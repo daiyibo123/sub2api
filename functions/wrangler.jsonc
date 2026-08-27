@@ -7,13 +7,13 @@
     {
       "binding": "DB",
       "database_name": "sub2api-db",
-      "database_id": "sub2api-db"
+      "database_id": "48281dab-c44b-496c-b1da-5cb409a6d6e2"
     }
   ],
   "kv_namespaces": [
     {
       "binding": "CONFIG_KV",
-      "id": "sub2api-config-kv"
+      "id": "b8674b89affa40889d3d869951de5eb4"
     }
   ],
   "vars": {
