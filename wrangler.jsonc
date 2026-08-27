@@ -3,9 +3,6 @@
   "compatibility_flags": ["nodejs_compat"],
   "compatibility_date": "2025-10-25",
   "pages_build_output_dir": "frontend",
-  "functions": {
-    "directory": "functions"
-  },
   "d1_databases": [
     {
       "binding": "DB",
