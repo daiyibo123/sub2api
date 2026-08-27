@@ -185,4 +185,7 @@ document.getElementById('btn-create-account').addEventListener('click', async ()
 
 if (authToken) {
   showPage('page-app')
-  document.querySelec
+  document.querySelectorAll('.page-section').forEach(p => p.classList.add('hidden'))
+  document.getElementById('page-dashboard').classList.remove('hidden')
+  loadDashboard()
+}
