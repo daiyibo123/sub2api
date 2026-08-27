@@ -1,0 +1,24 @@
+{
+  "name": "sub2api-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler pages project dev dist --port 8788",
+    "build": "echo 'No build step required for Functions'",
+    "deploy": "wrangler pages project publish dist",
+    "db:generate": "wrangler d1 migrations create sub2api-db",
+    "db:local": "wrangler d1 execute sub2api-db --local --file=functions/schema.sql",
+    "db:remote": "wrangler d1 execute sub2api-db --remote --file=functions/schema.sql"
+  },
+  "dependencies": {
+    "@cloudflare/workers-types": "^4.20251014.0",
+    "bcryptjs": "^2.4.3",
+    "hono": "^4.10.1",
+    "jose": "^5.9.6"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251014.0",
+    "wrangler": "^4.43.0"
+  }
+}
