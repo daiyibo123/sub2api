@@ -1,13 +1,67 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Sub2API - AI API Gateway</title>
-  </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sub2API Gateway</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="page-login" class="page">
+    <div class="login-container">
+      <h1>Sub2API Gateway</h1>
+      <form id="login-form">
+        <input type="text" id="login-username" placeholder="用户名" required>
+        <input type="password" id="login-password" placeholder="密码" required>
+        <button type="submit">登录</button>
+      </form>
+      <p id="login-error" class="error"></p>
+    </div>
+  </div>
+
+  <div id="page-app" class="page hidden">
+    <nav class="sidebar">
+      <div class="nav-item" data-page="dashboard">仪表板</div>
+      <div class="nav-item" data-page="keys">API Keys</div>
+      <div class="nav-item" data-page="usage">使用记录</div>
+      <div class="nav-section">管理后台</div>
+      <div class="nav-item" data-page="admin-groups">分组管理</div>
+      <div class="nav-item" data-page="admin-channels">渠道管理</div>
+      <div class="nav-item" data-page="admin-accounts">账号管理</div>
+      <div class="nav-item" id="nav-logout">退出登录</div>
+    </nav>
+    <main class="content">
+      <div id="page-dashboard" class="page-section">
+        <h2>仪表板</h2>
+        <div id="dashboard-stats"></div>
+      </div>
+      <div id="page-keys" class="page-section hidden">
+        <h2>API Keys</h2>
+        <button id="btn-create-key">创建 API Key</button>
+        <div id="keys-list"></div>
+      </div>
+      <div id="page-usage" class="page-section hidden">
+        <h2>使用记录</h2>
+        <div id="usage-list"></div>
+      </div>
+      <div id="page-admin-groups" class="page-section hidden">
+        <h2>分组管理</h2>
+        <button id="btn-create-group">创建分组</button>
+        <div id="groups-list"></div>
+      </div>
+      <div id="page-admin-channels" class="page-section hidden">
+        <h2>渠道管理</h2>
+        <button id="btn-create-channel">创建渠道</button>
+        <div id="channels-list"></div>
+      </div>
+      <div id="page-admin-accounts" class="page-section hidden">
+        <h2>账号管理</h2>
+        <button id="btn-create-account">创建账号</button>
+        <div id="accounts-list"></div>
+      </div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
 </html>

@@ -22,8 +22,8 @@
 3. 记下两者的 ID，填入 `functions/wrangler.jsonc`
 4. 把代码推送到 GitHub
 5. 在 Cloudflare Pages 连接 GitHub 仓库，配置：
-   - 构建命令：`cd frontend && npm install && npm run build`
-   - 构建输出目录：`frontend/dist`
+   - 构建命令：`echo "No build needed"`
+   - 构建输出目录：`frontend` 或根目录
    - Functions 目录：`functions`
 6. 部署后访问 `https://你的项目.pages.dev/login`
 7. 使用 `admin` / `admin123` 登录
@@ -31,14 +31,8 @@
 ### 方式二：本地直接部署
 
 ```bash
-# 1. 安装依赖并构建前端
-cd frontend
-npm install
-npm run build
-
-# 2. 部署到 Cloudflare Pages
-cd ..
-wrangler pages project publish frontend/dist
+# 1. 部署到 Cloudflare Pages
+wrangler pages project publish .
 ```
 
 ---
@@ -84,8 +78,10 @@ export XAI_API_KEY=sk-user-你创建的key
 
 ```
 .
-├── frontend/                  # Vue3 前端
-│   └── dist/                  # 构建输出
+├── frontend/                  # 纯静态前端（无需构建）
+│   ├── index.html
+│   ├── app.js
+│   └── styles.css
 ├── functions/                 # Cloudflare Pages Functions
 │   ├── src/
 │   │   ├── routes/            # 网关路由
@@ -103,7 +99,7 @@ export XAI_API_KEY=sk-user-你创建的key
 
 ## 技术栈
 
-- **前端**：Vue 3 + Vite + TailwindCSS + Pinia
+- **前端**：原生 HTML/CSS/JS（无需构建）
 - **后端**：Cloudflare Pages Functions（TypeScript）
 - **数据库**：Cloudflare D1（SQLite）
 - **缓存**：Cloudflare KV
