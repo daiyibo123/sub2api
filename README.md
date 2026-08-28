@@ -12,14 +12,16 @@
 
 构建设置建议如下：
 
-- 构建命令：`npm run build`（也可以留空，因为仓库已包含打包后的 `functions/_worker.js`）
+- 构建命令：`npm run build`
 - 构建输出目录：`frontend`
-- Functions 目录：`functions`
+- 根目录：留空
 
-在 Pages 项目的 Settings -> Functions -> Bindings 中绑定：
+本仓库的 `wrangler.jsonc` 仅用于本地开发，不包含 `pages_build_output_dir`，因此生产环境绑定在 Pages 面板中配置。进入 **Settings -> Functions -> Bindings**，选择 **Production** 环境并绑定：
 
 - D1：变量名必须是 `DB`
-- KV：变量名 `CONFIG_KV`（当前版本可选）
+- KV：变量名 `CONFIG_KV`
+
+不要把根目录设置为 `functions`，也不要配置 Functions 目录。Worker 已在构建时生成到 `frontend/_worker.js`。
 
 ### 2. 初始化数据库
 
@@ -42,7 +44,7 @@ npm install
 npm run deploy
 ```
 
-`npm run deploy` 会先将 `functions/_worker.ts` 打包成 Pages 可识别的 `functions/_worker.js` 和 `frontend/_worker.js`，然后上传 `frontend` 静态文件和 Functions。双入口兼容 Pages 的 Functions 部署和构建输出目录部署方式。
+`npm run deploy` 会先将 `functions/_worker.ts` 打包成 `frontend/_worker.js`，然后上传 `frontend` 静态文件。生产环境的 D1、KV 和密钥由 Pages 项目设置注入。
 
 ## 首次使用
 
@@ -79,7 +81,7 @@ npx wrangler pages dev frontend --d1 DB=sub2api-db --compatibility-flag=nodejs_c
 
 ## 配置变量
 
-`ERROR_RATE_THRESHOLD`、`ERROR_COUNT_THRESHOLD` 和 `WINDOW_SECONDS` 控制故障切换窗口；`MAX_SAME_ACCOUNT_RETRIES` 控制单次请求的最大重试次数。它们已在 `wrangler.jsonc` 中提供合理默认值，可在 Pages 环境变量中覆盖。
+`ERROR_RATE_THRESHOLD`、`ERROR_COUNT_THRESHOLD`、`WINDOW_SECONDS` 和 `MAX_SAME_ACCOUNT_RETRIES` 为可选运行时变量；未设置时使用代码内置默认值。
 
 ## 目录
 
