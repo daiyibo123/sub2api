@@ -8,6 +8,14 @@
 
 在 Cloudflare 创建一个 Pages 项目，以及一个 D1 数据库（例如 `sub2api-db`）。可选地创建 KV 命名空间（例如 `sub2api-config-kv`）。
 
+在 Pages 项目设置中先确认 **Root directory（根目录）留空或填写 `/`**，不要填写 `functions`。本仓库的 `frontend` 和 `functions` 是同级目录；把根目录设为 `functions` 会让 Wrangler 将输出目录解析成仓库外的 `../frontend`，Cloudflare 会拒绝部署。
+
+构建设置建议如下：
+
+- 构建命令：`npm run build`（也可以留空，因为仓库已包含打包后的 `functions/_worker.js`）
+- 构建输出目录：`frontend`
+- Functions 目录：`functions`
+
 在 Pages 项目的 Settings -> Functions -> Bindings 中绑定：
 
 - D1：变量名必须是 `DB`
@@ -34,11 +42,7 @@ npm install
 npm run deploy
 ```
 
-`npm run deploy` 会先将 `functions/_worker.ts` 打包成 Pages 可识别的 `functions/_worker.js`，然后上传 `frontend` 静态文件和 Functions。也可以在 Pages Git 构建设置中使用：
-
-- 构建命令：`npm run build`
-- 构建输出目录：`frontend`
-- Functions 目录：`functions`
+`npm run deploy` 会先将 `functions/_worker.ts` 打包成 Pages 可识别的 `functions/_worker.js`，然后上传 `frontend` 静态文件和 Functions。
 
 ## 首次使用
 

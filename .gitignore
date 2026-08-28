@@ -150,7 +150,6 @@ docs/screenshots/*
 .codex/
 frontend/coverage/
 .wrangler/
-functions/_worker.js
 aicodex
 output/
 .codegraph/
