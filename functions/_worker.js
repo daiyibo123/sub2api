@@ -1721,7 +1721,7 @@ async function handleModelsRequest(request, env) {
 var worker_default = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const path = url.pathname;
+    const path = url.pathname.replace(/\/+$/, "") || "/";
     if (!env.DB) return json({ error: "D1 binding DB is not configured" }, 500);
     if (request.method === "OPTIONS") {
       return new Response(null, {
@@ -1738,8 +1738,10 @@ var worker_default = {
     if (path === "/api/v1/auth/login" && request.method === "POST") {
       return handleLogin(request, env);
     }
-    if (path === "/api/v1/auth/setup" && request.method === "POST") {
-      return handleSetup(request, env);
+    if (path === "/api/v1/auth/setup") {
+      if (request.method === "POST") return handleSetup(request, env);
+      if (request.method === "GET") return json({ method: "POST", message: "Send username and password as JSON to initialize the administrator." });
+      return json({ error: "Method not allowed" }, 405);
     }
     if (path.startsWith("/api/v1/keys")) {
       return handleApiKeys(request, env);
