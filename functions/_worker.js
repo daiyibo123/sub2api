@@ -1779,9 +1779,11 @@ var worker_default = {
       return handleGatewayRequest(request, env, failover);
     }
     if (env.ASSETS) {
-      const assetUrl = new URL(request.url);
-      if (!assetUrl.pathname.includes(".")) assetUrl.pathname = "/index.html";
-      return env.ASSETS.fetch(new Request(assetUrl.toString(), request));
+      const assetResponse = await env.ASSETS.fetch(request);
+      if (assetResponse.status !== 404 || path.includes(".")) return assetResponse;
+      const fallbackUrl = new URL(request.url);
+      fallbackUrl.pathname = "/";
+      return env.ASSETS.fetch(new Request(fallbackUrl.toString(), request));
     }
     return json({ error: "Not found" }, 404);
   }
