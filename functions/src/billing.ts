@@ -19,7 +19,7 @@ export function estimateTokens(text: string): number {
 }
 
 // Extract token usage from response headers or body
-export function extractTokenUsage(body: any, headers: Headers): { promptTokens: number; completionTokens: number; totalTokens: number } {
+export function extractTokenUsage(body: any, headers: Headers | Record<string, string>): { promptTokens: number; completionTokens: number; totalTokens: number } {
   let promptTokens = 0;
   let completionTokens = 0;
   let totalTokens = 0;

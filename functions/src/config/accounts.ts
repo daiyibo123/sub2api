@@ -1,5 +1,5 @@
 // Accounts configuration API
-import { Env } from '../index';
+import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { verifySessionToken } from '../auth';
 
@@ -8,15 +8,15 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
   const url = new URL(request.url);
   const method = request.method;
   
-  // Auth check for write operations
-  if (method !== 'GET') {
+  // Configuration is an administrator-only surface.
+  {
     const authHeader = request.headers.get('authorization');
     if (!authHeader?.startsWith('Bearer ')) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     const token = authHeader.slice(7);
-    const session = await verifySessionToken(token, env.JWT_SECRET || 'default-secret');
+    const session = await verifySessionToken(token, env.JWT_SECRET || 'change-me-in-dashboard');
     if (!session) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
@@ -25,7 +25,7 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
   // GET /api/v1/accounts - list all accounts
   if (method === 'GET') {
     const accounts = await db.listAccounts();
-    return new Response(JSON.stringify({ data: accounts }), {
+    return new Response(JSON.stringify({ data: accounts.map(({ api_key, ...account }) => ({ ...account, api_key: api_key ? '***' : '' })) }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' }
     });
@@ -91,7 +91,8 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
   
   // POST /api/v1/accounts/:id/test - test account connection
   if (method === 'POST' && url.pathname.endsWith('/test')) {
-    const id = parseInt(url.pathname.split('/').at(-2) || '0');
+    const segments = url.pathname.split('/');
+    const id = parseInt(segments[segments.length - 2] || '0');
     if (!id) {
       return new Response(JSON.stringify({ error: 'Invalid account ID' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
     }

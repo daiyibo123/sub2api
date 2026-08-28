@@ -1,5 +1,5 @@
 // Groups configuration API
-import { Env } from '../index';
+import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { verifySessionToken } from '../auth';
 
@@ -8,15 +8,15 @@ export async function handleGroupsRequest(request: Request, env: Env, ctx: Execu
   const url = new URL(request.url);
   const method = request.method;
   
-  // Auth check for write operations
-  if (method !== 'GET') {
+  // Configuration is an administrator-only surface.
+  {
     const authHeader = request.headers.get('authorization');
     if (!authHeader?.startsWith('Bearer ')) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     const token = authHeader.slice(7);
-    const session = await verifySessionToken(token, env.JWT_SECRET || 'default-secret');
+    const session = await verifySessionToken(token, env.JWT_SECRET || 'change-me-in-dashboard');
     if (!session) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }

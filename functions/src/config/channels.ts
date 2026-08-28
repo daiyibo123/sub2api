@@ -1,5 +1,5 @@
 // Channels configuration API
-import { Env } from '../index';
+import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { verifySessionToken } from '../auth';
 
@@ -8,15 +8,15 @@ export async function handleChannelsRequest(request: Request, env: Env): Promise
   const url = new URL(request.url);
   const method = request.method;
   
-  // Auth check for write operations
-  if (method !== 'GET') {
+  // Configuration is an administrator-only surface.
+  {
     const authHeader = request.headers.get('authorization');
     if (!authHeader?.startsWith('Bearer ')) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
     
     const token = authHeader.slice(7);
-    const session = await verifySessionToken(token, env.JWT_SECRET || 'default-secret');
+    const session = await verifySessionToken(token, env.JWT_SECRET || 'change-me-in-dashboard');
     if (!session) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
@@ -25,7 +25,7 @@ export async function handleChannelsRequest(request: Request, env: Env): Promise
   // GET /api/v1/channels - list all channels
   if (method === 'GET') {
     const channels = await db.listChannels();
-    return new Response(JSON.stringify({ data: channels }), {
+    return new Response(JSON.stringify({ data: channels.map(({ api_key, ...channel }) => ({ ...channel, api_key: api_key ? '***' : '' })) }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' }
     });

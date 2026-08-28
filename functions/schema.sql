@@ -111,5 +111,4 @@ CREATE INDEX IF NOT EXISTS idx_req_logs_account_created ON request_logs(account_
 CREATE INDEX IF NOT EXISTS idx_req_logs_channel_created ON request_logs(channel_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_req_logs_group_created ON request_logs(group_id, created_at);
 
--- 插入默认管理员 (密码: admin123，需 bcrypt 哈希)
-INSERT OR IGNORE INTO users (username, password_hash) VALUES ('admin', '$2a$10$rZx8qJZ8qJZ8qJZ8qJZ8qOZ8qJZ8qJZ8qJZ8qJZ8qJZ8qJZ8qJZ8q');
+-- The first administrator is created through POST /api/v1/auth/setup.

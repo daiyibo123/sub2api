@@ -1,5 +1,5 @@
 // Main gateway handler - routes requests to appropriate provider
-import { Env } from '../index';
+import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { authenticateApiKey, hashApiKey } from '../auth';
 import { FailoverManager } from '../failover';
@@ -27,7 +27,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   const body = await request.text();
   let requestBody: any;
   try {
-    requestBody = JSON.parse(body);
+    requestBody = body.trim() ? JSON.parse(body) : {};
   } catch {
     return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
   }
@@ -96,15 +96,19 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     }
   }
   
-  const upstreamUrl = `${baseUrl}${upstreamPath}?beta=true`;
+  const upstreamUrl = new URL(`${baseUrl}${upstreamPath}`);
+  if (provider === 'anthropic') upstreamUrl.searchParams.set('beta', 'true');
   
   // Build headers
-  const headers = buildUpstreamHeaders(request.headers, provider, account.api_key, account.base_url);
+  const headers = buildUpstreamHeaders(request.headers, provider, account.api_key, account.base_url, account.client_spoofing);
   
   // Update request body with mapped model
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
+  const upstreamBody = request.method === 'GET' || request.method === 'HEAD'
+    ? undefined
+    : (upstreamModel !== model ? JSON.stringify(requestBody) : body);
   
   // Record start time
   const startTime = Date.now();
@@ -115,12 +119,12 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   try {
     // Make upstream request
     const proxyResponse = await proxyRequest({
-      url: upstreamUrl,
+      url: upstreamUrl.toString(),
       method: request.method,
       headers,
       body: new ReadableStream({
         start(controller) {
-          controller.enqueue(new TextEncoder().encode(body));
+          if (upstreamBody !== undefined) controller.enqueue(new TextEncoder().encode(upstreamBody));
           controller.close();
         }
       })
@@ -128,74 +132,16 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     
     responseStatus = proxyResponse.status;
     isError = responseStatus >= 400;
+    if (isError && failover.shouldFailover({ status: responseStatus }) && accounts.length > 1) {
+      await proxyResponse.text().catch(() => '');
+      failover.recordRequest(account.id, channel.id, group.id, true);
+      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`);
+    }
     
-    if (!isError && stream) {
-      // For streaming responses, record usage asynchronously
-      const responseClone = proxyResponse.body!;
-      const reader = responseClone.getReader();
-      
-      // Create a new stream that passes through
-      const transformStream = new TransformStream({
-        async transform(chunk, controller) {
-          controller.enqueue(chunk);
-          
-          // Try to extract usage from SSE events
-          const text = new TextDecoder().decode(chunk);
-          if (text.includes('"usage"') || text.includes('"prompt_tokens"')) {
-            try {
-              const jsonMatch = text.match(/"usage":\s*{[^}]+}/);
-              if (jsonMatch) {
-                const usage = JSON.parse(jsonMatch[0].replace('"usage": ', ''));
-                const { totalTokens } = extractTokenUsage(usage, new Headers());
-                if (totalTokens > 0) {
-                  db.incrementApiKeyUsage(keyRecord.id, calculateCost(provider, upstreamModel, totalTokens, 0)).catch(() => {});
-                }
-              }
-            } catch {
-              // Ignore parsing errors
-            }
-          }
-        },
-        async flush() {
-          // Record request log
-          db.createRequestLog({
-            account_id: account.id,
-            channel_id: channel.id,
-            group_id: group.id,
-            model: upstreamModel,
-            status: responseStatus,
-            error_message: isError ? errorMessage : '',
-            latency_ms: Date.now() - startTime
-          }).catch(() => {});
-        }
-      });
-      
-      // Pipe the response through the transform stream
-      const writableStream = transformStream.writable;
-      const reader2 = responseClone.getReader();
-      
-      (async () => {
-        try {
-          while (true) {
-            const { done, value } = await reader2.read();
-            if (done) break;
-            await writableStream.getWriter().write(value);
-          }
-        } finally {
-          writableStream.getWriter().close();
-        }
-      })();
-      
-      // Return the transformed stream
-      return new Response(transformStream.readable, {
-        status: proxyResponse.status,
-        headers: {
-          ...proxyResponse.headers,
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
-          'connection': 'keep-alive'
-        }
-      });
+    if (stream && proxyResponse.body) {
+      failover.recordRequest(account.id, channel.id, group.id, isError);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: isError ? 'Upstream error' : '', latency_ms: Date.now() - startTime }).catch(() => {});
+      return new Response(proxyResponse.body, { status: proxyResponse.status, headers: { ...proxyResponse.headers, 'content-type': proxyResponse.headers['content-type'] || 'text/event-stream' } });
     }
     
     // For non-streaming responses, extract usage and record
@@ -207,7 +153,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
       // Non-JSON response
     }
     
-    const { totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
+    const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
     const cost = calculateCost(provider, upstreamModel, 
       responseBody?.usage?.prompt_tokens || 0,
       responseBody?.usage?.completion_tokens || 0
@@ -217,6 +163,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     if (cost > 0) {
       db.incrementApiKeyUsage(keyRecord.id, cost).catch(() => {});
     }
+    db.createUsageRecord({ api_key_id: keyRecord.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: responseStatus, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }).catch(() => {});
     
     db.createRequestLog({
       account_id: account.id,
@@ -249,12 +196,13 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     failover.recordRequest(account.id, channel.id, group.id, true);
     
     // Try to failover to next account
-    return handleFailover(request, env, failover, keyRecord, accounts, channels, groups, mappings, provider, upstreamModel, stream, errorMessage);
+    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, errorMessage);
   }
 }
 
 // Handle failover to next account
 async function handleFailover(
+  body: string | undefined,
   request: Request,
   env: Env,
   failover: FailoverManager,
@@ -271,9 +219,11 @@ async function handleFailover(
   const db = createDatabase(env.DB);
   
   // Try next account (max 3 retries)
-  for (let i = 0; i < 3; i++) {
+  const attempted = new Set<number>();
+  const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
+  for (let i = 0; i < maxRetries; i++) {
     // Get next healthy account
-    const nextAccounts = accounts.filter(a => a.enabled);
+    const nextAccounts = accounts.filter(a => a.enabled && !attempted.has(a.id));
     const selection = failover.selectAccount(nextAccounts, channels, groups);
     
     if (!selection) {
@@ -281,6 +231,7 @@ async function handleFailover(
     }
     
     const { account, channel, group } = selection;
+    attempted.add(account.id);
     
     try {
       const baseUrl = getUpstreamBaseUrl(account.base_url, provider);
@@ -293,17 +244,17 @@ async function handleFailover(
         upstreamPath = '/v1/chat/completions';
       }
       
-      const upstreamUrl = `${baseUrl}${upstreamPath}?beta=true`;
-      const headers = buildUpstreamHeaders(request.headers, provider, account.api_key, account.base_url);
-      const body = await request.text();
+      const retryUrl = new URL(`${baseUrl}${upstreamPath}`);
+      if (provider === 'anthropic') retryUrl.searchParams.set('beta', 'true');
+      const headers = buildUpstreamHeaders(request.headers, provider, account.api_key, account.base_url, account.client_spoofing);
       
       const proxyResponse = await proxyRequest({
-        url: upstreamUrl,
+        url: retryUrl.toString(),
         method: request.method,
         headers,
         body: new ReadableStream({
           start(controller) {
-            controller.enqueue(new TextEncoder().encode(body));
+            if (body !== undefined) controller.enqueue(new TextEncoder().encode(body));
             controller.close();
           }
         })
@@ -311,15 +262,19 @@ async function handleFailover(
       
       const responseText = await proxyResponse.text();
       
-      // Record success
-      failover.recordRequest(account.id, channel.id, group.id, false);
+      const isError = proxyResponse.status >= 400;
+      if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
+        failover.recordRequest(account.id, channel.id, group.id, true);
+        continue;
+      }
+      failover.recordRequest(account.id, channel.id, group.id, isError);
       db.createRequestLog({
         account_id: account.id,
         channel_id: channel.id,
         group_id: group.id,
         model: upstreamModel,
         status: proxyResponse.status,
-        error_message: '',
+        error_message: isError ? 'Upstream error' : '',
         latency_ms: 0
       }).catch(() => {});
       

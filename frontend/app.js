@@ -15,18 +15,30 @@ function apiHeaders() {
 async function apiGet(url) {
   const res = await fetch(API_BASE + url, { headers: apiHeaders() })
   if (res.status === 401) { logout(); return null }
-  return res.json()
+  return res.json().catch(() => ({ data: [] }))
 }
 async function apiPost(url, body) {
   const res = await fetch(API_BASE + url, { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) })
   if (res.status === 401) { logout(); return null }
-  return res.json()
+  return res.json().catch(() => ({}))
 }
 async function apiDelete(url) {
   const res = await fetch(API_BASE + url, { method: 'DELETE', headers: apiHeaders() })
   if (res.status === 401) { logout(); return null }
-  return res.json()
+  return res.json().catch(() => ({}))
 }
+
+document.getElementById('btn-setup').addEventListener('click', async () => {
+  const username = prompt('管理员用户名：')
+  const password = prompt('管理员密码（至少 8 位）：')
+  if (!username || !password) return
+  const res = await fetch(API_BASE + '/auth/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password })
+  })
+  const data = await res.json().catch(() => ({}))
+  document.getElementById('login-error').textContent = res.ok ? '初始化成功，请登录' : (data.error || '初始化失败')
+})
 
 function logout() {
   authToken = null
@@ -91,12 +103,14 @@ async function loadPage(page) {
 
 async function loadDashboard() {
   const stats = await apiGet('/usage')
+  if (!stats) return
   const html = '<div class="stats-grid"><div class="stat-card"><h3>总请求数</h3><div class="value">' + (stats.data ? stats.data.length : 0) + '</div></div></div>'
   document.getElementById('dashboard-stats').innerHTML = html
 }
 
 async function loadKeys() {
   const data = await apiGet('/keys')
+  if (!data) return
   const keys = data.data || []
   document.getElementById('keys-list').innerHTML = keys.length === 0 ? '<p>暂无 API Key</p>' : '<table><thead><tr><th>ID</th><th>名称</th><th>状态</th><th>余额</th><th>操作</th></tr></thead><tbody>' + keys.map(k => '<tr><td>' + k.id + '</td><td>' + (k.name || '-') + '</td><td>' + (k.enabled ? '启用' : '禁用') + '</td><td>' + k.balance + '</td><td><button class="danger" onclick="deleteKey(' + k.id + ')">删除</button></td></tr>').join('') + '</tbody></table>'
 }
@@ -116,12 +130,14 @@ document.getElementById('btn-create-key').addEventListener('click', async () => 
 
 async function loadUsage() {
   const data = await apiGet('/usage')
+  if (!data) return
   const records = data.data || []
   document.getElementById('usage-list').innerHTML = records.length === 0 ? '<p>暂无使用记录</p>' : '<table><thead><tr><th>ID</th><th>模型</th><th>状态</th><th>时间</th></tr></thead><tbody>' + records.slice(0, 50).map(r => '<tr><td>' + r.id + '</td><td>' + r.model + '</td><td>' + r.status + '</td><td>' + new Date(r.created_at).toLocaleString() + '</td></tr>').join('') + '</tbody></table>'
 }
 
 async function loadGroups() {
   const data = await apiGet('/groups')
+  if (!data) return
   const groups = data.data || data || []
   document.getElementById('groups-list').innerHTML = groups.length === 0 ? '<p>暂无分组</p>' : '<table><thead><tr><th>ID</th><th>名称</th><th>优先级</th><th>启用</th><th>操作</th></tr></thead><tbody>' + groups.map(g => '<tr><td>' + g.id + '</td><td>' + g.name + '</td><td>' + g.priority + '</td><td>' + (g.enabled ? '是' : '否') + '</td><td><button class="danger" onclick="deleteGroup(' + g.id + ')">删除</button></td></tr>').join('') + '</tbody></table>'
 }
@@ -141,6 +157,7 @@ document.getElementById('btn-create-group').addEventListener('click', async () =
 
 async function loadChannels() {
   const data = await apiGet('/channels')
+  if (!data) return
   const channels = data.data || data || []
   document.getElementById('channels-list').innerHTML = channels.length === 0 ? '<p>暂无渠道</p>' : '<table><thead><tr><th>ID</th><th>名称</th><th>服务商</th><th>启用</th><th>操作</th></tr></thead><tbody>' + channels.map(c => '<tr><td>' + c.id + '</td><td>' + c.name + '</td><td>' + c.provider + '</td><td>' + (c.enabled ? '是' : '否') + '</td><td><button class="danger" onclick="deleteChannel(' + c.id + ')">删除</button></td></tr>').join('') + '</tbody></table>'
 }
@@ -161,6 +178,7 @@ document.getElementById('btn-create-channel').addEventListener('click', async ()
 
 async function loadAccounts() {
   const data = await apiGet('/accounts')
+  if (!data) return
   const accounts = data.data || data || []
   document.getElementById('accounts-list').innerHTML = accounts.length === 0 ? '<p>暂无账号</p>' : '<table><thead><tr><th>ID</th><th>名称</th><th>服务商</th><th>启用</th><th>操作</th></tr></thead><tbody>' + accounts.map(a => '<tr><td>' + a.id + '</td><td>' + a.name + '</td><td>' + a.provider + '</td><td>' + (a.enabled ? '是' : '否') + '</td><td><button class="danger" onclick="deleteAccount(' + a.id + ')">删除</button></td></tr>').join('') + '</tbody></table>'
 }

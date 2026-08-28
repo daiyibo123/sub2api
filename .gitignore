@@ -149,6 +149,8 @@ docs/screenshots/*
 .serena/
 .codex/
 frontend/coverage/
+.wrangler/
+functions/_worker.js
 aicodex
 output/
 .codegraph/

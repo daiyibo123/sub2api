@@ -1,126 +1,94 @@
-# Sub2API - Cloudflare 一键部署版
+# Sub2API Cloudflare Gateway
 
-## 简介
+一个基于 Cloudflare Pages Functions、D1 和 KV 的多模型智能网关。它提供 OpenAI、Anthropic 和 xAI 的统一入口，支持模型映射、账号优先级、故障切换、用量记录和管理后台。
 
-这是精简后的 Sub2API，可直接部署到 **Cloudflare Pages + Pages Functions**，无需服务器。
+## 部署到 Cloudflare Pages
 
-**核心功能：**
-- API Key 分发与管理
-- 分组 / 渠道 / 上游账号管理
-- OpenAI / Claude / Grok 路由转发
-- 错误率 + 错误数无感故障切换
-- 客户端伪装（Codex / Claude Code / Grok CLI 等）
+### 1. 创建资源
 
----
+在 Cloudflare 创建一个 Pages 项目，以及一个 D1 数据库（例如 `sub2api-db`）。可选地创建 KV 命名空间（例如 `sub2api-config-kv`）。
 
-## 快速部署
+在 Pages 项目的 Settings -> Functions -> Bindings 中绑定：
 
-### 方式一：Cloudflare Pages（推荐）
+- D1：变量名必须是 `DB`
+- KV：变量名 `CONFIG_KV`（当前版本可选）
 
-1. 在 Cloudflare Dashboard 创建 **D1 数据库**：`sub2api-db`
-2. 创建 **KV 命名空间**：`sub2api-config-kv`
-3. 记下两者的 ID，填入 `functions/wrangler.jsonc`
-4. 把代码推送到 GitHub
-5. 在 Cloudflare Pages 连接 GitHub 仓库，配置：
-   - 构建命令：`cd frontend && npm install && npm run build`
-   - 构建输出目录：`frontend/dist`
-   - Functions 目录：`functions`
-6. 部署后访问 `https://你的项目.pages.dev/login`
-7. 使用 `admin` / `admin123` 登录
-
-### 方式二：本地直接部署
+### 2. 初始化数据库
 
 ```bash
-# 1. 安装依赖并构建前端
-cd frontend
+npx wrangler d1 execute sub2api-db --remote --file=functions/schema.sql
+```
+
+### 3. 设置密钥
+
+```bash
+npx wrangler pages secret put JWT_SECRET --project-name sub2api-gateway
+```
+
+请使用随机生成的长字符串，不要使用仓库中的默认值。
+
+### 4. 部署
+
+```bash
 npm install
-npm run build
-
-# 2. 部署到 Cloudflare Pages
-cd ..
-wrangler pages project publish frontend/dist
+npm run deploy
 ```
 
----
+`npm run deploy` 会先将 `functions/_worker.ts` 打包成 Pages 可识别的 `functions/_worker.js`，然后上传 `frontend` 静态文件和 Functions。也可以在 Pages Git 构建设置中使用：
 
-## 首次配置
+- 构建命令：`npm run build`
+- 构建输出目录：`frontend`
+- Functions 目录：`functions`
 
-登录后按顺序添加：
+## 首次使用
 
-1. **分组**：OpenAI / Claude / Grok
-2. **渠道**：各平台的 base_url + api_key
-3. **账号**：关联分组和渠道，可填写客户端伪装
-4. **模型映射**：如 `gpt-4o` → `gpt-4o-2024-08-06`
-5. **API Key**：创建供终端使用的 Key
-
----
-
-## 客户端配置
-
-### OpenAI / Codex
+数据库初始化后，先创建管理员：
 
 ```bash
-export OPENAI_BASE_URL=https://你的项目.pages.dev/v1
-export OPENAI_API_KEY=sk-user-你创建的key
+curl -X POST https://<your-domain>/api/v1/auth/setup \
+  -H "content-type: application/json" \
+  -d '{"username":"admin","password":"请使用至少 8 位强密码"}'
 ```
 
-### Claude Code
+然后访问站点登录，在管理后台依次创建分组、渠道和上游账号，最后创建供客户端使用的 API Key。初始化接口在存在管理员后会自动关闭。
+
+## 客户端地址
+
+OpenAI/Codex：`https://<your-domain>/v1`
+
+Claude Code：`https://<your-domain>`（使用 `x-api-key` 或 `Authorization: Bearer`）
+
+Grok：`https://<your-domain>/v1`
+
+## 本地检查
 
 ```bash
-export ANTHROPIC_BASE_URL=https://你的项目.pages.dev
-export ANTHROPIC_API_KEY=sk-user-你创建的key
+npm run typecheck
+npm run build:functions
 ```
 
-### Grok
+本地 Pages 调试需要传入 D1 绑定，例如：
 
 ```bash
-export XAI_BASE_URL=https://你的项目.pages.dev/v1
-export XAI_API_KEY=sk-user-你创建的key
+npx wrangler pages dev frontend --d1 DB=sub2api-db --compatibility-flag=nodejs_compat
 ```
 
----
+## 配置变量
 
-## 目录结构
+`ERROR_RATE_THRESHOLD`、`ERROR_COUNT_THRESHOLD` 和 `WINDOW_SECONDS` 控制故障切换窗口；`MAX_SAME_ACCOUNT_RETRIES` 控制单次请求的最大重试次数。它们已在 `wrangler.jsonc` 中提供合理默认值，可在 Pages 环境变量中覆盖。
 
+## 目录
+
+```text
+frontend/              静态管理后台
+functions/_worker.ts   Pages 高级 Functions 入口
+functions/src/         API、认证、代理和故障切换逻辑
+functions/schema.sql   D1 建表脚本
+wrangler.jsonc         Pages 基础配置
 ```
-.
-├── frontend/                  # Vue3 前端
-│   └── dist/                  # 构建输出
-├── functions/                 # Cloudflare Pages Functions
-│   ├── src/
-│   │   ├── routes/            # 网关路由
-│   │   ├── utils/             # 工具函数
-│   │   ├── db.ts              # D1 数据库
-│   │   ├── auth.ts            # 认证
-│   │   ├── failover.ts        # 故障切换
-│   │   └── billing.ts         # 计费
-│   ├── schema.sql             # D1 数据库 schema
-│   └── wrangler.jsonc         # Functions 配置
-└── README.md
-```
-
----
-
-## 技术栈
-
-- **前端**：Vue 3 + Vite + TailwindCSS + Pinia
-- **后端**：Cloudflare Pages Functions（TypeScript）
-- **数据库**：Cloudflare D1（SQLite）
-- **缓存**：Cloudflare KV
-
----
-
-## 环境变量
-
-| 变量 | 说明 | 必须 |
-|------|------|------|
-| `VITE_API_BASE_URL` | 前端 API 地址 | ✅ |
-| `ERROR_RATE_THRESHOLD` | 错误率阈值（默认 0.5） | ❌ |
-| `ERROR_COUNT_THRESHOLD` | 错误数阈值（默认 5） | ❌ |
-| `WINDOW_SECONDS` | 统计窗口（默认 300） | ❌ |
-
----
 
 ## License
 
 MIT
+
+使用前请阅读 [DISCLAIMER.md](DISCLAIMER.md)。

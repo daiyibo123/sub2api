@@ -1,5 +1,6 @@
 // D1 Database abstraction layer
-import { Env } from './index';
+import type { Env } from './index';
+import type { UsageRecord, RequestLog } from './types';
 
 export class Database {
   constructor(private db: D1Database) {}

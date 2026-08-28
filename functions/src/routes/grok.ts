@@ -1,5 +1,5 @@
 // Grok route handler (OpenAI-compatible)
-import { Env } from '../index';
+import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { authenticateApiKey } from '../auth';
 import { FailoverManager } from '../failover';
@@ -97,6 +97,16 @@ export async function handleGrokRequest(request: Request, env: Env, failover: Fa
     });
     
     const isError = proxyResponse.status >= 400;
+    if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
+      await proxyResponse.text().catch(() => '');
+      failover.recordRequest(account.id, channel.id, group.id, true);
+      return handleGrokFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`);
+    }
+    if (stream && proxyResponse.body) {
+      failover.recordRequest(account.id, channel.id, group.id, isError);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: isError ? 'Upstream error' : '', latency_ms: Date.now() - startTime }).catch(() => {});
+      return new Response(proxyResponse.body, { status: proxyResponse.status, headers: { ...proxyResponse.headers, 'content-type': proxyResponse.headers['content-type'] || 'text/event-stream' } });
+    }
     const responseText = await proxyResponse.text();
     let responseBody: any = {};
     try {
@@ -113,6 +123,7 @@ export async function handleGrokRequest(request: Request, env: Env, failover: Fa
     if (cost > 0) {
       db.incrementApiKeyUsage(keyRecord.id, cost).catch(() => {});
     }
+    db.createUsageRecord({ api_key_id: keyRecord.id, model: upstreamModel, provider: 'xai', prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }).catch(() => {});
     
     // Record request log
     db.createRequestLog({
@@ -141,12 +152,13 @@ export async function handleGrokRequest(request: Request, env: Env, failover: Fa
     failover.recordRequest(account.id, channel.id, group.id, true);
     
     // Try failover
-    return handleGrokFailover(request, env, failover, keyRecord, accounts, channels, groups, mappings, upstreamModel, stream, errorMessage);
+    return handleGrokFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, errorMessage);
   }
 }
 
 // Grok-specific failover
 async function handleGrokFailover(
+  body: string,
   request: Request,
   env: Env,
   failover: FailoverManager,
@@ -161,20 +173,21 @@ async function handleGrokFailover(
 ): Promise<Response> {
   const db = createDatabase(env.DB);
   
-  for (let i = 0; i < 3; i++) {
-    const nextAccounts = accounts.filter(a => a.enabled);
+  const attempted = new Set<number>();
+  const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
+  for (let i = 0; i < maxRetries; i++) {
+    const nextAccounts = accounts.filter(a => a.enabled && !attempted.has(a.id));
     const selection = failover.selectAccount(nextAccounts, channels, groups);
     
     if (!selection) break;
     
     const { account, channel, group } = selection;
+    attempted.add(account.id);
     
     try {
       const baseUrl = getUpstreamBaseUrl(account.base_url, 'xai');
       const upstreamUrl = `${baseUrl}/v1/chat/completions`;
       const headers = buildUpstreamHeaders(request.headers, 'xai', account.api_key, account.base_url, account.client_spoofing);
-      const body = await request.text();
-      
       const proxyResponse = await proxyRequest({
         url: upstreamUrl,
         method: request.method,
@@ -189,8 +202,12 @@ async function handleGrokFailover(
       
       const responseText = await proxyResponse.text();
       const isError = proxyResponse.status >= 400;
+      if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
+        failover.recordRequest(account.id, channel.id, group.id, true);
+        continue;
+      }
       
-      failover.recordRequest(account.id, channel.id, group.id, !isError);
+      failover.recordRequest(account.id, channel.id, group.id, isError);
       db.createRequestLog({
         account_id: account.id,
         channel_id: channel.id,

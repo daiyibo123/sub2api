@@ -9,7 +9,7 @@ export async function proxyRequest(request: ProxyRequest): Promise<ProxyResponse
     const response = await fetch(request.url, {
       method: request.method,
       headers: request.headers as any,
-      body: request.body,
+      body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
       redirect: 'follow',
       signal: controller.signal
     });
@@ -24,7 +24,8 @@ export async function proxyRequest(request: ProxyRequest): Promise<ProxyResponse
     return {
       status: response.status,
       headers,
-      body: response.body!
+      body: response.body!,
+      text: () => response.text()
     };
   } catch (error) {
     clearTimeout(timeout);

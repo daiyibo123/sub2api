@@ -1,0 +1,18 @@
+{
+  "name": "sub2api-cloudflare-gateway",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:functions": "esbuild functions/_worker.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=functions/_worker.js",
+    "build": "npm run build:functions",
+    "typecheck": "tsc --noEmit -p functions/tsconfig.json",
+    "dev": "npm run build:functions && wrangler pages dev frontend --compatibility-flag=nodejs_compat",
+    "deploy": "npm run build:functions && wrangler pages deploy frontend --project-name sub2api-gateway"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250829.0",
+    "esbuild": "^0.25.9",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.33.0"
+  }
+}

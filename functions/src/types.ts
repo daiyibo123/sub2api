@@ -127,4 +127,5 @@ export interface ProxyResponse {
   status: number;
   headers: Record<string, string>;
   body: ReadableStream;
+  text(): Promise<string>;
 }

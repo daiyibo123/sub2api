@@ -2,7 +2,8 @@
 // This file acts as the unified entry for all requests in Cloudflare Pages Functions
 
 import { createDatabase } from './src/db'
-import { verifySessionToken, hashApiKey } from './src/auth'
+import { verifySessionToken, hashApiKey, hashPassword, authenticateUser, authenticateApiKey, createSessionToken } from './src/auth'
+import type { Env } from './src/index'
 import { FailoverManager } from './src/failover'
 import { handleGatewayRequest } from './src/routes/gateway'
 import { handleOpenAIRequest } from './src/routes/openai'
@@ -18,13 +19,15 @@ export default {
     const url = new URL(request.url)
     const path = url.pathname
 
+    if (!env.DB) return json({ error: 'D1 binding DB is not configured' }, 500)
+
     // CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key, Anthropic-Version, Anthropic-Beta',
         }
       })
     }
@@ -70,6 +73,12 @@ export default {
 
     // Gateway endpoints
     const failover = new FailoverManager(env)
+    failover.setDb(createDatabase(env.DB))
+
+    // OpenAI clients commonly probe this endpoint before sending a request.
+    if (path === '/v1/models' && request.method === 'GET') {
+      return handleProviderModels(request, env)
+    }
 
     if (path.startsWith('/v1/chat/completions')) {
       return handleOpenAIRequest(request, env, failover)
@@ -84,20 +93,14 @@ export default {
       return handleGatewayRequest(request, env, failover)
     }
 
-    // Static assets fallback
+    // In Pages advanced mode static files are exposed through ASSETS.
+    if (env.ASSETS) {
+      const assetUrl = new URL(request.url)
+      if (!assetUrl.pathname.includes('.')) assetUrl.pathname = '/index.html'
+      return env.ASSETS.fetch(new Request(assetUrl.toString(), request))
+    }
     return json({ error: 'Not found' }, 404)
   }
-}
-
-// Env type for Cloudflare Pages Functions
-export interface Env {
-  DB: D1Database
-  CONFIG_KV: KVNamespace
-  JWT_SECRET?: string
-  ERROR_RATE_THRESHOLD?: string
-  ERROR_COUNT_THRESHOLD?: string
-  WINDOW_SECONDS?: string
-  MAX_SAME_ACCOUNT_RETRIES?: string
 }
 
 function json(data: any, status = 200) {
@@ -107,71 +110,49 @@ function json(data: any, status = 200) {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key, Anthropic-Version, Anthropic-Beta',
     }
   })
 }
 
 async function handleLogin(request: Request, env: Env): Promise<Response> {
-  const body = await request.json<{ username: string; password: string }>()
+  let body: { username?: string; password?: string }
+  try { body = await request.json() } catch { return json({ error: 'Invalid JSON body' }, 400) }
 
   if (!body.username || !body.password) {
     return json({ error: 'Username and password required' }, 400)
   }
 
   const db = createDatabase(env.DB)
-  const user = await db.getUserByUsername(body.username)
-
-  if (!user) {
-    return json({ error: 'Invalid credentials' }, 401)
-  }
-
-  const encoder = new TextEncoder()
-  const data = encoder.encode(body.password)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data)
-  const hashArray = Array.from(new Uint8Array(hashBuffer))
-  const passwordHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
-
-  if (passwordHash !== user.password_hash.substring(0, 64)) {
-    return json({ error: 'Invalid credentials' }, 401)
-  }
-
-  const session = {
-    userId: user.id,
-    username: user.username,
-    isAdmin: true,
-    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000
-  }
-
-  const token = createSessionToken(session)
+  const session = await authenticateUser(db, body.username, body.password)
+  if (!session) return json({ error: 'Invalid credentials' }, 401)
+  const token = await createSessionToken(session, env.JWT_SECRET || 'change-me-in-dashboard')
 
   return json({
     token,
-    user: { id: user.id, username: user.username, is_admin: true }
+    user: { id: session.userId, username: session.username, is_admin: session.isAdmin }
   })
 }
 
 async function handleSetup(request: Request, env: Env): Promise<Response> {
   const db = createDatabase(env.DB)
-  const existing = await db.getUserByUsername('admin')
+  const existing = await db.queryOne<{ id: number; password_hash: string }>('SELECT id, password_hash FROM users LIMIT 1')
 
-  if (existing) {
-    return json({ error: 'Setup already completed' }, 400)
-  }
+  let body: { username?: string; password?: string }
+  try { body = await request.json() } catch { return json({ error: 'Invalid JSON body' }, 400) }
 
-  const body = await request.json<{ username: string; password: string }>()
-
-  if (!body.username || !body.password) {
+  if (!body.username || !body.password || body.username.length > 128 || body.password.length < 8) {
     return json({ error: 'Username and password required' }, 400)
   }
 
-  const encoder = new TextEncoder()
-  const data = encoder.encode(body.password)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data)
-  const hashArray = Array.from(new Uint8Array(hashBuffer))
-  const passwordHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
-
-  await db.createUser(body.username, passwordHash)
+  const passwordHash = await hashPassword(body.password)
+  if (existing && existing.password_hash.startsWith('$2a$')) {
+    await db.update('UPDATE users SET username = ?, password_hash = ? WHERE id = ?', [body.username, passwordHash, existing.id])
+  } else if (existing) {
+    return json({ error: 'Setup already completed' }, 400)
+  } else {
+    await db.createUser(body.username, passwordHash)
+  }
 
   return json({ success: true, message: 'Admin user created' })
 }
@@ -191,7 +172,8 @@ async function handleApiKeys(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === 'POST') {
-    const body = await request.json<{ name?: string; quota_limit?: number }>()
+    let body: { name?: string; quota_limit?: number }
+    try { body = await request.json() } catch { return json({ error: 'Invalid JSON body' }, 400) }
 
     const apiKey = `sk-${Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b => b.toString(16).padStart(2, '0')).join('')}`
     const keyHash = await hashApiKey(apiKey)
@@ -228,8 +210,8 @@ async function handleUsage(request: Request, env: Env): Promise<Response> {
 
   const db = createDatabase(env.DB)
   const url = new URL(request.url)
-  const limit = parseInt(url.searchParams.get('limit') || '100')
-  const offset = parseInt(url.searchParams.get('offset') || '0')
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '100', 10) || 100, 1), 500)
+  const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0)
 
   const records = await db.listUsageRecords(limit, offset)
   return json({ data: records })
@@ -242,21 +224,20 @@ async function checkAuth(request: Request, env: Env): Promise<any> {
   }
 
   const token = authHeader.slice(7)
-  const session = await verifySessionToken(token, env.JWT_SECRET || 'default-secret')
+  const session = await verifySessionToken(token, env.JWT_SECRET || 'change-me-in-dashboard')
   return session
 }
 
-function createSessionToken(session: any): string {
-  const payload = {
-    sub: session.userId,
-    username: session.username,
-    admin: session.isAdmin,
-    exp: Math.floor(session.expiresAt / 1000)
+async function handleProviderModels(request: Request, env: Env): Promise<Response> {
+  const authHeader = request.headers.get('authorization')
+  if (!authHeader?.startsWith('Bearer ')) return json({ error: 'Missing API key' }, 401)
+  const db = createDatabase(env.DB)
+  if (!await authenticateApiKey(db, authHeader.slice(7))) {
+    return json({ error: 'Invalid or disabled API key' }, 401)
   }
-
-  const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
-  const payloadB64 = btoa(JSON.stringify(payload))
-  const signature = btoa(`${header}.${payloadB64}`)
-
-  return `${header}.${payloadB64}.${signature}`
+  const accounts = await db.listEnabledAccounts()
+  const mappings = await db.listModelMappings()
+  const ids = new Set<string>(mappings.filter(m => m.enabled).map(m => m.requested_model))
+  accounts.forEach(account => ids.add(account.provider === 'anthropic' ? 'claude-3-5-sonnet-20241022' : account.provider === 'xai' ? 'grok-2-latest' : 'gpt-4o'))
+  return json({ object: 'list', data: [...ids].map(id => ({ id, object: 'model', owned_by: 'sub2api' })) })
 }
