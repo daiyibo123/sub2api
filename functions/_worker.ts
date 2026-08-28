@@ -17,7 +17,7 @@ import { handleModelsRequest } from './src/config/models'
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
-    const path = url.pathname
+    const path = url.pathname.replace(/\/+$/, '') || '/'
 
     if (!env.DB) return json({ error: 'D1 binding DB is not configured' }, 500)
 
@@ -43,8 +43,10 @@ export default {
     }
 
     // Setup
-    if (path === '/api/v1/auth/setup' && request.method === 'POST') {
-      return handleSetup(request, env)
+    if (path === '/api/v1/auth/setup') {
+      if (request.method === 'POST') return handleSetup(request, env)
+      if (request.method === 'GET') return json({ method: 'POST', message: 'Send username and password as JSON to initialize the administrator.' })
+      return json({ error: 'Method not allowed' }, 405)
     }
 
     // API Key management
