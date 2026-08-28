@@ -37,7 +37,10 @@ var SCHEMA_STATEMENTS = [
     api_key TEXT NOT NULL,
     base_url TEXT,
     group_id INTEGER NOT NULL,
-    channel_id INTEGER NOT NULL,
+    -- Retired: the channel layer was folded into accounts. Kept with a default
+    -- so one INSERT statement works against databases created before the
+    -- change, where this column still carries a NOT NULL constraint.
+    channel_id INTEGER DEFAULT 0,
     enabled INTEGER DEFAULT 1,
     error_count INTEGER DEFAULT 0,
     error_rate REAL DEFAULT 0,
@@ -104,6 +107,25 @@ var SCHEMA_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_records(created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_accounts_group ON accounts(group_id)`,
   `CREATE INDEX IF NOT EXISTS idx_accounts_channel ON accounts(channel_id)`
+];
+var ADDITIVE_COLUMNS = [
+  // Time to first byte. Latency alone hides whether a slow response was slow to
+  // start or merely long, which is the number that matters for streaming.
+  { table: "usage_records", column: "ttft_ms", definition: "INTEGER" },
+  { table: "request_logs", column: "ttft_ms", definition: "INTEGER" },
+  // Upstream billing weight. Scheduling prefers cheaper accounts, so a 0.5x
+  // reseller is chosen ahead of a 2x one when both are healthy.
+  { table: "accounts", column: "rate_multiplier", definition: "REAL DEFAULT 1" },
+  { table: "channels", column: "rate_multiplier", definition: "REAL DEFAULT 1" },
+  // Health probe results, kept on the row so the console can show liveness
+  // without re-testing every upstream on each page load.
+  { table: "accounts", column: "last_check_at", definition: "TEXT" },
+  { table: "accounts", column: "last_check_ok", definition: "INTEGER" },
+  { table: "accounts", column: "last_check_latency_ms", definition: "INTEGER" },
+  { table: "accounts", column: "last_check_message", definition: "TEXT" },
+  // A client key may be pinned to one group. NULL keeps the previous behaviour
+  // of allowing every group, so existing keys are unaffected.
+  { table: "api_keys", column: "group_id", definition: "INTEGER" }
 ];
 
 // functions/src/db.ts
@@ -208,74 +230,25 @@ var Database = class {
   async deleteGroup(id) {
     return this.update("DELETE FROM groups WHERE id = ?", [id]);
   }
-  // Channel operations
-  async listChannels() {
-    return this.query("SELECT * FROM channels ORDER BY priority ASC, id ASC");
-  }
-  async getChannel(id) {
-    return this.queryOne("SELECT * FROM channels WHERE id = ?", [id]);
-  }
-  /** channels.name is UNIQUE; pre-check so collisions get a readable message. */
-  async getChannelByName(name) {
-    return this.queryOne("SELECT * FROM channels WHERE name = ?", [name]);
-  }
-  async createChannel(name, provider, baseUrl, apiKey, priority = 0, enabled = 1) {
-    return this.insert(
-      "INSERT INTO channels (name, provider, base_url, api_key, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)",
-      [name, provider, baseUrl || "", apiKey || "", priority, enabled]
-    );
-  }
-  async updateChannel(id, updates) {
-    const fields = [];
-    const values = [];
-    if (updates.name !== void 0) {
-      fields.push("name = ?");
-      values.push(updates.name);
-    }
-    if (updates.provider !== void 0) {
-      fields.push("provider = ?");
-      values.push(updates.provider);
-    }
-    if (updates.base_url !== void 0) {
-      fields.push("base_url = ?");
-      values.push(updates.base_url);
-    }
-    if (updates.api_key !== void 0) {
-      fields.push("api_key = ?");
-      values.push(updates.api_key);
-    }
-    if (updates.enabled !== void 0) {
-      fields.push("enabled = ?");
-      values.push(updates.enabled);
-    }
-    if (updates.priority !== void 0) {
-      fields.push("priority = ?");
-      values.push(updates.priority);
-    }
-    if (fields.length === 0) return { changes: 0 };
-    values.push(id);
-    return this.update(`UPDATE channels SET ${fields.join(", ")} WHERE id = ?`, values);
-  }
-  async deleteChannel(id) {
-    return this.update("DELETE FROM channels WHERE id = ?", [id]);
-  }
   // Account operations
   async listAccounts() {
     return this.query(`
-      SELECT a.*, g.name as group_name, c.name as channel_name 
+      SELECT a.*, g.name as group_name
       FROM accounts a
       LEFT JOIN groups g ON a.group_id = g.id
-      LEFT JOIN channels c ON a.channel_id = c.id
       ORDER BY a.priority ASC, a.id ASC
     `);
   }
   async getAccount(id) {
     return this.queryOne("SELECT * FROM accounts WHERE id = ?", [id]);
   }
-  async createAccount(name, provider, apiKey, groupId, channelId, baseUrl, priority = 0, clientSpoofing, enabled = 1) {
+  async createAccount(name, provider, apiKey, groupId, baseUrl, priority = 0, clientSpoofing, enabled = 1, rateMultiplier = 1) {
     return this.insert(
-      "INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [name, provider, apiKey, baseUrl || "", groupId, channelId, priority, clientSpoofing || "", enabled]
+      // channel_id is a retired column that older databases still declare
+      // NOT NULL, so a literal 0 is written to satisfy both shapes.
+      `INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing, enabled, rate_multiplier)
+       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+      [name, provider, apiKey, baseUrl || "", groupId, priority, clientSpoofing || "", enabled, rateMultiplier]
     );
   }
   async updateAccount(id, updates) {
@@ -301,10 +274,6 @@ var Database = class {
       fields.push("group_id = ?");
       values.push(updates.group_id);
     }
-    if (updates.channel_id !== void 0) {
-      fields.push("channel_id = ?");
-      values.push(updates.channel_id);
-    }
     if (updates.enabled !== void 0) {
       fields.push("enabled = ?");
       values.push(updates.enabled);
@@ -325,6 +294,10 @@ var Database = class {
       fields.push("client_spoofing = ?");
       values.push(updates.client_spoofing);
     }
+    if (updates.rate_multiplier !== void 0) {
+      fields.push("rate_multiplier = ?");
+      values.push(updates.rate_multiplier);
+    }
     if (fields.length === 0) return { changes: 0 };
     values.push(id);
     return this.update(`UPDATE accounts SET ${fields.join(", ")} WHERE id = ?`, values);
@@ -336,16 +309,12 @@ var Database = class {
     return this.query("SELECT * FROM accounts WHERE group_id = ? AND enabled = 1 ORDER BY priority ASC, id ASC", [groupId]);
   }
   /**
-   * An account with a blank api_key falls back to its channel's key, so a
-   * channel can hold one shared credential for several accounts.
+   * Credentials live on the account itself; there is no longer a second layer
+   * holding shared defaults.
    */
   async listEnabledAccounts() {
     return this.query(`
-      SELECT a.*, COALESCE(NULLIF(a.api_key, ''), c.api_key, '') AS api_key
-      FROM accounts a
-      LEFT JOIN channels c ON a.channel_id = c.id
-      WHERE a.enabled = 1
-      ORDER BY a.priority ASC, a.id ASC
+      SELECT * FROM accounts WHERE enabled = 1 ORDER BY priority ASC, id ASC
     `);
   }
   /** Dependants that would break if a group were removed. */
@@ -364,42 +333,30 @@ var Database = class {
     return Number(row?.total || 0);
   }
   /**
-   * Count accounts that would be orphaned by switching a channel's provider.
-   * Scheduling requires channel.provider === account.provider, so such accounts
-   * would silently stop receiving traffic.
-   */
-  async countAccountsForChannelWithOtherProvider(channelId, nextProvider) {
-    const row = await this.queryOne(
-      "SELECT COUNT(*) AS total FROM accounts WHERE channel_id = ? AND provider != ?",
-      [channelId, nextProvider]
-    );
-    return Number(row?.total || 0);
-  }
-  /**
-   * Name lookups back friendly duplicate errors. Both groups and channels have
+   * Name lookups back friendly duplicate errors. Groups have
    * a UNIQUE(name) constraint, which would otherwise surface as a raw D1 500.
    */
   async findGroupByName(name) {
     return this.queryOne("SELECT * FROM groups WHERE name = ?", [name]);
   }
-  async findChannelByName(name) {
-    return this.queryOne("SELECT * FROM channels WHERE name = ?", [name]);
-  }
-  /** Accounts still pointing at a channel, used to block unsafe deletes. */
-  async countAccountsForChannel(channelId) {
-    const row = await this.queryOne(
-      "SELECT COUNT(*) AS total FROM accounts WHERE channel_id = ?",
-      [channelId]
+  /**
+   * Store the outcome of a liveness probe on the account row.
+   *
+   * Keeping the last result denormalized lets the console show which upstreams
+   * are alive without re-probing every provider on each page load.
+   */
+  async recordAccountHealthCheck(id, ok, latencyMs, message) {
+    return this.update(
+      `UPDATE accounts
+       SET last_check_at = datetime('now'), last_check_ok = ?, last_check_latency_ms = ?, last_check_message = ?
+       WHERE id = ?`,
+      [ok ? 1 : 0, Math.max(0, Math.round(latencyMs)), (message || "").slice(0, 300), id]
     );
-    return Number(row?.total || 0);
   }
-  /** Resolve an account with the channel key fallback applied. */
+  /** Resolve a single account row including its credential. */
   async getAccountWithKey(id) {
     return this.queryOne(`
-      SELECT a.*, COALESCE(NULLIF(a.api_key, ''), c.api_key, '') AS api_key
-      FROM accounts a
-      LEFT JOIN channels c ON a.channel_id = c.id
-      WHERE a.id = ?
+      SELECT * FROM accounts WHERE id = ?
     `, [id]);
   }
   // Model mapping operations
@@ -462,15 +419,21 @@ var Database = class {
   }
   // API Key operations
   async listApiKeys() {
-    return this.query("SELECT id, name, enabled, balance, quota_limit, created_at FROM api_keys ORDER BY id DESC");
+    return this.query(`
+      SELECT k.id, k.name, k.enabled, k.balance, k.quota_limit, k.group_id, k.created_at,
+             g.name AS group_name
+      FROM api_keys k
+      LEFT JOIN groups g ON k.group_id = g.id
+      ORDER BY k.id DESC
+    `);
   }
   async getApiKeyByHash(keyHash) {
     return this.queryOne("SELECT * FROM api_keys WHERE key_hash = ?", [keyHash]);
   }
-  async createApiKey(keyHash, name, quotaLimit = 0) {
+  async createApiKey(keyHash, name, quotaLimit = 0, groupId = null) {
     return this.insert(
-      "INSERT INTO api_keys (key_hash, name, quota_limit) VALUES (?, ?, ?)",
-      [keyHash, name || "", quotaLimit]
+      "INSERT INTO api_keys (key_hash, name, quota_limit, group_id) VALUES (?, ?, ?, ?)",
+      [keyHash, name || "", quotaLimit, groupId]
     );
   }
   async updateApiKey(id, updates) {
@@ -492,6 +455,10 @@ var Database = class {
       fields.push("quota_limit = ?");
       values.push(updates.quota_limit);
     }
+    if (updates.group_id !== void 0) {
+      fields.push("group_id = ?");
+      values.push(updates.group_id);
+    }
     if (fields.length === 0) return { changes: 0 };
     values.push(id);
     return this.update(`UPDATE api_keys SET ${fields.join(", ")} WHERE id = ?`, values);
@@ -509,8 +476,8 @@ var Database = class {
   async createUsageRecord(record) {
     return this.insert(
       `INSERT INTO usage_records 
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, status, error_message, latency_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, status, error_message, latency_ms, ttft_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -521,7 +488,8 @@ var Database = class {
         record.cost ?? 0,
         record.status ?? 200,
         record.error_message || "",
-        record.latency_ms ?? 0
+        record.latency_ms ?? 0,
+        record.ttft_ms ?? null
       ]
     );
   }
@@ -534,16 +502,17 @@ var Database = class {
   // Request logs for error tracking
   async createRequestLog(log) {
     return this.insert(
-      `INSERT INTO request_logs (account_id, channel_id, group_id, model, status, error_message, latency_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO request_logs (account_id, channel_id, group_id, model, status, error_message, latency_ms, ttft_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         log.account_id,
-        log.channel_id,
+        0,
         log.group_id,
         log.model,
         log.status,
         log.error_message || "",
-        log.latency_ms ?? 0
+        log.latency_ms ?? 0,
+        log.ttft_ms ?? null
       ]
     );
   }
@@ -556,18 +525,6 @@ var Database = class {
        FROM request_logs 
        WHERE account_id = ? AND created_at >= ?`,
       [accountId, cutoff]
-    );
-    return result || { total_requests: 0, error_count: 0 };
-  }
-  async getChannelErrorStats(channelId, windowSeconds) {
-    const cutoff = sqliteTimestamp(Date.now() - windowSeconds * 1e3);
-    const result = await this.queryOne(
-      `SELECT 
-        COUNT(*) as total_requests,
-        SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) as error_count
-       FROM request_logs 
-       WHERE channel_id = ? AND created_at >= ?`,
-      [channelId, cutoff]
     );
     return result || { total_requests: 0, error_count: 0 };
   }
@@ -604,8 +561,6 @@ var Database = class {
           (SELECT COUNT(*) FROM accounts WHERE enabled = 1) AS active_accounts,
           (SELECT COUNT(*) FROM api_keys) AS total_keys,
           (SELECT COUNT(*) FROM api_keys WHERE enabled = 1) AS active_keys,
-          (SELECT COUNT(*) FROM channels) AS total_channels,
-          (SELECT COUNT(*) FROM channels WHERE enabled = 1) AS active_channels,
           (SELECT COUNT(*) FROM groups) AS total_groups,
           (SELECT COUNT(*) FROM groups WHERE enabled = 1) AS active_groups,
           (SELECT COUNT(*) FROM model_mappings) AS total_models,
@@ -645,7 +600,97 @@ var Database = class {
     for (const statement of SCHEMA_STATEMENTS) {
       await this.db.prepare(statement).run();
     }
+    await this.applyAdditiveColumns();
+    await this.migrateChannelsIntoAccounts();
     return !wasReady;
+  }
+  /**
+   * Fold the retired channel layer into accounts.
+   *
+   * Channels only ever supplied defaults: a fallback API key and base URL. Two
+   * behaviours depended on that indirection and must be preserved exactly, or
+   * upgrading would silently change which upstreams receive traffic:
+   *
+   *  1. An account with a blank key inherited the channel key at request time.
+   *     Those credentials are copied onto the account, otherwise the account
+   *     would suddenly have no key at all.
+   *  2. Scheduling skipped accounts whose channel was disabled. Without the
+   *     channel there is nothing left to express that, so such accounts are
+   *     disabled individually rather than being quietly promoted to live.
+   *
+   * Guarded by a settings flag so it runs once, and wrapped so a database that
+   * never had a channels table (a fresh deployment) is unaffected.
+   */
+  async migrateChannelsIntoAccounts() {
+    if (await this.getSetting("channels_folded_into_accounts")) return;
+    const hasChannels = await this.queryOne(
+      "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'channels'"
+    ).catch(() => null);
+    if (!Number(hasChannels?.total || 0)) {
+      await this.setSetting("channels_folded_into_accounts", (/* @__PURE__ */ new Date()).toISOString());
+      return;
+    }
+    try {
+      await this.update(`
+        UPDATE accounts SET api_key = COALESCE(
+          (SELECT c.api_key FROM channels c WHERE c.id = accounts.channel_id), ''
+        )
+        WHERE (api_key IS NULL OR TRIM(api_key) = '')
+          AND EXISTS (SELECT 1 FROM channels c
+                      WHERE c.id = accounts.channel_id AND TRIM(COALESCE(c.api_key, '')) != '')
+      `);
+      await this.update(`
+        UPDATE accounts SET base_url = COALESCE(
+          (SELECT c.base_url FROM channels c WHERE c.id = accounts.channel_id), ''
+        )
+        WHERE (base_url IS NULL OR TRIM(base_url) = '')
+          AND EXISTS (SELECT 1 FROM channels c
+                      WHERE c.id = accounts.channel_id AND TRIM(COALESCE(c.base_url, '')) != '')
+      `);
+      await this.update(`
+        UPDATE accounts SET rate_multiplier = COALESCE(
+          (SELECT c.rate_multiplier FROM channels c WHERE c.id = accounts.channel_id), 1
+        )
+        WHERE (rate_multiplier IS NULL OR rate_multiplier = 1)
+          AND EXISTS (SELECT 1 FROM channels c
+                      WHERE c.id = accounts.channel_id
+                        AND c.rate_multiplier IS NOT NULL AND c.rate_multiplier != 1)
+      `).catch(() => {
+      });
+      await this.update(`
+        UPDATE accounts SET enabled = 0
+        WHERE EXISTS (SELECT 1 FROM channels c
+                      WHERE c.id = accounts.channel_id AND c.enabled = 0)
+      `);
+      await this.setSetting("channels_folded_into_accounts", (/* @__PURE__ */ new Date()).toISOString());
+    } catch {
+    }
+  }
+  /**
+   * Add columns introduced after a database was first created.
+   *
+   * SQLite lacks `ADD COLUMN IF NOT EXISTS`, so the existing columns are read
+   * from `PRAGMA table_info` and only genuinely missing ones are added. This
+   * never rewrites or drops data.
+   */
+  async applyAdditiveColumns() {
+    const tables = [...new Set(ADDITIVE_COLUMNS.map((entry) => entry.table))];
+    const existing = /* @__PURE__ */ new Map();
+    for (const table of tables) {
+      try {
+        const rows = await this.query(`PRAGMA table_info(${table})`);
+        existing.set(table, new Set(rows.map((row) => row.name)));
+      } catch {
+      }
+    }
+    for (const { table, column, definition } of ADDITIVE_COLUMNS) {
+      const columns = existing.get(table);
+      if (!columns || columns.has(column)) continue;
+      try {
+        await this.db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      } catch {
+      }
+    }
   }
   /** Read a persisted setting, or null when it has never been written. */
   async getSetting(key) {
@@ -679,9 +724,9 @@ var Database = class {
   async schemaReady() {
     try {
       const row = await this.queryOne(
-        "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','channels','accounts','model_mappings','api_keys','usage_records','request_logs')"
+        "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','accounts','model_mappings','api_keys','usage_records','request_logs')"
       );
-      return Number(row?.total || 0) >= 8;
+      return Number(row?.total || 0) >= 7;
     } catch {
       return false;
     }
@@ -805,169 +850,6 @@ async function authenticateApiKey(db, apiKey) {
   return key;
 }
 
-// functions/src/failover.ts
-var FailoverManager = class {
-  errorWindows = /* @__PURE__ */ new Map();
-  windowMs;
-  errorRateThreshold;
-  errorCountThreshold;
-  db;
-  lastUsed = /* @__PURE__ */ new Map();
-  constructor(env) {
-    const windowSeconds = Number(env.WINDOW_SECONDS);
-    const errorRateThreshold = Number(env.ERROR_RATE_THRESHOLD);
-    const errorCountThreshold = Number(env.ERROR_COUNT_THRESHOLD);
-    this.windowMs = (Number.isFinite(windowSeconds) && windowSeconds > 0 ? windowSeconds : 300) * 1e3;
-    this.errorRateThreshold = Number.isFinite(errorRateThreshold) ? Math.min(Math.max(errorRateThreshold, 0), 1) : 0.5;
-    this.errorCountThreshold = Number.isFinite(errorCountThreshold) && errorCountThreshold > 0 ? Math.floor(errorCountThreshold) : 5;
-  }
-  setDb(db) {
-    this.db = db;
-  }
-  // Record request result for error tracking
-  recordRequest(accountId, channelId, groupId, isError) {
-    const now = Date.now();
-    const key = accountId;
-    let window = this.errorWindows.get(key);
-    if (!window) {
-      window = {
-        accountId,
-        channelId,
-        groupId,
-        timestamps: [],
-        errors: []
-      };
-      this.errorWindows.set(key, window);
-    }
-    const cutoff = now - this.windowMs;
-    while (window.timestamps.length > 0 && window.timestamps[0] < cutoff) {
-      window.timestamps.shift();
-      window.errors.shift();
-    }
-    window.timestamps.push(now);
-    window.errors.push(isError ? 1 : 0);
-  }
-  // Get error stats for an account
-  getMemoryErrorStats(accountId, group) {
-    const window = this.errorWindows.get(accountId);
-    if (!window) {
-      return {
-        accountId,
-        channelId: 0,
-        groupId: 0,
-        windowStart: Date.now() - this.windowMs,
-        totalRequests: 0,
-        errorCount: 0,
-        errorRate: 0,
-        isUnhealthy: false
-      };
-    }
-    const totalRequests = window.timestamps.length;
-    const errorCount = window.errors.reduce((sum, err) => sum + err, 0);
-    const errorRate = totalRequests > 0 ? errorCount / totalRequests : 0;
-    const errorRateThreshold = group?.error_threshold ?? this.errorRateThreshold;
-    const errorCountThreshold = group?.error_count_threshold ?? this.errorCountThreshold;
-    return {
-      accountId,
-      channelId: window.channelId,
-      groupId: window.groupId,
-      windowStart: Date.now() - this.windowMs,
-      totalRequests,
-      errorCount,
-      errorRate,
-      isUnhealthy: errorRate > errorRateThreshold || errorCount >= errorCountThreshold
-    };
-  }
-  async getErrorStats(accountId, group) {
-    const windowSeconds = Math.max(1, Number(group?.window_seconds) || this.windowMs / 1e3);
-    if (this.db) {
-      try {
-        const persisted = await this.db.getAccountErrorStats(accountId, windowSeconds);
-        const totalRequests = Number(persisted.total_requests || 0);
-        const errorCount = Number(persisted.error_count || 0);
-        const errorRate = totalRequests > 0 ? errorCount / totalRequests : 0;
-        return {
-          accountId,
-          channelId: 0,
-          groupId: group?.id ?? 0,
-          windowStart: Date.now() - windowSeconds * 1e3,
-          totalRequests,
-          errorCount,
-          errorRate,
-          isUnhealthy: errorRate > (group?.error_threshold ?? this.errorRateThreshold) || errorCount >= (group?.error_count_threshold ?? this.errorCountThreshold)
-        };
-      } catch {
-      }
-    }
-    return this.getMemoryErrorStats(accountId, group);
-  }
-  // Select best account from available accounts
-  async selectAccount(accounts, channels, groups, preferredGroupId) {
-    if (accounts.length === 0) return null;
-    const usableAccounts = accounts.filter((acc) => {
-      const channel2 = channels.get(acc.channel_id);
-      const group2 = groups.get(acc.group_id);
-      return acc.enabled === 1 && Boolean(channel2 && group2 && channel2.enabled === 1 && group2.enabled === 1) && channel2?.provider === acc.provider;
-    });
-    if (usableAccounts.length === 0) return null;
-    const preferred = preferredGroupId ? usableAccounts.filter((acc) => acc.group_id === preferredGroupId) : [];
-    const candidateAccounts = preferred.length > 0 ? preferred : usableAccounts;
-    const statsByAccount = new Map(
-      await Promise.all(candidateAccounts.map(async (acc) => [
-        acc.id,
-        await this.getErrorStats(acc.id, groups.get(acc.group_id))
-      ]))
-    );
-    let healthyAccounts = candidateAccounts.filter((acc) => {
-      const stats = statsByAccount.get(acc.id);
-      return !stats.isUnhealthy;
-    });
-    if (healthyAccounts.length === 0) {
-      healthyAccounts = [...candidateAccounts].sort((a, b) => {
-        const statsA = statsByAccount.get(a.id);
-        const statsB = statsByAccount.get(b.id);
-        return statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount;
-      });
-    }
-    healthyAccounts.sort((a, b) => {
-      const groupA = groups.get(a.group_id);
-      const groupB = groups.get(b.group_id);
-      const channelA = channels.get(a.channel_id);
-      const channelB = channels.get(b.channel_id);
-      const statsA = statsByAccount.get(a.id);
-      const statsB = statsByAccount.get(b.id);
-      return groupA.priority - groupB.priority || channelA.priority - channelB.priority || a.priority - b.priority || statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount || (this.lastUsed.get(a.id) ?? 0) - (this.lastUsed.get(b.id) ?? 0) || a.id - b.id;
-    });
-    const selected = healthyAccounts[0];
-    const channel = channels.get(selected.channel_id);
-    const group = groups.get(selected.group_id);
-    if (!channel || !group) return null;
-    this.lastUsed.set(selected.id, Date.now());
-    return {
-      account: selected,
-      channel,
-      group,
-      stats: statsByAccount.get(selected.id) ?? null
-    };
-  }
-  // Check if error should trigger failover
-  shouldFailover(error) {
-    if (!error) return false;
-    const status = error.status || error.statusCode || 0;
-    return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
-  }
-  // Cleanup old windows periodically
-  cleanup() {
-    const now = Date.now();
-    const cutoff = now - this.windowMs * 2;
-    for (const [key, window] of this.errorWindows) {
-      if (window.timestamps.length > 0 && window.timestamps[window.timestamps.length - 1] < cutoff) {
-        this.errorWindows.delete(key);
-      }
-    }
-  }
-};
-
 // functions/src/utils/proxy.ts
 async function proxyRequest(request) {
   const controller = new AbortController();
@@ -1085,11 +967,68 @@ function applyClientSpoofing(headers, provider, clientSpoofing) {
   } catch {
   }
 }
-function resolveUpstreamCredentials(account, channel) {
+function resolveUpstreamCredentials(account) {
   return {
-    apiKey: String(account?.api_key || "").trim() || String(channel?.api_key || "").trim(),
-    baseUrl: String(account?.base_url || "").trim() || String(channel?.base_url || "").trim()
+    apiKey: String(account?.api_key || "").trim(),
+    baseUrl: String(account?.base_url || "").trim()
   };
+}
+function measureStreamTiming(body, startedAt, onDone) {
+  let ttftMs = null;
+  let settled = false;
+  let tail = "";
+  const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  const decoder = new TextDecoder();
+  const TAIL_LIMIT = 4096;
+  const scan = (text) => {
+    tail = (tail + text).slice(-TAIL_LIMIT);
+    const prompt = /"(?:prompt_tokens|input_tokens)"\s*:\s*(\d+)/g;
+    const completion = /"(?:completion_tokens|output_tokens)"\s*:\s*(\d+)/g;
+    const total = /"total_tokens"\s*:\s*(\d+)/g;
+    for (let m = prompt.exec(tail); m; m = prompt.exec(tail)) {
+      usage.promptTokens = Math.max(usage.promptTokens, Number(m[1]) || 0);
+    }
+    for (let m = completion.exec(tail); m; m = completion.exec(tail)) {
+      usage.completionTokens = Math.max(usage.completionTokens, Number(m[1]) || 0);
+    }
+    for (let m = total.exec(tail); m; m = total.exec(tail)) {
+      usage.totalTokens = Math.max(usage.totalTokens, Number(m[1]) || 0);
+    }
+  };
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    try {
+      onDone({
+        ttftMs,
+        totalMs: Date.now() - startedAt,
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+        totalTokens: usage.totalTokens || usage.promptTokens + usage.completionTokens
+      });
+    } catch {
+    }
+  };
+  return body.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+      if (ttftMs === null) ttftMs = Date.now() - startedAt;
+      try {
+        scan(decoder.decode(chunk, { stream: true }));
+      } catch {
+      }
+    },
+    flush() {
+      finish();
+    },
+    cancel() {
+      finish();
+    }
+  }));
+}
+function accountRateMultiplier(account) {
+  const value = Number(account?.rate_multiplier);
+  return Number.isFinite(value) && value >= 0 ? value : 1;
 }
 function getUpstreamBaseUrl(baseUrl, provider) {
   if (baseUrl && baseUrl.trim()) {
@@ -1114,6 +1053,163 @@ function findModelMapping(requestedModel, mappings, provider) {
     return requestedModel.startsWith(mapping.requested_model.slice(0, -1));
   }) || null;
 }
+
+// functions/src/failover.ts
+var FailoverManager = class {
+  errorWindows = /* @__PURE__ */ new Map();
+  windowMs;
+  errorRateThreshold;
+  errorCountThreshold;
+  db;
+  lastUsed = /* @__PURE__ */ new Map();
+  constructor(env) {
+    const windowSeconds = Number(env.WINDOW_SECONDS);
+    const errorRateThreshold = Number(env.ERROR_RATE_THRESHOLD);
+    const errorCountThreshold = Number(env.ERROR_COUNT_THRESHOLD);
+    this.windowMs = (Number.isFinite(windowSeconds) && windowSeconds > 0 ? windowSeconds : 300) * 1e3;
+    this.errorRateThreshold = Number.isFinite(errorRateThreshold) ? Math.min(Math.max(errorRateThreshold, 0), 1) : 0.5;
+    this.errorCountThreshold = Number.isFinite(errorCountThreshold) && errorCountThreshold > 0 ? Math.floor(errorCountThreshold) : 5;
+  }
+  setDb(db) {
+    this.db = db;
+  }
+  // Record request result for error tracking
+  recordRequest(accountId, groupId, isError) {
+    const now = Date.now();
+    const key = accountId;
+    let window = this.errorWindows.get(key);
+    if (!window) {
+      window = {
+        accountId,
+        groupId,
+        timestamps: [],
+        errors: []
+      };
+      this.errorWindows.set(key, window);
+    }
+    const cutoff = now - this.windowMs;
+    while (window.timestamps.length > 0 && window.timestamps[0] < cutoff) {
+      window.timestamps.shift();
+      window.errors.shift();
+    }
+    window.timestamps.push(now);
+    window.errors.push(isError ? 1 : 0);
+  }
+  // Get error stats for an account
+  getMemoryErrorStats(accountId, group) {
+    const window = this.errorWindows.get(accountId);
+    if (!window) {
+      return {
+        accountId,
+        groupId: 0,
+        windowStart: Date.now() - this.windowMs,
+        totalRequests: 0,
+        errorCount: 0,
+        errorRate: 0,
+        isUnhealthy: false
+      };
+    }
+    const totalRequests = window.timestamps.length;
+    const errorCount = window.errors.reduce((sum, err) => sum + err, 0);
+    const errorRate = totalRequests > 0 ? errorCount / totalRequests : 0;
+    const errorRateThreshold = group?.error_threshold ?? this.errorRateThreshold;
+    const errorCountThreshold = group?.error_count_threshold ?? this.errorCountThreshold;
+    return {
+      accountId,
+      groupId: window.groupId,
+      windowStart: Date.now() - this.windowMs,
+      totalRequests,
+      errorCount,
+      errorRate,
+      isUnhealthy: errorRate > errorRateThreshold || errorCount >= errorCountThreshold
+    };
+  }
+  async getErrorStats(accountId, group) {
+    const windowSeconds = Math.max(1, Number(group?.window_seconds) || this.windowMs / 1e3);
+    if (this.db) {
+      try {
+        const persisted = await this.db.getAccountErrorStats(accountId, windowSeconds);
+        const totalRequests = Number(persisted.total_requests || 0);
+        const errorCount = Number(persisted.error_count || 0);
+        const errorRate = totalRequests > 0 ? errorCount / totalRequests : 0;
+        return {
+          accountId,
+          groupId: group?.id ?? 0,
+          windowStart: Date.now() - windowSeconds * 1e3,
+          totalRequests,
+          errorCount,
+          errorRate,
+          isUnhealthy: errorRate > (group?.error_threshold ?? this.errorRateThreshold) || errorCount >= (group?.error_count_threshold ?? this.errorCountThreshold)
+        };
+      } catch {
+      }
+    }
+    return this.getMemoryErrorStats(accountId, group);
+  }
+  // Select best account from available accounts
+  async selectAccount(accounts, groups, preferredGroupId) {
+    if (accounts.length === 0) return null;
+    const usableAccounts = accounts.filter((acc) => {
+      const group2 = groups.get(acc.group_id);
+      return acc.enabled === 1 && Boolean(group2 && group2.enabled === 1);
+    });
+    if (usableAccounts.length === 0) return null;
+    const preferred = preferredGroupId ? usableAccounts.filter((acc) => acc.group_id === preferredGroupId) : [];
+    const candidateAccounts = preferred.length > 0 ? preferred : usableAccounts;
+    const statsByAccount = new Map(
+      await Promise.all(candidateAccounts.map(async (acc) => [
+        acc.id,
+        await this.getErrorStats(acc.id, groups.get(acc.group_id))
+      ]))
+    );
+    let healthyAccounts = candidateAccounts.filter((acc) => !statsByAccount.get(acc.id).isUnhealthy);
+    if (healthyAccounts.length === 0) {
+      healthyAccounts = [...candidateAccounts].sort((a, b) => {
+        const statsA = statsByAccount.get(a.id);
+        const statsB = statsByAccount.get(b.id);
+        return statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount;
+      });
+    }
+    healthyAccounts.sort((a, b) => {
+      const groupA = groups.get(a.group_id);
+      const groupB = groups.get(b.group_id);
+      const statsA = statsByAccount.get(a.id);
+      const statsB = statsByAccount.get(b.id);
+      return groupA.priority - groupB.priority || a.priority - b.priority || accountRateMultiplier(a) - accountRateMultiplier(b) || statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount || (this.lastUsed.get(a.id) ?? 0) - (this.lastUsed.get(b.id) ?? 0) || a.id - b.id;
+    });
+    const selected = healthyAccounts[0];
+    const group = groups.get(selected.group_id);
+    if (!group) return null;
+    this.lastUsed.set(selected.id, Date.now());
+    return {
+      account: selected,
+      group,
+      stats: statsByAccount.get(selected.id) ?? null
+    };
+  }
+  /** Persist a health probe result so the console can show liveness. */
+  async recordHealthCheck(accountId, ok, latencyMs, message) {
+    if (!this.db) return;
+    await this.db.recordAccountHealthCheck(accountId, ok, latencyMs, message).catch(() => {
+    });
+  }
+  // Check if error should trigger failover
+  shouldFailover(error) {
+    if (!error) return false;
+    const status = error.status || error.statusCode || 0;
+    return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
+  }
+  // Cleanup old windows periodically
+  cleanup() {
+    const now = Date.now();
+    const cutoff = now - this.windowMs * 2;
+    for (const [key, window] of this.errorWindows) {
+      if (window.timestamps.length > 0 && window.timestamps[window.timestamps.length - 1] < cutoff) {
+        this.errorWindows.delete(key);
+      }
+    }
+  }
+};
 
 // functions/src/billing.ts
 function estimateTokens(text) {
@@ -1177,6 +1273,52 @@ function calculateCost(provider, model, promptTokens, completionTokens) {
   return Math.round((promptCost + completionCost) * 1e6) / 1e6;
 }
 
+// functions/src/utils/record.ts
+function streamWithRecording(body, status, headers, context) {
+  const isError = status >= 400;
+  const measured = measureStreamTiming(body, context.startedAt, (outcome) => {
+    const cost = isError ? 0 : calculateCost(
+      context.provider,
+      context.model,
+      outcome.promptTokens,
+      outcome.completionTokens
+    ) * context.rateMultiplier;
+    if (cost > 0) {
+      context.db.incrementApiKeyUsage(context.keyRecordId, cost).catch(() => {
+      });
+    }
+    context.db.createUsageRecord({
+      api_key_id: context.keyRecordId,
+      model: context.model,
+      provider: context.provider,
+      prompt_tokens: outcome.promptTokens,
+      completion_tokens: outcome.completionTokens,
+      total_tokens: outcome.totalTokens,
+      cost,
+      status,
+      error_message: isError ? "Upstream error" : "",
+      latency_ms: outcome.totalMs,
+      ttft_ms: outcome.ttftMs ?? void 0
+    }).catch(() => {
+    });
+    context.db.createRequestLog({
+      account_id: context.accountId,
+      group_id: context.groupId,
+      model: context.model,
+      status,
+      error_message: isError ? "Upstream error" : "",
+      latency_ms: outcome.totalMs,
+      ttft_ms: outcome.ttftMs ?? void 0
+    }).catch(() => {
+    });
+  });
+  context.failover.recordRequest(context.accountId, context.groupId, isError);
+  return new Response(measured, {
+    status,
+    headers: { ...headers, "content-type": headers["content-type"] || "text/event-stream" }
+  });
+}
+
 // functions/src/routes/gateway.ts
 async function handleGatewayRequest(request, env, failover) {
   const db = createDatabase(env.DB);
@@ -1209,29 +1351,37 @@ async function handleGatewayRequest(request, env, failover) {
     provider = "openai";
   }
   let accounts = await db.listEnabledAccounts();
-  const [channelsRaw, groupsRaw, mappingsRaw] = await Promise.all([
-    db.listChannels(),
+  const [groupsRaw, mappingsRaw] = await Promise.all([
     db.listGroups(),
     db.listModelMappings()
   ]);
-  const channels = new Map(channelsRaw.map((c) => [c.id, c]));
   const groups = new Map(groupsRaw.map((g) => [g.id, g]));
   const mappings = mappingsRaw;
   const mapping = findModelMapping(model, mappings);
   if (mapping?.provider) provider = mapping.provider;
   accounts = accounts.filter((a) => a.provider === provider && a.enabled);
+  const keyGroupId = Number(keyRecord?.group_id) || 0;
+  if (keyGroupId) {
+    accounts = accounts.filter((account2) => Number(account2.group_id) === keyGroupId);
+    if (accounts.length === 0) {
+      return new Response(JSON.stringify({
+        error: "No available accounts",
+        message: "\u8BE5 API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
+      }), { status: 503, headers: { "Content-Type": "application/json" } });
+    }
+  }
   if (accounts.length === 0) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
   const providerMapping = mapping && mapping.provider === provider ? mapping : findModelMapping(model, mappings, provider);
   let upstreamModel = providerMapping?.requested_model.endsWith("*") ? providerMapping.upstream_model + model.slice(providerMapping.requested_model.length - 1) : providerMapping?.upstream_model || model;
   const preferredGroupId = providerMapping?.group_id || void 0;
-  const selection = await failover.selectAccount(accounts, channels, groups, preferredGroupId);
+  const selection = await failover.selectAccount(accounts, groups, preferredGroupId);
   if (!selection) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
-  const { account, channel, group, stats } = selection;
-  const credentials = resolveUpstreamCredentials(account, channel);
+  const { account, group, stats } = selection;
+  const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   let upstreamPath = url.pathname;
   if (provider === "anthropic") {
@@ -1271,16 +1421,23 @@ async function handleGatewayRequest(request, env, failover) {
     isError = responseStatus >= 400;
     if (isError && failover.shouldFailover({ status: responseStatus }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
-      failover.recordRequest(account.id, channel.id, group.id, true);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }).catch(() => {
+      failover.recordRequest(account.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }).catch(() => {
       });
-      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`, preferredGroupId);
+      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`, preferredGroupId, startTime);
     }
     if (stream && proxyResponse.body) {
-      failover.recordRequest(account.id, channel.id, group.id, isError);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: isError ? "Upstream error" : "", latency_ms: Date.now() - startTime }).catch(() => {
+      return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+        db,
+        failover,
+        keyRecordId: keyRecord.id,
+        accountId: account.id,
+        groupId: group.id,
+        provider,
+        model: upstreamModel,
+        rateMultiplier: accountRateMultiplier(account),
+        startedAt: startTime
       });
-      return new Response(proxyResponse.body, { status: proxyResponse.status, headers: { ...proxyResponse.headers, "content-type": proxyResponse.headers["content-type"] || "text/event-stream" } });
     }
     const responseText = await proxyResponse.text();
     let responseBody = {};
@@ -1303,7 +1460,6 @@ async function handleGatewayRequest(request, env, failover) {
     });
     db.createRequestLog({
       account_id: account.id,
-      channel_id: channel.id,
       group_id: group.id,
       model: upstreamModel,
       status: responseStatus,
@@ -1311,7 +1467,7 @@ async function handleGatewayRequest(request, env, failover) {
       latency_ms: Date.now() - startTime
     }).catch(() => {
     });
-    failover.recordRequest(account.id, channel.id, group.id, isError);
+    failover.recordRequest(account.id, group.id, isError);
     return new Response(responseText, {
       status: proxyResponse.status,
       headers: {
@@ -1323,26 +1479,26 @@ async function handleGatewayRequest(request, env, failover) {
     isError = true;
     errorMessage = error instanceof Error ? error.message : "Unknown error";
     responseStatus = 502;
-    failover.recordRequest(account.id, channel.id, group.id, true);
-    db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {
+    failover.recordRequest(account.id, group.id, true);
+    db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {
     });
-    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId);
+    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, startTime);
   }
 }
-async function handleFailover(body, request, env, failover, keyRecord, accounts, channels, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId) {
+async function handleFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now()) {
   const db = createDatabase(env.DB);
   const attempted = /* @__PURE__ */ new Set();
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
     const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
-    const selection = await failover.selectAccount(nextAccounts, channels, groups, preferredGroupId);
+    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId);
     if (!selection) {
       break;
     }
-    const { account, channel, group } = selection;
+    const { account, group } = selection;
     attempted.add(account.id);
     try {
-      const credentials = resolveUpstreamCredentials(account, channel);
+      const credentials = resolveUpstreamCredentials(account);
       const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
       const url = new URL(request.url);
       let upstreamPath = url.pathname;
@@ -1367,13 +1523,25 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
       });
       const isError = proxyResponse.status >= 400;
       if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
-        failover.recordRequest(account.id, channel.id, group.id, true);
+        failover.recordRequest(account.id, group.id, true);
         continue;
       }
-      failover.recordRequest(account.id, channel.id, group.id, isError);
+      if (stream && !isError && proxyResponse.body) {
+        return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+          db,
+          failover,
+          keyRecordId: keyRecord.id,
+          accountId: account.id,
+          groupId: group.id,
+          provider,
+          model: upstreamModel,
+          rateMultiplier: accountRateMultiplier(account),
+          startedAt: originStart
+        });
+      }
+      failover.recordRequest(account.id, group.id, isError);
       db.createRequestLog({
         account_id: account.id,
-        channel_id: channel.id,
         group_id: group.id,
         model: upstreamModel,
         status: proxyResponse.status,
@@ -1381,20 +1549,14 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
         latency_ms: 0
       }).catch(() => {
       });
-      if (stream && !isError && proxyResponse.body) {
-        return new Response(proxyResponse.body, {
-          status: proxyResponse.status,
-          headers: { ...proxyResponse.headers, "content-type": proxyResponse.headers["content-type"] || "text/event-stream" }
-        });
-      }
       const responseText = await proxyResponse.text();
       return new Response(responseText, {
         status: proxyResponse.status,
         headers: { ...proxyResponse.headers, "content-type": "application/json" }
       });
     } catch (retryError) {
-      failover.recordRequest(account.id, channel.id, group.id, true);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }).catch(() => {
+      failover.recordRequest(account.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }).catch(() => {
       });
       continue;
     }
@@ -1453,15 +1615,23 @@ async function handleOpenAIRequest(request, env, failover) {
   }
   let accounts = await db.listEnabledAccounts();
   accounts = accounts.filter((a) => (a.provider === "openai" || a.provider === "xai") && a.enabled);
+  const keyGroupId = Number(keyRecord?.group_id) || 0;
+  if (keyGroupId) {
+    accounts = accounts.filter((account2) => Number(account2.group_id) === keyGroupId);
+    if (accounts.length === 0) {
+      return new Response(JSON.stringify({
+        error: "No available accounts",
+        message: "\u8BE5 API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
+      }), { status: 503, headers: { "Content-Type": "application/json" } });
+    }
+  }
   if (accounts.length === 0) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
-  const [channelsRaw, groupsRaw, mappingsRaw] = await Promise.all([
-    db.listChannels(),
+  const [groupsRaw, mappingsRaw] = await Promise.all([
     db.listGroups(),
     db.listModelMappings()
   ]);
-  const channels = new Map(channelsRaw.map((c) => [c.id, c]));
   const groups = new Map(groupsRaw.map((g) => [g.id, g]));
   const mappings = mappingsRaw;
   const mapping = findModelMapping(model, mappings, "openai") || findModelMapping(model, mappings, "xai");
@@ -1477,13 +1647,13 @@ async function handleOpenAIRequest(request, env, failover) {
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
-  const selection = await failover.selectAccount(accounts, channels, groups, preferredGroupId);
+  const selection = await failover.selectAccount(accounts, groups, preferredGroupId);
   if (!selection) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
-  const { account, channel, group } = selection;
+  const { account, group } = selection;
   const provider = account.provider;
-  const credentials = resolveUpstreamCredentials(account, channel);
+  const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   const upstreamUrl = `${baseUrl}${endpoint}`;
   const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
@@ -1503,16 +1673,23 @@ async function handleOpenAIRequest(request, env, failover) {
     const isError = proxyResponse.status >= 400;
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
-      failover.recordRequest(account.id, channel.id, group.id, true);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }).catch(() => {
+      failover.recordRequest(account.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }).catch(() => {
       });
-      return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId);
+      return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime);
     }
     if (stream && proxyResponse.body) {
-      failover.recordRequest(account.id, channel.id, group.id, isError);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: isError ? "Upstream error" : "", latency_ms: Date.now() - startTime }).catch(() => {
+      return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+        db,
+        failover,
+        keyRecordId: keyRecord.id,
+        accountId: account.id,
+        groupId: group.id,
+        provider,
+        model: upstreamModel,
+        rateMultiplier: accountRateMultiplier(account),
+        startedAt: startTime
       });
-      return new Response(proxyResponse.body, { status: proxyResponse.status, headers: { ...proxyResponse.headers, "content-type": proxyResponse.headers["content-type"] || "text/event-stream" } });
     }
     const responseText = await proxyResponse.text();
     let responseBody = {};
@@ -1530,7 +1707,6 @@ async function handleOpenAIRequest(request, env, failover) {
     });
     db.createRequestLog({
       account_id: account.id,
-      channel_id: channel.id,
       group_id: group.id,
       model: upstreamModel,
       status: proxyResponse.status,
@@ -1538,7 +1714,7 @@ async function handleOpenAIRequest(request, env, failover) {
       latency_ms: Date.now() - startTime
     }).catch(() => {
     });
-    failover.recordRequest(account.id, channel.id, group.id, isError);
+    failover.recordRequest(account.id, group.id, isError);
     return new Response(responseText, {
       status: proxyResponse.status,
       headers: {
@@ -1548,13 +1724,13 @@ async function handleOpenAIRequest(request, env, failover) {
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    failover.recordRequest(account.id, channel.id, group.id, true);
-    db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {
+    failover.recordRequest(account.id, group.id, true);
+    db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {
     });
-    return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId);
+    return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, startTime);
   }
 }
-async function handleFailover2(body, request, env, failover, keyRecord, accounts, channels, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId) {
+async function handleFailover2(body, request, env, failover, keyRecord, accounts, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now()) {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   const isResponses = url.pathname.includes("/responses");
@@ -1564,13 +1740,13 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
     const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
-    const selection = await failover.selectAccount(nextAccounts, channels, groups, preferredGroupId);
+    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId);
     if (!selection) break;
-    const { account, channel, group } = selection;
+    const { account, group } = selection;
     attempted.add(account.id);
     const currentProvider = account.provider;
     try {
-      const credentials = resolveUpstreamCredentials(account, channel);
+      const credentials = resolveUpstreamCredentials(account);
       const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, currentProvider);
       const upstreamUrl = `${baseUrl}${endpoint}`;
       const headers = buildUpstreamHeaders(request.headers, currentProvider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
@@ -1587,13 +1763,25 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
       });
       const isError = proxyResponse.status >= 400;
       if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
-        failover.recordRequest(account.id, channel.id, group.id, true);
+        failover.recordRequest(account.id, group.id, true);
         continue;
       }
-      failover.recordRequest(account.id, channel.id, group.id, isError);
+      if (stream && !isError && proxyResponse.body) {
+        return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+          db,
+          failover,
+          keyRecordId: keyRecord.id,
+          accountId: account.id,
+          groupId: group.id,
+          provider: currentProvider,
+          model: upstreamModel,
+          rateMultiplier: accountRateMultiplier(account),
+          startedAt: originStart
+        });
+      }
+      failover.recordRequest(account.id, group.id, isError);
       db.createRequestLog({
         account_id: account.id,
-        channel_id: channel.id,
         group_id: group.id,
         model: upstreamModel,
         status: proxyResponse.status,
@@ -1601,20 +1789,14 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
         latency_ms: 0
       }).catch(() => {
       });
-      if (stream && !isError && proxyResponse.body) {
-        return new Response(proxyResponse.body, {
-          status: proxyResponse.status,
-          headers: { ...proxyResponse.headers, "content-type": proxyResponse.headers["content-type"] || "text/event-stream" }
-        });
-      }
       const responseText = await proxyResponse.text();
       return new Response(responseText, {
         status: proxyResponse.status,
         headers: { ...proxyResponse.headers, "content-type": "application/json" }
       });
     } catch (retryError) {
-      failover.recordRequest(account.id, channel.id, group.id, true);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }).catch(() => {
+      failover.recordRequest(account.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }).catch(() => {
       });
       continue;
     }
@@ -1646,15 +1828,23 @@ async function handleClaudeRequest(request, env, failover) {
   const stream = requestBody.stream === true;
   let accounts = await db.listEnabledAccounts();
   accounts = accounts.filter((a) => a.provider === "anthropic" && a.enabled);
+  const keyGroupId = Number(keyRecord?.group_id) || 0;
+  if (keyGroupId) {
+    accounts = accounts.filter((account2) => Number(account2.group_id) === keyGroupId);
+    if (accounts.length === 0) {
+      return new Response(JSON.stringify({
+        error: "No available accounts",
+        message: "\u8BE5 API \u5BC6\u94A5\u7ED1\u5B9A\u7684\u5206\u7EC4\u4E0B\u6CA1\u6709\u53EF\u7528\u8D26\u53F7"
+      }), { status: 503, headers: { "Content-Type": "application/json" } });
+    }
+  }
   if (accounts.length === 0) {
     return new Response(JSON.stringify({ error: "No available Anthropic accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
-  const [channelsRaw, groupsRaw, mappingsRaw] = await Promise.all([
-    db.listChannels(),
+  const [groupsRaw, mappingsRaw] = await Promise.all([
     db.listGroups(),
     db.listModelMappings()
   ]);
-  const channels = new Map(channelsRaw.map((c) => [c.id, c]));
   const groups = new Map(groupsRaw.map((g) => [g.id, g]));
   const mappings = mappingsRaw;
   const mapping = findModelMapping(model, mappings, "anthropic");
@@ -1663,12 +1853,12 @@ async function handleClaudeRequest(request, env, failover) {
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
-  const selection = await failover.selectAccount(accounts, channels, groups, preferredGroupId);
+  const selection = await failover.selectAccount(accounts, groups, preferredGroupId);
   if (!selection) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
-  const { account, channel, group } = selection;
-  const credentials = resolveUpstreamCredentials(account, channel);
+  const { account, group } = selection;
+  const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, "anthropic");
   const upstreamUrl = `${baseUrl}/v1/messages?beta=true`;
   const headers = buildUpstreamHeaders(request.headers, "anthropic", credentials.apiKey, credentials.baseUrl, account.client_spoofing);
@@ -1688,16 +1878,23 @@ async function handleClaudeRequest(request, env, failover) {
     const isError = proxyResponse.status >= 400;
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
-      failover.recordRequest(account.id, channel.id, group.id, true);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }).catch(() => {
+      failover.recordRequest(account.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }).catch(() => {
       });
-      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId);
+      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime);
     }
     if (stream && proxyResponse.body) {
-      failover.recordRequest(account.id, channel.id, group.id, isError);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: isError ? "Upstream error" : "", latency_ms: Date.now() - startTime }).catch(() => {
+      return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+        db,
+        failover,
+        keyRecordId: keyRecord.id,
+        accountId: account.id,
+        groupId: group.id,
+        provider: "anthropic",
+        model: upstreamModel,
+        rateMultiplier: accountRateMultiplier(account),
+        startedAt: startTime
       });
-      return new Response(proxyResponse.body, { status: proxyResponse.status, headers: { ...proxyResponse.headers, "content-type": proxyResponse.headers["content-type"] || "text/event-stream" } });
     }
     const responseText = await proxyResponse.text();
     let responseBody = {};
@@ -1715,7 +1912,6 @@ async function handleClaudeRequest(request, env, failover) {
     });
     db.createRequestLog({
       account_id: account.id,
-      channel_id: channel.id,
       group_id: group.id,
       model: upstreamModel,
       status: proxyResponse.status,
@@ -1723,7 +1919,7 @@ async function handleClaudeRequest(request, env, failover) {
       latency_ms: Date.now() - startTime
     }).catch(() => {
     });
-    failover.recordRequest(account.id, channel.id, group.id, isError);
+    failover.recordRequest(account.id, group.id, isError);
     return new Response(responseText, {
       status: proxyResponse.status,
       headers: {
@@ -1733,24 +1929,24 @@ async function handleClaudeRequest(request, env, failover) {
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    failover.recordRequest(account.id, channel.id, group.id, true);
-    db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {
+    failover.recordRequest(account.id, group.id, true);
+    db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {
     });
-    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId);
+    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime);
   }
 }
-async function handleClaudeFailover(body, request, env, failover, keyRecord, accounts, channels, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId) {
+async function handleClaudeFailover(body, request, env, failover, keyRecord, accounts, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, originStart = Date.now()) {
   const db = createDatabase(env.DB);
   const attempted = /* @__PURE__ */ new Set();
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
     const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
-    const selection = await failover.selectAccount(nextAccounts, channels, groups, preferredGroupId);
+    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId);
     if (!selection) break;
-    const { account, channel, group } = selection;
+    const { account, group } = selection;
     attempted.add(account.id);
     try {
-      const credentials = resolveUpstreamCredentials(account, channel);
+      const credentials = resolveUpstreamCredentials(account);
       const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, "anthropic");
       const upstreamUrl = `${baseUrl}/v1/messages?beta=true`;
       const headers = buildUpstreamHeaders(request.headers, "anthropic", credentials.apiKey, credentials.baseUrl, account.client_spoofing);
@@ -1767,13 +1963,25 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
       });
       const isError = proxyResponse.status >= 400;
       if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
-        failover.recordRequest(account.id, channel.id, group.id, true);
+        failover.recordRequest(account.id, group.id, true);
         continue;
       }
-      failover.recordRequest(account.id, channel.id, group.id, isError);
+      if (stream && !isError && proxyResponse.body) {
+        return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+          db,
+          failover,
+          keyRecordId: keyRecord.id,
+          accountId: account.id,
+          groupId: group.id,
+          provider: "anthropic",
+          model: upstreamModel,
+          rateMultiplier: accountRateMultiplier(account),
+          startedAt: originStart
+        });
+      }
+      failover.recordRequest(account.id, group.id, isError);
       db.createRequestLog({
         account_id: account.id,
-        channel_id: channel.id,
         group_id: group.id,
         model: upstreamModel,
         status: proxyResponse.status,
@@ -1781,20 +1989,14 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
         latency_ms: 0
       }).catch(() => {
       });
-      if (stream && !isError && proxyResponse.body) {
-        return new Response(proxyResponse.body, {
-          status: proxyResponse.status,
-          headers: { ...proxyResponse.headers, "content-type": proxyResponse.headers["content-type"] || "text/event-stream" }
-        });
-      }
       const responseText = await proxyResponse.text();
       return new Response(responseText, {
         status: proxyResponse.status,
         headers: { ...proxyResponse.headers, "content-type": "application/json" }
       });
     } catch (retryError) {
-      failover.recordRequest(account.id, channel.id, group.id, true);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }).catch(() => {
+      failover.recordRequest(account.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }).catch(() => {
       });
       continue;
     }
@@ -1918,121 +2120,125 @@ function readThresholds(body, partial = false) {
   return result;
 }
 
-// functions/src/config/channels.ts
-async function handleChannelsRequest(request, env) {
-  const db = createDatabase(env.DB);
-  const url = new URL(request.url);
-  const method = request.method;
-  {
-    const authHeader = request.headers.get("authorization");
-    if (!authHeader?.startsWith("Bearer ")) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
-    }
-    const token = authHeader.slice(7);
-    const session = await verifySessionToken(token, await resolveSessionSecret(db, env.JWT_SECRET));
-    if (!session) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
-    }
+// functions/src/utils/provider.ts
+function getDefaultBaseUrl(provider) {
+  switch (provider) {
+    case "anthropic":
+      return "https://api.anthropic.com";
+    case "xai":
+      return "https://api.x.ai";
+    case "openai":
+    default:
+      return "https://api.openai.com";
   }
-  if (method === "GET") {
-    const channels = await db.listChannels();
-    return jsonData2(channels.map(maskChannel));
+}
+function getProviderAuthHeaders(provider, apiKey) {
+  if (provider === "anthropic") {
+    return { "x-api-key": apiKey, "anthropic-version": "2023-06-01" };
   }
-  if (method === "POST") {
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return jsonError2("Invalid JSON body", 400);
-    }
-    const name = String(body.name || "").trim();
-    const provider = String(body.provider || "").trim();
-    if (!name) return jsonError2("\u8BF7\u586B\u5199\u6E20\u9053\u540D\u79F0", 400);
-    if (!PROVIDERS.includes(provider)) return jsonError2("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
-    const baseUrl = normalizeBaseUrl(body.base_url);
-    if (baseUrl === null) return jsonError2("\u57FA\u7840\u5730\u5740\u5FC5\u987B\u662F http(s) \u5F00\u5934\u7684\u5408\u6CD5\u5730\u5740", 400);
-    if (await db.getChannelByName(name)) return jsonError2(`\u6E20\u9053\u540D\u79F0\u300C${name}\u300D\u5DF2\u5B58\u5728`, 409);
-    const result = await db.createChannel(
-      name,
-      provider,
-      baseUrl,
-      String(body.api_key || "").trim(),
-      Number(body.priority) || 0,
-      body.enabled === false || body.enabled === 0 ? 0 : 1
+  return { authorization: `Bearer ${apiKey}` };
+}
+
+// functions/src/utils/healthcheck.ts
+var PROBE_TIMEOUT_MS = 15e3;
+async function probeAccount(db, accountId) {
+  const account = await db.getAccount(accountId);
+  if (!account) {
+    return {
+      accountId,
+      name: `#${accountId}`,
+      provider: "",
+      success: false,
+      status: 0,
+      latencyMs: 0,
+      message: "\u8D26\u53F7\u4E0D\u5B58\u5728"
+    };
+  }
+  const base = {
+    accountId,
+    name: String(account.name || `#${accountId}`),
+    provider: String(account.provider || "")
+  };
+  const apiKey = String(account.api_key || "").trim();
+  if (!apiKey) {
+    const result = { ...base, success: false, status: 0, latencyMs: 0, message: "\u8D26\u53F7\u6CA1\u6709\u914D\u7F6E\u5BC6\u94A5" };
+    await persist(db, result);
+    return result;
+  }
+  const baseUrl = (String(account.base_url || "").trim() || getDefaultBaseUrl(account.provider)).replace(/\/+$/, "");
+  const isAnthropic = account.provider === "anthropic";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(
+      isAnthropic ? `${baseUrl}/v1/messages` : `${baseUrl}/v1/models`,
+      {
+        method: isAnthropic ? "POST" : "GET",
+        headers: { ...getProviderAuthHeaders(account.provider, apiKey), "content-type": "application/json" },
+        body: isAnthropic ? JSON.stringify({
+          model: "claude-3-5-haiku-20241022",
+          max_tokens: 1,
+          messages: [{ role: "user", content: "ping" }]
+        }) : void 0,
+        signal: controller.signal
+      }
     );
-    const channel = await db.getChannel(result.lastRowId);
-    return jsonData2(maskChannel(channel), 201);
-  }
-  if (method === "PUT") {
-    const id = parseInt(url.pathname.split("/").pop() || "0");
-    if (!id) return jsonError2("Invalid channel ID", 400);
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return jsonError2("Invalid JSON body", 400);
-    }
-    const existing = await db.getChannel(id);
-    if (!existing) return jsonError2("\u6E20\u9053\u4E0D\u5B58\u5728", 404);
-    const updates = {};
-    if (body.name !== void 0) {
-      const name = String(body.name).trim();
-      if (!name) return jsonError2("\u8BF7\u586B\u5199\u6E20\u9053\u540D\u79F0", 400);
-      const clash = await db.getChannelByName(name);
-      if (clash && Number(clash.id) !== id) return jsonError2(`\u6E20\u9053\u540D\u79F0\u300C${name}\u300D\u5DF2\u5B58\u5728`, 409);
-      updates.name = name;
-    }
-    if (body.provider !== void 0) {
-      const provider = String(body.provider).trim();
-      if (!PROVIDERS.includes(provider)) return jsonError2("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
-      updates.provider = provider;
-    }
-    if (body.base_url !== void 0) {
-      const baseUrl = normalizeBaseUrl(body.base_url);
-      if (baseUrl === null) return jsonError2("\u57FA\u7840\u5730\u5740\u5FC5\u987B\u662F http(s) \u5F00\u5934\u7684\u5408\u6CD5\u5730\u5740", 400);
-      updates.base_url = baseUrl;
-    }
-    if (body.api_key !== void 0 && String(body.api_key).trim()) {
-      updates.api_key = String(body.api_key).trim();
-    }
-    if (body.priority !== void 0) updates.priority = Number(body.priority) || 0;
-    if (body.enabled !== void 0) updates.enabled = body.enabled === true || body.enabled === 1 ? 1 : 0;
-    const nextProvider = String(updates.provider ?? existing.provider);
-    if (nextProvider !== existing.provider) {
-      const conflicting = await db.countAccountsForChannelWithOtherProvider(id, nextProvider);
-      if (conflicting > 0) {
-        return jsonError2(`\u8BE5\u6E20\u9053\u4E0B\u6709 ${conflicting} \u4E2A ${existing.provider} \u8D26\u53F7\uFF0C\u8BF7\u5148\u8C03\u6574\u8D26\u53F7\u670D\u52A1\u5546`, 400);
+    const latencyMs = Date.now() - startedAt;
+    let detail = "";
+    if (!response.ok) {
+      const raw = await response.text().catch(() => "");
+      try {
+        detail = JSON.parse(raw)?.error?.message || "";
+      } catch {
+        detail = raw.slice(0, 160);
       }
     }
-    await db.updateChannel(id, updates);
-    const channel = await db.getChannel(id);
-    return jsonData2(maskChannel(channel));
+    const result = {
+      ...base,
+      success: response.ok,
+      status: response.status,
+      latencyMs,
+      message: response.ok ? `\u8FDE\u63A5\u6210\u529F\uFF08${latencyMs} ms\uFF09` : `\u8FDE\u63A5\u5931\u8D25\uFF08HTTP ${response.status}\uFF09${detail ? `\uFF1A${detail}` : ""}`
+    };
+    await persist(db, result);
+    return result;
+  } catch (error) {
+    const latencyMs = Date.now() - startedAt;
+    const message = error instanceof Error && error.name === "AbortError" ? `\u8FDE\u63A5\u8D85\u65F6\uFF08${PROBE_TIMEOUT_MS / 1e3} \u79D2\uFF09` : error instanceof Error ? error.message : "\u672A\u77E5\u9519\u8BEF";
+    const result = { ...base, success: false, status: 0, latencyMs, message };
+    await persist(db, result);
+    return result;
+  } finally {
+    clearTimeout(timer);
   }
-  if (method === "DELETE") {
-    const id = parseInt(url.pathname.split("/").pop() || "0");
-    if (!id) return jsonError2("Invalid channel ID", 400);
-    if (!await db.getChannel(id)) return jsonError2("\u6E20\u9053\u4E0D\u5B58\u5728", 404);
-    const dependants = await db.countAccountsForChannel(id);
-    if (dependants > 0) {
-      return jsonError2(`\u8BE5\u6E20\u9053\u4E0B\u8FD8\u6709 ${dependants} \u4E2A\u4E0A\u6E38\u8D26\u53F7\uFF0C\u8BF7\u5148\u5220\u9664\u6216\u8FC1\u79FB\u8FD9\u4E9B\u8D26\u53F7`, 400);
+}
+async function probeAccounts(db, accountIds, concurrency = 4) {
+  const results = [];
+  const queue = [...accountIds];
+  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+    for (let id = queue.shift(); id !== void 0; id = queue.shift()) {
+      results.push(await probeAccount(db, id));
     }
-    await db.deleteChannel(id);
-    return new Response(JSON.stringify({ success: true }), { status: 200, headers: JSON_HEADERS2 });
-  }
-  return jsonError2("Method not allowed", 405);
+  });
+  await Promise.all(workers);
+  return accountIds.map((id) => results.find((entry) => entry.accountId === id)).filter((entry) => Boolean(entry));
 }
-var PROVIDERS = ["openai", "anthropic", "xai"];
+async function persist(db, result) {
+  await db.recordAccountHealthCheck(result.accountId, result.success, result.latencyMs, result.message).catch(() => {
+  });
+}
+
+// functions/src/config/accounts.ts
 var JSON_HEADERS2 = { "Content-Type": "application/json" };
-function jsonData2(data, status = 200) {
-  return new Response(JSON.stringify({ data }), { status, headers: JSON_HEADERS2 });
-}
 function jsonError2(message, status) {
   return new Response(JSON.stringify({ error: message }), { status, headers: JSON_HEADERS2 });
 }
-function maskChannel(channel) {
-  if (!channel) return channel;
-  const { api_key, ...rest } = channel;
-  return { ...rest, has_api_key: Boolean(api_key), api_key: api_key ? "***" : "" };
+function readRateMultiplier(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return "\u500D\u7387\u5FC5\u987B\u662F\u4E0D\u5C0F\u4E8E 0 \u7684\u6570\u5B57";
+  if (parsed > 100) return "\u500D\u7387\u4E0D\u80FD\u5927\u4E8E 100";
+  return parsed;
 }
 function normalizeBaseUrl(value) {
   const raw = String(value ?? "").trim();
@@ -2044,12 +2250,6 @@ function normalizeBaseUrl(value) {
   } catch {
     return null;
   }
-}
-
-// functions/src/config/accounts.ts
-var JSON_HEADERS3 = { "Content-Type": "application/json" };
-function jsonError3(message, status) {
-  return new Response(JSON.stringify({ error: message }), { status, headers: JSON_HEADERS3 });
 }
 function maskAccount(account) {
   if (!account) return account;
@@ -2078,43 +2278,40 @@ async function handleAccountsRequest(request, env) {
       headers: { "Content-Type": "application/json" }
     });
   }
-  if (method === "POST" && !url.pathname.endsWith("/test")) {
+  const isProbePath = url.pathname.endsWith("/test") || url.pathname.endsWith("/test-all");
+  if (method === "POST" && !isProbePath) {
     let body;
     try {
       body = await request.json();
     } catch {
-      return jsonError3("Invalid JSON body", 400);
+      return jsonError2("Invalid JSON body", 400);
     }
     const name = String(body.name || "").trim();
     const provider = String(body.provider || "").trim();
     const groupId = Number(body.group_id);
-    const channelId = Number(body.channel_id);
-    if (!name || !provider || !groupId || !channelId) {
-      return jsonError3("\u8BF7\u586B\u5199\u8D26\u53F7\u540D\u79F0\uFF0C\u5E76\u9009\u62E9\u670D\u52A1\u5546\u3001\u5206\u7EC4\u548C\u6E20\u9053", 400);
+    if (!name || !provider || !groupId) {
+      return jsonError2("\u8BF7\u586B\u5199\u8D26\u53F7\u540D\u79F0\uFF0C\u5E76\u9009\u62E9\u670D\u52A1\u5546\u548C\u5206\u7EC4", 400);
     }
     if (!["openai", "anthropic", "xai"].includes(provider)) {
-      return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+      return jsonError2("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
     }
-    const [group, channel] = await Promise.all([db.getGroup(groupId), db.getChannel(channelId)]);
-    if (!group) return jsonError3("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
-    if (!channel) return jsonError3("\u6240\u9009\u6E20\u9053\u4E0D\u5B58\u5728", 400);
-    if (channel.provider !== provider) {
-      return jsonError3(`\u6240\u9009\u6E20\u9053\u5C5E\u4E8E ${channel.provider}\uFF0C\u4E0E\u8D26\u53F7\u670D\u52A1\u5546 ${provider} \u4E0D\u4E00\u81F4`, 400);
-    }
+    if (!await db.getGroup(groupId)) return jsonError2("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
+    const baseUrl = normalizeBaseUrl(body.base_url);
+    if (baseUrl === null) return jsonError2("\u57FA\u7840\u5730\u5740\u5FC5\u987B\u662F http(s) \u5F00\u5934\u7684\u5408\u6CD5\u5730\u5740\uFF0C\u4F8B\u5982 https://api.openai.com", 400);
     const apiKey = String(body.api_key || "").trim();
-    if (!apiKey && !String(channel.api_key || "").trim()) {
-      return jsonError3("\u8D26\u53F7\u5BC6\u94A5\u4E3A\u7A7A\u65F6\uFF0C\u6240\u9009\u6E20\u9053\u5FC5\u987B\u914D\u7F6E\u9ED8\u8BA4\u5BC6\u94A5", 400);
-    }
+    if (!apiKey) return jsonError2("\u8BF7\u586B\u5199\u4E0A\u6E38\u5BC6\u94A5", 400);
+    const multiplier = readRateMultiplier(body.rate_multiplier ?? 1);
+    if (typeof multiplier === "string") return jsonError2(multiplier, 400);
     const result = await db.createAccount(
       name,
       provider,
       apiKey,
       groupId,
-      channelId,
-      body.base_url,
+      baseUrl,
       Number(body.priority) || 0,
       body.client_spoofing,
-      body.enabled === false || body.enabled === 0 ? 0 : 1
+      body.enabled === false || body.enabled === 0 ? 0 : 1,
+      multiplier
     );
     const account = await db.getAccount(result.lastRowId);
     return new Response(JSON.stringify({ data: maskAccount(account) }), {
@@ -2124,48 +2321,47 @@ async function handleAccountsRequest(request, env) {
   }
   if (method === "PUT") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
-    if (!id) return jsonError3("Invalid account ID", 400);
+    if (!id) return jsonError2("Invalid account ID", 400);
     let body;
     try {
       body = await request.json();
     } catch {
-      return jsonError3("Invalid JSON body", 400);
+      return jsonError2("Invalid JSON body", 400);
     }
     const existing = await db.getAccount(id);
-    if (!existing) return jsonError3("\u8D26\u53F7\u4E0D\u5B58\u5728", 404);
+    if (!existing) return jsonError2("\u8D26\u53F7\u4E0D\u5B58\u5728", 404);
     const updates = {};
     if (body.name !== void 0) {
       const name = String(body.name).trim();
-      if (!name) return jsonError3("\u8D26\u53F7\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A", 400);
+      if (!name) return jsonError2("\u8D26\u53F7\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A", 400);
       updates.name = name;
     }
     if (body.provider !== void 0) {
       if (!["openai", "anthropic", "xai"].includes(String(body.provider))) {
-        return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+        return jsonError2("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
       }
       updates.provider = String(body.provider);
     }
-    if (body.base_url !== void 0) updates.base_url = String(body.base_url || "").trim();
+    if (body.base_url !== void 0) {
+      const baseUrl = normalizeBaseUrl(body.base_url);
+      if (baseUrl === null) return jsonError2("\u57FA\u7840\u5730\u5740\u5FC5\u987B\u662F http(s) \u5F00\u5934\u7684\u5408\u6CD5\u5730\u5740\uFF0C\u4F8B\u5982 https://api.openai.com", 400);
+      updates.base_url = baseUrl;
+    }
     if (body.client_spoofing !== void 0) updates.client_spoofing = String(body.client_spoofing || "").trim();
     if (body.priority !== void 0 && Number.isFinite(Number(body.priority))) updates.priority = Number(body.priority);
     if (body.enabled !== void 0) updates.enabled = body.enabled === true || body.enabled === 1 ? 1 : 0;
+    if (body.rate_multiplier !== void 0) {
+      const multiplier = readRateMultiplier(body.rate_multiplier);
+      if (typeof multiplier === "string") return jsonError2(multiplier, 400);
+      updates.rate_multiplier = multiplier;
+    }
     if (typeof body.api_key === "string" && body.api_key.trim() && body.api_key.trim() !== "***") {
       updates.api_key = body.api_key.trim();
     }
     if (body.group_id !== void 0) {
       const groupId = Number(body.group_id);
-      if (!groupId || !await db.getGroup(groupId)) return jsonError3("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
+      if (!groupId || !await db.getGroup(groupId)) return jsonError2("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
       updates.group_id = groupId;
-    }
-    if (body.channel_id !== void 0) {
-      const channelId = Number(body.channel_id);
-      const channel = channelId ? await db.getChannel(channelId) : null;
-      if (!channel) return jsonError3("\u6240\u9009\u6E20\u9053\u4E0D\u5B58\u5728", 400);
-      const provider = String(updates.provider ?? existing.provider);
-      if (channel.provider !== provider) {
-        return jsonError3(`\u6240\u9009\u6E20\u9053\u5C5E\u4E8E ${channel.provider}\uFF0C\u4E0E\u8D26\u53F7\u670D\u52A1\u5546 ${provider} \u4E0D\u4E00\u81F4`, 400);
-      }
-      updates.channel_id = channelId;
     }
     await db.updateAccount(id, updates);
     const account = await db.getAccount(id);
@@ -2185,87 +2381,34 @@ async function handleAccountsRequest(request, env) {
       headers: { "Content-Type": "application/json" }
     });
   }
+  if (method === "POST" && url.pathname.endsWith("/test-all")) {
+    const accounts = await db.listAccounts();
+    const ids = accounts.filter((account) => Number(account.enabled) === 1).map((account) => Number(account.id));
+    if (!ids.length) return jsonError2("\u6CA1\u6709\u542F\u7528\u7684\u8D26\u53F7\u53EF\u6D4B\u8BD5", 400);
+    const results = await probeAccounts(db, ids);
+    const healthy = results.filter((result) => result.success).length;
+    return new Response(JSON.stringify({
+      data: {
+        total: results.length,
+        healthy,
+        failed: results.length - healthy,
+        results
+      }
+    }), { status: 200, headers: JSON_HEADERS2 });
+  }
   if (method === "POST" && url.pathname.endsWith("/test")) {
     const segments = url.pathname.split("/");
     const id = parseInt(segments[segments.length - 2] || "0");
-    if (!id) {
-      return new Response(JSON.stringify({ error: "Invalid account ID" }), { status: 400, headers: { "Content-Type": "application/json" } });
-    }
-    const account = await db.getAccount(id);
-    if (!account) return jsonError3("\u8D26\u53F7\u4E0D\u5B58\u5728", 404);
-    const channel = await db.getChannel(account.channel_id);
-    const apiKey = String(account.api_key || "").trim() || String(channel?.api_key || "").trim();
-    if (!apiKey) {
-      return new Response(JSON.stringify({ success: false, message: "\u8D26\u53F7\u548C\u6E20\u9053\u90FD\u6CA1\u6709\u914D\u7F6E\u5BC6\u94A5" }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-    const baseUrl = String(account.base_url || "").trim() || String(channel?.base_url || "").trim() || getDefaultBaseUrl(account.provider);
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15e3);
-      const isAnthropic = account.provider === "anthropic";
-      const testUrl = isAnthropic ? `${baseUrl.replace(/\/$/, "")}/v1/messages` : `${baseUrl.replace(/\/$/, "")}/v1/models`;
-      const response = await fetch(testUrl, {
-        method: isAnthropic ? "POST" : "GET",
-        headers: { ...getAuthHeaders(account.provider, apiKey), "content-type": "application/json" },
-        body: isAnthropic ? JSON.stringify({
-          model: "claude-3-5-haiku-20241022",
-          max_tokens: 1,
-          messages: [{ role: "user", content: "ping" }]
-        }) : void 0,
-        signal: controller.signal
-      }).finally(() => clearTimeout(timer));
-      let detail = "";
-      if (!response.ok) {
-        const raw = await response.text().catch(() => "");
-        try {
-          detail = JSON.parse(raw)?.error?.message || "";
-        } catch {
-          detail = raw.slice(0, 160);
-        }
-      }
-      return new Response(JSON.stringify({
-        success: response.ok,
-        status: response.status,
-        message: response.ok ? `\u8FDE\u63A5\u6210\u529F\uFF08HTTP ${response.status}\uFF09` : `\u8FDE\u63A5\u5931\u8D25\uFF08HTTP ${response.status}\uFF09${detail ? `\uFF1A${detail}` : ""}`
-      }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    } catch (error) {
-      const message = error instanceof Error && error.name === "AbortError" ? "\u8FDE\u63A5\u8D85\u65F6\uFF0815 \u79D2\uFF09" : error instanceof Error ? error.message : "Unknown error";
-      return new Response(JSON.stringify({ success: false, message }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
+    if (!id) return jsonError2("Invalid account ID", 400);
+    const result = await probeAccount(db, id);
+    return new Response(JSON.stringify({
+      success: result.success,
+      status: result.status,
+      latency_ms: result.latencyMs,
+      message: result.message
+    }), { status: 200, headers: JSON_HEADERS2 });
   }
   return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
-}
-function getDefaultBaseUrl(provider) {
-  switch (provider) {
-    case "anthropic":
-      return "https://api.anthropic.com";
-    case "xai":
-      return "https://api.x.ai";
-    case "openai":
-      return "https://api.openai.com";
-    default:
-      return "https://api.openai.com";
-  }
-}
-function getAuthHeaders(provider, apiKey) {
-  switch (provider) {
-    case "anthropic":
-      return { "x-api-key": apiKey, "anthropic-version": "2023-06-01" };
-    case "openai":
-    case "xai":
-      return { "authorization": `Bearer ${apiKey}` };
-    default:
-      return { "authorization": `Bearer ${apiKey}` };
-  }
 }
 
 // functions/src/config/models.ts
@@ -2286,29 +2429,29 @@ async function handleModelsRequest(request, env) {
   }
   if (method === "GET") {
     const mappings = await db.listModelMappings();
-    return jsonData3(mappings);
+    return jsonData2(mappings);
   }
   if (method === "POST") {
     let body;
     try {
       body = await request.json();
     } catch {
-      return jsonError4("Invalid JSON body", 400);
+      return jsonError3("Invalid JSON body", 400);
     }
     const requestedModel = String(body.requested_model || "").trim();
     const upstreamModel = String(body.upstream_model || "").trim();
     const provider = String(body.provider || "").trim();
     const groupId = Number(body.group_id);
-    if (!requestedModel || !upstreamModel) return jsonError4("\u8BF7\u586B\u5199\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u548C\u4E0A\u6E38\u6A21\u578B\u540D", 400);
-    if (!PROVIDERS2.includes(provider)) return jsonError4("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
-    if (!groupId) return jsonError4("\u8BF7\u9009\u62E9\u76EE\u6807\u5206\u7EC4", 400);
-    if (!await db.getGroup(groupId)) return jsonError4("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
+    if (!requestedModel || !upstreamModel) return jsonError3("\u8BF7\u586B\u5199\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u548C\u4E0A\u6E38\u6A21\u578B\u540D", 400);
+    if (!PROVIDERS.includes(provider)) return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+    if (!groupId) return jsonError3("\u8BF7\u9009\u62E9\u76EE\u6807\u5206\u7EC4", 400);
+    if (!await db.getGroup(groupId)) return jsonError3("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
     if (requestedModel.includes("*") && !requestedModel.endsWith("*")) {
-      return jsonError4("\u901A\u914D\u7B26\u53EA\u80FD\u653E\u5728\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u672B\u5C3E\uFF0C\u4F8B\u5982 gpt-4*", 400);
+      return jsonError3("\u901A\u914D\u7B26\u53EA\u80FD\u653E\u5728\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u672B\u5C3E\uFF0C\u4F8B\u5982 gpt-4*", 400);
     }
     const duplicate = await db.findModelMappingByModel(requestedModel, provider);
     if (duplicate) {
-      return jsonError4(`\u5DF2\u5B58\u5728 ${requestedModel} \u5230 ${provider} \u7684\u6620\u5C04\uFF0C\u8BF7\u5148\u7F16\u8F91\u6216\u5220\u9664\u539F\u89C4\u5219`, 409);
+      return jsonError3(`\u5DF2\u5B58\u5728 ${requestedModel} \u5230 ${provider} \u7684\u6620\u5C04\uFF0C\u8BF7\u5148\u7F16\u8F91\u6216\u5220\u9664\u539F\u89C4\u5219`, 409);
     }
     const result = await db.createModelMapping(
       requestedModel,
@@ -2319,47 +2462,47 @@ async function handleModelsRequest(request, env) {
       body.enabled === false || body.enabled === 0 ? 0 : 1
     );
     const mapping = await db.getModelMapping(result.lastRowId);
-    return jsonData3(mapping, 201);
+    return jsonData2(mapping, 201);
   }
   if (method === "PUT") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
-    if (!id) return jsonError4("Invalid mapping ID", 400);
+    if (!id) return jsonError3("Invalid mapping ID", 400);
     let body;
     try {
       body = await request.json();
     } catch {
-      return jsonError4("Invalid JSON body", 400);
+      return jsonError3("Invalid JSON body", 400);
     }
-    if (!await db.getModelMapping(id)) return jsonError4("\u6A21\u578B\u6620\u5C04\u4E0D\u5B58\u5728", 404);
+    if (!await db.getModelMapping(id)) return jsonError3("\u6A21\u578B\u6620\u5C04\u4E0D\u5B58\u5728", 404);
     const updates = {};
     if (body.requested_model !== void 0) {
       const requestedModel = String(body.requested_model).trim();
-      if (!requestedModel) return jsonError4("\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u4E0D\u80FD\u4E3A\u7A7A", 400);
+      if (!requestedModel) return jsonError3("\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u4E0D\u80FD\u4E3A\u7A7A", 400);
       if (requestedModel.includes("*") && !requestedModel.endsWith("*")) {
-        return jsonError4("\u901A\u914D\u7B26\u53EA\u80FD\u653E\u5728\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u672B\u5C3E\uFF0C\u4F8B\u5982 gpt-4*", 400);
+        return jsonError3("\u901A\u914D\u7B26\u53EA\u80FD\u653E\u5728\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u672B\u5C3E\uFF0C\u4F8B\u5982 gpt-4*", 400);
       }
       updates.requested_model = requestedModel;
     }
     if (body.upstream_model !== void 0) {
       const upstreamModel = String(body.upstream_model).trim();
-      if (!upstreamModel) return jsonError4("\u4E0A\u6E38\u6A21\u578B\u540D\u4E0D\u80FD\u4E3A\u7A7A", 400);
+      if (!upstreamModel) return jsonError3("\u4E0A\u6E38\u6A21\u578B\u540D\u4E0D\u80FD\u4E3A\u7A7A", 400);
       updates.upstream_model = upstreamModel;
     }
     if (body.provider !== void 0) {
       const provider = String(body.provider).trim();
-      if (!PROVIDERS2.includes(provider)) return jsonError4("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+      if (!PROVIDERS.includes(provider)) return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
       updates.provider = provider;
     }
     if (body.group_id !== void 0) {
       const groupId = Number(body.group_id);
-      if (!groupId || !await db.getGroup(groupId)) return jsonError4("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
+      if (!groupId || !await db.getGroup(groupId)) return jsonError3("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
       updates.group_id = groupId;
     }
     if (body.priority !== void 0) updates.priority = Number(body.priority) || 0;
     if (body.enabled !== void 0) updates.enabled = body.enabled === true || body.enabled === 1 ? 1 : 0;
     await db.updateModelMapping(id, updates);
     const mapping = await db.getModelMapping(id);
-    return jsonData3(mapping);
+    return jsonData2(mapping);
   }
   if (method === "DELETE") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
@@ -2372,15 +2515,15 @@ async function handleModelsRequest(request, env) {
       headers: { "Content-Type": "application/json" }
     });
   }
-  return jsonError4("Method not allowed", 405);
+  return jsonError3("Method not allowed", 405);
 }
-var PROVIDERS2 = ["openai", "anthropic", "xai"];
-var JSON_HEADERS4 = { "Content-Type": "application/json" };
-function jsonData3(data, status = 200) {
-  return new Response(JSON.stringify({ data }), { status, headers: JSON_HEADERS4 });
+var PROVIDERS = ["openai", "anthropic", "xai"];
+var JSON_HEADERS3 = { "Content-Type": "application/json" };
+function jsonData2(data, status = 200) {
+  return new Response(JSON.stringify({ data }), { status, headers: JSON_HEADERS3 });
 }
-function jsonError4(message, status) {
-  return new Response(JSON.stringify({ error: message }), { status, headers: JSON_HEADERS4 });
+function jsonError3(message, status) {
+  return new Response(JSON.stringify({ error: message }), { status, headers: JSON_HEADERS3 });
 }
 
 // functions/_worker.ts
@@ -2424,9 +2567,6 @@ var worker_default = {
     }
     if (path.startsWith("/api/v1/groups")) {
       return handleGroupsRequest(request, env, ctx);
-    }
-    if (path.startsWith("/api/v1/channels")) {
-      return handleChannelsRequest(request, env);
     }
     if (path.startsWith("/api/v1/accounts")) {
       return handleAccountsRequest(request, env);
@@ -2485,6 +2625,8 @@ async function handleLogin(request, env) {
   const db = createDatabase(env.DB);
   const session = await authenticateUser(db, body.username, body.password);
   if (!session) return json({ error: "Invalid credentials" }, 401);
+  await db.ensureSchema().catch(() => {
+  });
   const token = await createSessionToken(session, await resolveSessionSecret(db, env.JWT_SECRET));
   return json({
     token,
@@ -2579,17 +2721,25 @@ async function handleApiKeys(request, env) {
     } catch {
       return json({ error: "Invalid JSON body" }, 400);
     }
+    const name = String(body.name || "").trim();
+    if (!name) return json({ error: "\u8BF7\u586B\u5199\u5BC6\u94A5\u540D\u79F0" }, 400);
+    let groupId = null;
+    if (body.group_id !== void 0 && body.group_id !== null && String(body.group_id) !== "") {
+      groupId = Number(body.group_id);
+      if (!groupId || !await db.getGroup(groupId)) return json({ error: "\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728" }, 400);
+    }
     const apiKey = `sk-${Array.from(crypto.getRandomValues(new Uint8Array(32))).map((b) => b.toString(16).padStart(2, "0")).join("")}`;
     const keyHash = await hashApiKey(apiKey);
-    const result = await db.createApiKey(keyHash, body.name, body.quota_limit || 0);
+    const result = await db.createApiKey(keyHash, name, body.quota_limit || 0, groupId);
     return json({
       data: {
         id: result.lastRowId,
         key: apiKey,
-        name: body.name,
+        name,
         enabled: true,
         balance: 0,
-        quota_limit: body.quota_limit || 0
+        quota_limit: body.quota_limit || 0,
+        group_id: groupId
       }
     }, 201);
   }
@@ -2603,12 +2753,27 @@ async function handleApiKeys(request, env) {
       return json({ error: "Invalid JSON body" }, 400);
     }
     const updates = {};
-    if (body.name !== void 0) updates.name = String(body.name).trim();
+    if (body.name !== void 0) {
+      const name = String(body.name).trim();
+      if (!name) return json({ error: "\u5BC6\u94A5\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A" }, 400);
+      updates.name = name;
+    }
     if (body.enabled !== void 0) updates.enabled = body.enabled === true || body.enabled === 1 ? 1 : 0;
     if (body.balance !== void 0 && Number.isFinite(Number(body.balance))) updates.balance = Number(body.balance);
     if (body.quota_limit !== void 0 && Number.isFinite(Number(body.quota_limit))) updates.quota_limit = Math.max(0, Number(body.quota_limit));
+    if (body.group_id !== void 0) {
+      if (body.group_id === null || String(body.group_id) === "") {
+        updates.group_id = null;
+      } else {
+        const groupId = Number(body.group_id);
+        if (!groupId || !await db.getGroup(groupId)) return json({ error: "\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728" }, 400);
+        updates.group_id = groupId;
+      }
+    }
     await db.updateApiKey(id, updates);
-    const key = await db.queryOne("SELECT id, name, enabled, balance, quota_limit, created_at FROM api_keys WHERE id = ?", [id]);
+    const key = await db.queryOne(`SELECT k.id, k.name, k.enabled, k.balance, k.quota_limit, k.group_id, k.created_at,
+             g.name AS group_name
+      FROM api_keys k LEFT JOIN groups g ON k.group_id = g.id WHERE k.id = ?`, [id]);
     if (!key) return json({ error: "API Key not found" }, 404);
     return json({ data: key });
   }

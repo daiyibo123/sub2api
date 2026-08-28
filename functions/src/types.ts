@@ -19,20 +19,6 @@ export interface Group {
   created_at: string;
 }
 
-export interface Channel {
-  id: number;
-  name: string;
-  provider: string;
-  base_url?: string;
-  api_key?: string;
-  enabled: number;
-  priority: number;
-  error_count: number;
-  error_rate: number;
-  last_error_at?: string;
-  created_at: string;
-}
-
 export interface Account {
   id: number;
   name: string;
@@ -40,8 +26,10 @@ export interface Account {
   api_key: string;
   base_url?: string;
   group_id: number;
-  channel_id: number;
+  /** Legacy column retained by the migration; no longer used for routing. */
+  channel_id?: number;
   enabled: number;
+  rate_multiplier?: number;
   error_count: number;
   error_rate: number;
   last_error_at?: string;
@@ -83,24 +71,27 @@ export interface UsageRecord {
   status: number;
   error_message?: string;
   latency_ms?: number;
+  /** Time to first byte. Null for non-streaming replies, which have no TTFT. */
+  ttft_ms?: number | null;
   created_at: string;
 }
 
 export interface RequestLog {
   id: number;
   account_id: number;
-  channel_id: number;
+  /** Retained for historical rows written before channels were removed. */
+  channel_id?: number;
   group_id: number;
   model: string;
   status: number;
   error_message?: string;
   latency_ms?: number;
+  ttft_ms?: number | null;
   created_at: string;
 }
 
 export interface AccountErrorStats {
   accountId: number;
-  channelId: number;
   groupId: number;
   windowStart: number;
   totalRequests: number;
@@ -111,7 +102,6 @@ export interface AccountErrorStats {
 
 export interface SelectAccountResult {
   account: Account;
-  channel: Channel;
   group: Group;
   stats: AccountErrorStats | null;
 }

@@ -105,38 +105,23 @@ _, backup = call('/groups', 'POST', {'name': 'gw-backup', 'priority': 10, 'error
 primary_id = primary.get('data', {}).get('id')
 backup_id = backup.get('data', {}).get('id')
 
-# One channel per stub port, all OpenAI-compatible.
-channel_ids = {}
-for name, port, priority in (('gw-a', PORT_A, 0), ('gw-b', PORT_B, 5), ('gw-c', PORT_C, 0)):
-    _, created = call('/channels', 'POST', {
-        'name': name, 'provider': 'openai',
+# Accounts now carry their own base_url and key; there is no channel layer.
+account_ids = {}
+for name, port, priority, group in (
+    ('gw-a', PORT_A, 0, 'primary'),
+    ('gw-b', PORT_B, 5, 'primary'),
+    ('gw-c', PORT_C, 0, 'backup'),
+):
+    _, created = call('/accounts', 'POST', {
+        'name': name, 'provider': 'openai', 'api_key': f'sk-account-{name}',
         'base_url': f'http://127.0.0.1:{port}',
-        'api_key': f'sk-channel-{name}', 'priority': priority,
+        'group_id': primary_id if group == 'primary' else backup_id,
+        'priority': priority,
     }, token=token)
-    channel_ids[name] = created.get('data', {}).get('id')
+    account_ids[name] = created.get('data', {}).get('id')
 
-check('fixtures created', all([primary_id, backup_id, *channel_ids.values()]),
-      f'groups={primary_id},{backup_id} channels={channel_ids}')
-
-# Account A: primary group, priority 0 -> should always be chosen first.
-_, acc_a = call('/accounts', 'POST', {
-    'name': 'gw-acct-a', 'provider': 'openai', 'api_key': 'sk-acct-a',
-    'group_id': primary_id, 'channel_id': channel_ids['gw-a'], 'priority': 0,
-}, token=token)
-# Account B: primary group, priority 5 -> first failover target.
-_, acc_b = call('/accounts', 'POST', {
-    'name': 'gw-acct-b', 'provider': 'openai', 'api_key': '',
-    'group_id': primary_id, 'channel_id': channel_ids['gw-b'], 'priority': 5,
-}, token=token)
-# Account C: backup group -> only used when the primary group is exhausted.
-_, acc_c = call('/accounts', 'POST', {
-    'name': 'gw-acct-c', 'provider': 'openai', 'api_key': 'sk-acct-c',
-    'group_id': backup_id, 'channel_id': channel_ids['gw-c'], 'priority': 0,
-}, token=token)
-id_a = acc_a.get('data', {}).get('id')
-id_b = acc_b.get('data', {}).get('id')
-id_c = acc_c.get('data', {}).get('id')
-check('three accounts created', all([id_a, id_b, id_c]), f'{id_a},{id_b},{id_c}')
+check('fixtures created', bool(primary_id and backup_id), f'groups={primary_id},{backup_id}')
+check('three accounts created', all(account_ids.values()), account_ids)
 
 _, key_payload = call('/keys', 'POST', {'name': 'gw-key', 'quota_limit': 0}, token=token)
 client_key = key_payload.get('data', {}).get('key')
@@ -160,9 +145,9 @@ check('response came from priority-0 account', payload.get('id') == f'chatcmpl-{
 check('only the selected upstream was called', len(requests_seen(PORT_A)) == 1 and not requests_seen(PORT_B))
 
 seen = requests_seen(PORT_A)[0]
-check('account key forwarded to upstream', seen['authorization'] == 'Bearer sk-acct-a', seen['authorization'])
+check('account key forwarded to upstream', seen['authorization'] == 'Bearer sk-account-gw-a', seen['authorization'])
 
-# Account B has a blank key and must inherit its channel credential.
+# Failover must forward the next account's own credential.
 reset_upstreams()
 control(PORT_A, status=500)
 status, payload = call('/v1/chat/completions', 'POST',
@@ -171,7 +156,7 @@ status, payload = call('/v1/chat/completions', 'POST',
 check('failover produced a success', status == 200, (status, payload))
 check('failover used the next account', payload.get('id') == f'chatcmpl-{PORT_B}', payload.get('id'))
 b_seen = requests_seen(PORT_B)
-check('inherited channel key used', bool(b_seen) and b_seen[0]['authorization'] == 'Bearer sk-channel-gw-b',
+check('account key forwarded on failover', bool(b_seen) and b_seen[0]['authorization'] == 'Bearer sk-account-gw-b',
       b_seen[0]['authorization'] if b_seen else None)
 
 # 400 is a caller error and must NOT trigger failover.
@@ -255,15 +240,10 @@ stream_seen = all_requests_seen()
 check('upstream saw stream flag', bool(stream_seen) and stream_seen[0]['stream'] is True)
 
 # ----------------------------------------------------- anthropic + messages
-_, anthropic_channel = call('/channels', 'POST', {
-    'name': 'gw-anthropic', 'provider': 'anthropic',
-    'base_url': f'http://127.0.0.1:{PORT_C}', 'api_key': 'sk-anthropic-channel',
-}, token=token)
-anthropic_channel_id = anthropic_channel.get('data', {}).get('id')
 call('/accounts', 'POST', {
     'name': 'gw-anthropic-acct', 'provider': 'anthropic', 'api_key': 'sk-anthropic-acct',
-    'group_id': primary_id, 'channel_id': anthropic_channel_id,
-    'client_spoofing': 'claude-code',
+    'base_url': f'http://127.0.0.1:{PORT_C}',
+    'group_id': primary_id, 'client_spoofing': 'claude-code',
 }, token=token)
 
 reset_upstreams()
@@ -289,14 +269,14 @@ check('anthropic hit the messages path',
 
 # --------------------------------------------------- disabled account skip
 reset_upstreams()
-call(f'/accounts/{id_a}', 'PUT', {'enabled': 0}, token=token)
+call(f'/accounts/{account_ids["gw-a"]}', 'PUT', {'enabled': 0}, token=token)
 status, payload = call('/v1/chat/completions', 'POST',
                        {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
                        token=client_key, base=BASE)
 check('disabled account is skipped',
       status == 200 and payload.get('id') != f'chatcmpl-{PORT_A}' and not requests_seen(PORT_A),
       (status, payload.get('id')))
-call(f'/accounts/{id_a}', 'PUT', {'enabled': 1}, token=token)
+call(f'/accounts/{account_ids["gw-a"]}', 'PUT', {'enabled': 1}, token=token)
 
 # ------------------------------------------------------ usage + model probe
 status, payload = call('/v1/models', token=client_key, base=BASE)
@@ -315,11 +295,11 @@ check('stats aggregates requests', status == 200 and int(totals.get('total_reque
 
 # ------------------------------------------------------- connection tester
 reset_upstreams()
-status, payload = call(f'/accounts/{id_a}/test', 'POST', token=token)
+status, payload = call(f'/accounts/{account_ids["gw-a"]}/test', 'POST', token=token)
 check('account connection test succeeds', status == 200 and payload.get('success') is True, payload)
 
 control(PORT_A, status=401)
-status, payload = call(f'/accounts/{id_a}/test', 'POST', token=token)
+status, payload = call(f'/accounts/{account_ids["gw-a"]}/test', 'POST', token=token)
 check('account connection test reports failure', status == 200 and payload.get('success') is False, payload)
 
 print()

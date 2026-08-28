@@ -150,17 +150,122 @@ function applyClientSpoofing(headers: Record<string, string>, provider: string, 
 
 /**
  * Resolve the credentials a request should actually use. An account may leave
- * its key or base URL empty to inherit the channel's values; the provider
+ * An account carries its own key and base URL. A blank base URL means the
  * default is applied later by getUpstreamBaseUrl.
  */
 export function resolveUpstreamCredentials(
-  account: { api_key?: string; base_url?: string },
-  channel?: { api_key?: string; base_url?: string }
+  account: { api_key?: string; base_url?: string }
 ): { apiKey: string; baseUrl: string } {
   return {
-    apiKey: String(account?.api_key || '').trim() || String(channel?.api_key || '').trim(),
-    baseUrl: String(account?.base_url || '').trim() || String(channel?.base_url || '').trim()
+    apiKey: String(account?.api_key || '').trim(),
+    baseUrl: String(account?.base_url || '').trim()
   };
+}
+
+export interface StreamOutcome {
+  /** Milliseconds until the first upstream byte reached the client. */
+  ttftMs: number | null;
+  /** Milliseconds until the upstream closed the stream. */
+  totalMs: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+/**
+ * Forward a stream untouched while observing timing and token usage.
+ *
+ * Time to first token decides whether a client feels responsive, so it must be
+ * measured without buffering: every chunk is enqueued immediately and only
+ * timestamped on the way past. Buffering to measure would inflate the very
+ * number being measured.
+ *
+ * Providers report usage in a late SSE frame (`message_delta` for Anthropic, a
+ * final `usage` chunk for OpenAI). Rather than retain the whole transcript, only
+ * a small rolling tail is kept so a usage object split across two chunks is
+ * still parsed. `onDone` runs after the upstream closes, so the caller can log
+ * without delaying delivery.
+ */
+export function measureStreamTiming(
+  body: ReadableStream<Uint8Array>,
+  startedAt: number,
+  onDone: (outcome: StreamOutcome) => void
+): ReadableStream<Uint8Array> {
+  let ttftMs: number | null = null;
+  let settled = false;
+  let tail = '';
+  const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  const decoder = new TextDecoder();
+
+  // Enough to hold a usage frame that straddles a chunk boundary, small enough
+  // that a long conversation never accumulates memory in the isolate.
+  const TAIL_LIMIT = 4096;
+
+  const scan = (text: string) => {
+    tail = (tail + text).slice(-TAIL_LIMIT);
+    // Match both OpenAI (prompt_tokens/completion_tokens) and Anthropic
+    // (input_tokens/output_tokens) spellings wherever they appear.
+    const prompt = /"(?:prompt_tokens|input_tokens)"\s*:\s*(\d+)/g;
+    const completion = /"(?:completion_tokens|output_tokens)"\s*:\s*(\d+)/g;
+    const total = /"total_tokens"\s*:\s*(\d+)/g;
+    for (let m = prompt.exec(tail); m; m = prompt.exec(tail)) {
+      usage.promptTokens = Math.max(usage.promptTokens, Number(m[1]) || 0);
+    }
+    for (let m = completion.exec(tail); m; m = completion.exec(tail)) {
+      // Anthropic emits a running output count, so the largest seen wins.
+      usage.completionTokens = Math.max(usage.completionTokens, Number(m[1]) || 0);
+    }
+    for (let m = total.exec(tail); m; m = total.exec(tail)) {
+      usage.totalTokens = Math.max(usage.totalTokens, Number(m[1]) || 0);
+    }
+  };
+
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    try {
+      onDone({
+        ttftMs,
+        totalMs: Date.now() - startedAt,
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+        totalTokens: usage.totalTokens || usage.promptTokens + usage.completionTokens
+      });
+    } catch {
+      // Never let logging break the response the client is reading.
+    }
+  };
+
+  return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      // Deliver first, measure second: the client must never wait on bookkeeping.
+      controller.enqueue(chunk);
+      if (ttftMs === null) ttftMs = Date.now() - startedAt;
+      try {
+        scan(decoder.decode(chunk, { stream: true }));
+      } catch {
+        // Binary or malformed frame; timing is still valid.
+      }
+    },
+    flush() {
+      finish();
+    },
+    cancel() {
+      // The client disconnected mid-stream; still record what was observed.
+      finish();
+    }
+  }));
+}
+
+/**
+ * Billing weight for an account; 1 when unset or invalid.
+ *
+ * A reseller upstream may bill at a fraction (or a premium) of list price, so
+ * cost is the raw token price scaled by this factor.
+ */
+export function accountRateMultiplier(account: any): number {
+  const value = Number(account?.rate_multiplier);
+  return Number.isFinite(value) && value >= 0 ? value : 1;
 }
 
 export function getUpstreamBaseUrl(baseUrl?: string, provider?: string): string {

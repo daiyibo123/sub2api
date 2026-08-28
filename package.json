@@ -9,9 +9,8 @@
     "test:ui": "node tests/ui.test.mjs",
     "test:api": "python tests/api.test.py",
     "test:gateway": "python tests/gateway.test.py",
+    "test:features": "python tests/features.test.py",
     "test": "npm run typecheck && npm run test:ui",
-    "test:ui": "node tests/ui.test.mjs",
-    "test:api": "python tests/api.test.py",
     "dev": "npm run build:functions && wrangler pages dev frontend --compatibility-flag=nodejs_compat",
     "deploy": "npm run build:functions && wrangler pages deploy frontend --project-name sub2api-gateway"
   },

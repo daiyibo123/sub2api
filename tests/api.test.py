@@ -74,47 +74,30 @@ check("empty group name rejected", st == 400, (st, js))
 st, js = call("POST", "/api/v1/groups", {"name": "bad", "error_threshold": 5}, token)
 check("out-of-range threshold rejected", st == 400, (st, js))
 
-# --- channels ---
-st, js = call("POST", "/api/v1/channels",
-              {"name": "OpenAI 主渠道", "provider": "openai", "api_key": "sk-SECRET-CHANNEL"}, token)
-cid = js.get("data", {}).get("id")
-check("create channel", st == 201 and cid, (st, js))
-check("channel create masks key", js.get("data", {}).get("api_key") == "***", js.get("data"))
-check("channel exposes has_api_key", js.get("data", {}).get("has_api_key") is True, js.get("data"))
+# --- accounts (upstream accounts now hold their own credentials) ---
+st, js = call("POST", "/api/v1/accounts",
+              {"name": "主账号", "provider": "openai", "api_key": "sk-SECRET-ACCOUNT",
+               "group_id": gid, "base_url": "https://api.openai.com"}, token)
+aid = js.get("data", {}).get("id")
+check("create account", st == 201 and aid, (st, js))
+check("account create masks key", js.get("data", {}).get("api_key") == "***", js.get("data"))
+check("account exposes has_api_key", js.get("data", {}).get("has_api_key") is True, js.get("data"))
 
-st, js = call("POST", "/api/v1/channels",
-              {"name": "dup-name-check", "provider": "openai"}, token)
-dup_channel = js.get("data", {}).get("id")
-st, js = call("POST", "/api/v1/channels", {"name": "dup-name-check", "provider": "openai"}, token)
-check("duplicate channel name rejected", st in (400, 409), (st, js))
+st, js = call("GET", "/api/v1/accounts", token=token)
+check("account list masks key",
+      all(a.get("api_key") in ("***", "") for a in js.get("data", [])), js.get("data"))
 
-st, js = call("POST", "/api/v1/channels",
-              {"name": "bad-url", "provider": "openai", "base_url": "notaurl"}, token)
-check("invalid base_url rejected", st == 400, (st, js))
-
-st, js = call("POST", "/api/v1/channels", {"name": "bad-prov", "provider": "nope"}, token)
+st, js = call("POST", "/api/v1/accounts",
+              {"name": "bad-prov", "provider": "nope", "api_key": "sk-x", "group_id": gid}, token)
 check("invalid provider rejected", st == 400, (st, js))
 
-st, js = call("GET", "/api/v1/channels", token=token)
-check("channel list masks key",
-      all(c.get("api_key") in ("***", "") for c in js.get("data", [])), js.get("data"))
-
-# --- accounts ---
 st, js = call("POST", "/api/v1/accounts",
-              {"name": "主账号", "provider": "openai", "api_key": "",
-               "group_id": gid, "channel_id": cid}, token)
-aid = js.get("data", {}).get("id")
-check("account with blank key inherits channel key", st == 201 and aid, (st, js))
-check("account create masks key", js.get("data", {}).get("api_key") in ("***", ""), js.get("data"))
+              {"name": "bad-url", "provider": "openai", "api_key": "sk-x",
+               "group_id": gid, "base_url": "notaurl"}, token)
+check("invalid base_url rejected", st == 400, (st, js))
 
 st, js = call("POST", "/api/v1/accounts",
-              {"name": "mismatch", "provider": "anthropic", "api_key": "sk-x",
-               "group_id": gid, "channel_id": cid}, token)
-check("provider mismatch with channel rejected", st == 400, (st, js))
-
-st, js = call("POST", "/api/v1/accounts",
-              {"name": "nogroup", "provider": "openai", "api_key": "sk-x",
-               "group_id": 9999, "channel_id": cid}, token)
+              {"name": "nogroup", "provider": "openai", "api_key": "sk-x", "group_id": 9999}, token)
 check("nonexistent group rejected", st == 400, (st, js))
 
 st, js = call("POST", "/api/v1/accounts",
@@ -122,9 +105,13 @@ st, js = call("POST", "/api/v1/accounts",
 check("missing group rejected", st == 400, (st, js))
 
 st, js = call("POST", "/api/v1/accounts",
-              {"name": "keyless", "provider": "openai", "api_key": "",
-               "group_id": gid, "channel_id": dup_channel}, token)
-check("blank key + keyless channel rejected", st == 400, (st, js))
+              {"name": "keyless", "provider": "openai", "api_key": "", "group_id": gid}, token)
+check("account without a key rejected", st == 400, (st, js))
+
+st, js = call("POST", "/api/v1/accounts",
+              {"name": "neg-rate", "provider": "openai", "api_key": "sk-x",
+               "group_id": gid, "rate_multiplier": -1}, token)
+check("negative multiplier rejected", st == 400, (st, js))
 
 # --- model mappings ---
 st, js = call("POST", "/api/v1/models",
@@ -169,11 +156,8 @@ check("toggle key", st == 200 and js.get("data", {}).get("enabled") == 0, (st, j
 st, js = call("DELETE", "/api/v1/groups/%s" % gid, token=token)
 check("group delete blocked while in use", st in (400, 409), (st, js))
 
-st, js = call("DELETE", "/api/v1/channels/%s" % cid, token=token)
-check("channel delete blocked while in use", st in (400, 409), (st, js))
-
-st, js = call("PUT", "/api/v1/channels/%s" % cid, {"provider": "anthropic"}, token)
-check("channel provider switch blocked", st == 400, (st, js))
+st, js = call("PUT", "/api/v1/accounts/%s" % aid, {"rate_multiplier": 0.5}, token)
+check("account multiplier updatable", st == 200 and js.get("data", {}).get("rate_multiplier") == 0.5, (st, js))
 
 # --- stats ---
 st, js = call("GET", "/api/v1/stats?hours=24", token=token)

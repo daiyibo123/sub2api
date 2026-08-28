@@ -550,6 +550,42 @@ html.dark .tint-amber { color: var(--amber); }
 html.dark .quick-action:hover { border-color: rgba(20, 184, 166, .3); background: rgba(20, 184, 166, .1); }
 .quick-action .stat-icon { width: 36px; height: 36px; }
 .quick-action-body { min-width: 0; flex: 1; }
+
+/* Resource summary cards on the dashboard. Stacked rather than one flat row so
+   the count reads as the headline and the enabled ratio stays legible. */
+.res-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 0 20px 20px; }
+@media (min-width: 1280px) { .res-cards { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+.res-card {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-ctl);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+  transition: transform .2s, border-color .2s, box-shadow .2s;
+}
+.res-card:hover { transform: translateY(-2px); border-color: var(--p300); box-shadow: var(--shadow-card); }
+.res-card.is-empty { border-style: dashed; background: var(--canvas); }
+.res-card.is-empty:hover { border-color: var(--amber); }
+.res-top { display: flex; align-items: center; gap: 9px; }
+.res-top .stat-icon { width: 32px; height: 32px; border-radius: 9px; }
+.res-top .stat-icon .ico { width: 17px; height: 17px; }
+.res-label { flex: 1; min-width: 0; color: var(--text-2); font-size: 12.5px; font-weight: 600; }
+/* The chevron only earns attention on hover; at rest it is a quiet affordance. */
+.res-card .chevron { color: var(--text-3); transition: transform .2s, color .2s; }
+.res-card:hover .chevron { color: var(--p600); transform: translateX(2px); }
+.res-figure { display: flex; align-items: baseline; gap: 5px; }
+.res-figure strong { font-size: 24px; font-weight: 700; letter-spacing: -.03em; line-height: 1; }
+.res-figure em { color: var(--text-3); font-size: 11.5px; font-style: normal; }
+.res-hint { color: var(--amber-ink, #b45309); font-size: 11.5px; font-weight: 500; }
+html.dark .res-hint { color: var(--amber); }
+/* Full width means everything is enabled, which reads better in green. */
+.res-card .meter { width: 100%; margin-top: 0; }
+.res-card .meter.is-full > span { background: linear-gradient(90deg, var(--emerald), #34d399); }
 .quick-action-body strong { display: block; font-size: 13.5px; font-weight: 600; }
 .quick-action-body span { display: block; margin-top: 2px; color: var(--text-2); font-size: 12px; }
 .quick-action .chevron { color: var(--text-3); transition: color .2s, transform .2s; }
@@ -636,6 +672,22 @@ th:last-child, td:last-child { text-align: right; }
 .meter { display: block; width: 88px; height: 6px; margin-top: 5px; border-radius: 99px; background: var(--line); overflow: hidden; }
 .meter > span { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--p500), var(--p400)); }
 
+/* A leading glyph on each page title and card title. Icons here are decoration
+   for scanning, so they are sized down and never carry meaning on their own. */
+.page-heading h1 { display: flex; align-items: center; gap: 9px; }
+.page-icon {
+  width: 30px; height: 30px; flex: 0 0 auto;
+  display: grid; place-items: center;
+  border-radius: 9px;
+}
+.page-icon .ico { width: 16px; height: 16px; }
+.card-head h2 { display: flex; align-items: center; gap: 7px; }
+.card-head h2 .ico { color: var(--text-3); flex: 0 0 auto; }
+@media (max-width: 640px) {
+  .page-icon { width: 26px; height: 26px; border-radius: 8px; }
+  .page-icon .ico { width: 14px; height: 14px; }
+}
+
 /* ------------------------------------------------------------------ badges */
 
 .badge {
@@ -655,6 +707,10 @@ th:last-child, td:last-child { text-align: right; }
 .badge-warn    { color: #b45309;        background: rgba(245, 158, 11, .14); }
 .badge-err     { color: var(--red);     background: rgba(239, 68, 68, .12); }
 .badge-neutral { color: var(--text-2);  background: var(--surface-2); }
+/* Group binding on an API key: a routing constraint, so it reads as an
+   identity chip rather than a health signal. */
+.badge-group { color: var(--indigo); background: rgba(99, 102, 241, .12); }
+html.dark .badge-group { color: #a5b4fc; }
 html.dark .badge-warn { color: var(--amber); }
 
 .badge-provider { border-radius: var(--radius-sm); text-transform: none; }

@@ -1,7 +1,7 @@
 // D1 Database abstraction layer
 import type { Env } from './index';
 import type { UsageRecord, RequestLog } from './types';
-import { SCHEMA_STATEMENTS } from './schema';
+import { SCHEMA_STATEMENTS, ADDITIVE_COLUMNS } from './schema';
 
 export class Database {
   constructor(private db: D1Database) {}
@@ -102,54 +102,18 @@ export class Database {
     return this.update('DELETE FROM groups WHERE id = ?', [id]);
   }
 
-  // Channel operations
-  async listChannels() {
-    return this.query<any>('SELECT * FROM channels ORDER BY priority ASC, id ASC');
-  }
 
-  async getChannel(id: number) {
-    return this.queryOne<any>('SELECT * FROM channels WHERE id = ?', [id]);
-  }
 
-  /** channels.name is UNIQUE; pre-check so collisions get a readable message. */
-  async getChannelByName(name: string) {
-    return this.queryOne<any>('SELECT * FROM channels WHERE name = ?', [name]);
-  }
 
-  async createChannel(name: string, provider: string, baseUrl?: string, apiKey?: string, priority = 0, enabled = 1) {
-    return this.insert(
-      'INSERT INTO channels (name, provider, base_url, api_key, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)',
-      [name, provider, baseUrl || '', apiKey || '', priority, enabled]
-    );
-  }
 
-  async updateChannel(id: number, updates: Partial<any>) {
-    const fields: string[] = [];
-    const values: any[] = [];
-    
-    if (updates.name !== undefined) { fields.push('name = ?'); values.push(updates.name); }
-    if (updates.provider !== undefined) { fields.push('provider = ?'); values.push(updates.provider); }
-    if (updates.base_url !== undefined) { fields.push('base_url = ?'); values.push(updates.base_url); }
-    if (updates.api_key !== undefined) { fields.push('api_key = ?'); values.push(updates.api_key); }
-    if (updates.enabled !== undefined) { fields.push('enabled = ?'); values.push(updates.enabled); }
-    if (updates.priority !== undefined) { fields.push('priority = ?'); values.push(updates.priority); }
-    
-    if (fields.length === 0) return { changes: 0 };
-    values.push(id);
-    return this.update(`UPDATE channels SET ${fields.join(', ')} WHERE id = ?`, values);
-  }
 
-  async deleteChannel(id: number) {
-    return this.update('DELETE FROM channels WHERE id = ?', [id]);
-  }
 
   // Account operations
   async listAccounts() {
     return this.query<any>(`
-      SELECT a.*, g.name as group_name, c.name as channel_name 
+      SELECT a.*, g.name as group_name
       FROM accounts a
       LEFT JOIN groups g ON a.group_id = g.id
-      LEFT JOIN channels c ON a.channel_id = c.id
       ORDER BY a.priority ASC, a.id ASC
     `);
   }
@@ -158,10 +122,13 @@ export class Database {
     return this.queryOne<any>('SELECT * FROM accounts WHERE id = ?', [id]);
   }
 
-  async createAccount(name: string, provider: string, apiKey: string, groupId: number, channelId: number, baseUrl?: string, priority = 0, clientSpoofing?: string, enabled = 1) {
+  async createAccount(name: string, provider: string, apiKey: string, groupId: number, baseUrl?: string, priority = 0, clientSpoofing?: string, enabled = 1, rateMultiplier = 1) {
     return this.insert(
-      'INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [name, provider, apiKey, baseUrl || '', groupId, channelId, priority, clientSpoofing || '', enabled]
+      // channel_id is a retired column that older databases still declare
+      // NOT NULL, so a literal 0 is written to satisfy both shapes.
+      `INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing, enabled, rate_multiplier)
+       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+      [name, provider, apiKey, baseUrl || '', groupId, priority, clientSpoofing || '', enabled, rateMultiplier]
     );
   }
 
@@ -174,12 +141,12 @@ export class Database {
     if (updates.api_key !== undefined) { fields.push('api_key = ?'); values.push(updates.api_key); }
     if (updates.base_url !== undefined) { fields.push('base_url = ?'); values.push(updates.base_url); }
     if (updates.group_id !== undefined) { fields.push('group_id = ?'); values.push(updates.group_id); }
-    if (updates.channel_id !== undefined) { fields.push('channel_id = ?'); values.push(updates.channel_id); }
     if (updates.enabled !== undefined) { fields.push('enabled = ?'); values.push(updates.enabled); }
     if (updates.priority !== undefined) { fields.push('priority = ?'); values.push(updates.priority); }
     if (updates.error_count !== undefined) { fields.push('error_count = ?'); values.push(updates.error_count); }
     if (updates.error_rate !== undefined) { fields.push('error_rate = ?'); values.push(updates.error_rate); }
     if (updates.client_spoofing !== undefined) { fields.push('client_spoofing = ?'); values.push(updates.client_spoofing); }
+    if (updates.rate_multiplier !== undefined) { fields.push('rate_multiplier = ?'); values.push(updates.rate_multiplier); }
     
     if (fields.length === 0) return { changes: 0 };
     values.push(id);
@@ -195,16 +162,12 @@ export class Database {
   }
 
   /**
-   * An account with a blank api_key falls back to its channel's key, so a
-   * channel can hold one shared credential for several accounts.
+   * Credentials live on the account itself; there is no longer a second layer
+   * holding shared defaults.
    */
   async listEnabledAccounts() {
     return this.query<any>(`
-      SELECT a.*, COALESCE(NULLIF(a.api_key, ''), c.api_key, '') AS api_key
-      FROM accounts a
-      LEFT JOIN channels c ON a.channel_id = c.id
-      WHERE a.enabled = 1
-      ORDER BY a.priority ASC, a.id ASC
+      SELECT * FROM accounts WHERE enabled = 1 ORDER BY priority ASC, id ASC
     `);
   }
 
@@ -225,47 +188,36 @@ export class Database {
     return Number(row?.total || 0);
   }
 
-  /**
-   * Count accounts that would be orphaned by switching a channel's provider.
-   * Scheduling requires channel.provider === account.provider, so such accounts
-   * would silently stop receiving traffic.
-   */
-  async countAccountsForChannelWithOtherProvider(channelId: number, nextProvider: string): Promise<number> {
-    const row = await this.queryOne<{ total: number }>(
-      'SELECT COUNT(*) AS total FROM accounts WHERE channel_id = ? AND provider != ?',
-      [channelId, nextProvider]
-    );
-    return Number(row?.total || 0);
-  }
 
   /**
-   * Name lookups back friendly duplicate errors. Both groups and channels have
+   * Name lookups back friendly duplicate errors. Groups have
    * a UNIQUE(name) constraint, which would otherwise surface as a raw D1 500.
    */
   async findGroupByName(name: string) {
     return this.queryOne<any>('SELECT * FROM groups WHERE name = ?', [name]);
   }
 
-  async findChannelByName(name: string) {
-    return this.queryOne<any>('SELECT * FROM channels WHERE name = ?', [name]);
-  }
 
-  /** Accounts still pointing at a channel, used to block unsafe deletes. */
-  async countAccountsForChannel(channelId: number): Promise<number> {
-    const row = await this.queryOne<{ total: number }>(
-      'SELECT COUNT(*) AS total FROM accounts WHERE channel_id = ?',
-      [channelId]
+
+  /**
+   * Store the outcome of a liveness probe on the account row.
+   *
+   * Keeping the last result denormalized lets the console show which upstreams
+   * are alive without re-probing every provider on each page load.
+   */
+  async recordAccountHealthCheck(id: number, ok: boolean, latencyMs: number, message: string) {
+    return this.update(
+      `UPDATE accounts
+       SET last_check_at = datetime('now'), last_check_ok = ?, last_check_latency_ms = ?, last_check_message = ?
+       WHERE id = ?`,
+      [ok ? 1 : 0, Math.max(0, Math.round(latencyMs)), (message || '').slice(0, 300), id]
     );
-    return Number(row?.total || 0);
   }
 
-  /** Resolve an account with the channel key fallback applied. */
+  /** Resolve a single account row including its credential. */
   async getAccountWithKey(id: number) {
     return this.queryOne<any>(`
-      SELECT a.*, COALESCE(NULLIF(a.api_key, ''), c.api_key, '') AS api_key
-      FROM accounts a
-      LEFT JOIN channels c ON a.channel_id = c.id
-      WHERE a.id = ?
+      SELECT * FROM accounts WHERE id = ?
     `, [id]);
   }
 
@@ -319,17 +271,23 @@ export class Database {
 
   // API Key operations
   async listApiKeys() {
-    return this.query<any>('SELECT id, name, enabled, balance, quota_limit, created_at FROM api_keys ORDER BY id DESC');
+    return this.query<any>(`
+      SELECT k.id, k.name, k.enabled, k.balance, k.quota_limit, k.group_id, k.created_at,
+             g.name AS group_name
+      FROM api_keys k
+      LEFT JOIN groups g ON k.group_id = g.id
+      ORDER BY k.id DESC
+    `);
   }
 
   async getApiKeyByHash(keyHash: string) {
     return this.queryOne<any>('SELECT * FROM api_keys WHERE key_hash = ?', [keyHash]);
   }
 
-  async createApiKey(keyHash: string, name?: string, quotaLimit = 0) {
+  async createApiKey(keyHash: string, name?: string, quotaLimit = 0, groupId: number | null = null) {
     return this.insert(
-      'INSERT INTO api_keys (key_hash, name, quota_limit) VALUES (?, ?, ?)',
-      [keyHash, name || '', quotaLimit]
+      'INSERT INTO api_keys (key_hash, name, quota_limit, group_id) VALUES (?, ?, ?, ?)',
+      [keyHash, name || '', quotaLimit, groupId]
     );
   }
 
@@ -341,6 +299,7 @@ export class Database {
     if (updates.enabled !== undefined) { fields.push('enabled = ?'); values.push(updates.enabled); }
     if (updates.balance !== undefined) { fields.push('balance = ?'); values.push(updates.balance); }
     if (updates.quota_limit !== undefined) { fields.push('quota_limit = ?'); values.push(updates.quota_limit); }
+    if (updates.group_id !== undefined) { fields.push('group_id = ?'); values.push(updates.group_id); }
     
     if (fields.length === 0) return { changes: 0 };
     values.push(id);
@@ -362,8 +321,8 @@ export class Database {
   async createUsageRecord(record: Partial<UsageRecord>) {
     return this.insert(
       `INSERT INTO usage_records 
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, status, error_message, latency_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, status, error_message, latency_ms, ttft_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -374,7 +333,8 @@ export class Database {
         record.cost ?? 0,
         record.status ?? 200,
         record.error_message || '',
-        record.latency_ms ?? 0
+        record.latency_ms ?? 0,
+        record.ttft_ms ?? null
       ]
     );
   }
@@ -389,16 +349,17 @@ export class Database {
   // Request logs for error tracking
   async createRequestLog(log: Partial<RequestLog>) {
     return this.insert(
-      `INSERT INTO request_logs (account_id, channel_id, group_id, model, status, error_message, latency_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO request_logs (account_id, channel_id, group_id, model, status, error_message, latency_ms, ttft_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         log.account_id,
-        log.channel_id,
+        0,
         log.group_id,
         log.model,
         log.status,
         log.error_message || '',
-        log.latency_ms ?? 0
+        log.latency_ms ?? 0,
+        log.ttft_ms ?? null
       ]
     );
   }
@@ -416,18 +377,6 @@ export class Database {
     return result || { total_requests: 0, error_count: 0 };
   }
 
-  async getChannelErrorStats(channelId: number, windowSeconds: number) {
-    const cutoff = sqliteTimestamp(Date.now() - windowSeconds * 1000);
-    const result = await this.queryOne<any>(
-      `SELECT 
-        COUNT(*) as total_requests,
-        SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) as error_count
-       FROM request_logs 
-       WHERE channel_id = ? AND created_at >= ?`,
-      [channelId, cutoff]
-    );
-    return result || { total_requests: 0, error_count: 0 };
-  }
 
   /**
    * Dashboard aggregates computed in D1 rather than by paging every row into
@@ -463,8 +412,6 @@ export class Database {
           (SELECT COUNT(*) FROM accounts WHERE enabled = 1) AS active_accounts,
           (SELECT COUNT(*) FROM api_keys) AS total_keys,
           (SELECT COUNT(*) FROM api_keys WHERE enabled = 1) AS active_keys,
-          (SELECT COUNT(*) FROM channels) AS total_channels,
-          (SELECT COUNT(*) FROM channels WHERE enabled = 1) AS active_channels,
           (SELECT COUNT(*) FROM groups) AS total_groups,
           (SELECT COUNT(*) FROM groups WHERE enabled = 1) AS active_groups,
           (SELECT COUNT(*) FROM model_mappings) AS total_models,
@@ -511,7 +458,117 @@ export class Database {
     for (const statement of SCHEMA_STATEMENTS) {
       await this.db.prepare(statement).run();
     }
+    await this.applyAdditiveColumns();
+    // Columns must exist before the backfill reads or writes them.
+    await this.migrateChannelsIntoAccounts();
     return !wasReady;
+  }
+
+  /**
+   * Fold the retired channel layer into accounts.
+   *
+   * Channels only ever supplied defaults: a fallback API key and base URL. Two
+   * behaviours depended on that indirection and must be preserved exactly, or
+   * upgrading would silently change which upstreams receive traffic:
+   *
+   *  1. An account with a blank key inherited the channel key at request time.
+   *     Those credentials are copied onto the account, otherwise the account
+   *     would suddenly have no key at all.
+   *  2. Scheduling skipped accounts whose channel was disabled. Without the
+   *     channel there is nothing left to express that, so such accounts are
+   *     disabled individually rather than being quietly promoted to live.
+   *
+   * Guarded by a settings flag so it runs once, and wrapped so a database that
+   * never had a channels table (a fresh deployment) is unaffected.
+   */
+  private async migrateChannelsIntoAccounts(): Promise<void> {
+    if (await this.getSetting('channels_folded_into_accounts')) return;
+
+    const hasChannels = await this.queryOne<{ total: number }>(
+      "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'channels'"
+    ).catch(() => null);
+    if (!Number(hasChannels?.total || 0)) {
+      await this.setSetting('channels_folded_into_accounts', new Date().toISOString());
+      return;
+    }
+
+    try {
+      // Inherit credentials before the join disappears.
+      await this.update(`
+        UPDATE accounts SET api_key = COALESCE(
+          (SELECT c.api_key FROM channels c WHERE c.id = accounts.channel_id), ''
+        )
+        WHERE (api_key IS NULL OR TRIM(api_key) = '')
+          AND EXISTS (SELECT 1 FROM channels c
+                      WHERE c.id = accounts.channel_id AND TRIM(COALESCE(c.api_key, '')) != '')
+      `);
+
+      await this.update(`
+        UPDATE accounts SET base_url = COALESCE(
+          (SELECT c.base_url FROM channels c WHERE c.id = accounts.channel_id), ''
+        )
+        WHERE (base_url IS NULL OR TRIM(base_url) = '')
+          AND EXISTS (SELECT 1 FROM channels c
+                      WHERE c.id = accounts.channel_id AND TRIM(COALESCE(c.base_url, '')) != '')
+      `);
+
+      // Carry the multiplier across only where the account never set its own.
+      await this.update(`
+        UPDATE accounts SET rate_multiplier = COALESCE(
+          (SELECT c.rate_multiplier FROM channels c WHERE c.id = accounts.channel_id), 1
+        )
+        WHERE (rate_multiplier IS NULL OR rate_multiplier = 1)
+          AND EXISTS (SELECT 1 FROM channels c
+                      WHERE c.id = accounts.channel_id
+                        AND c.rate_multiplier IS NOT NULL AND c.rate_multiplier != 1)
+      `).catch(() => {
+        // Older channels rows may predate rate_multiplier; the default of 1 is
+        // already correct in that case.
+      });
+
+      // A disabled channel used to mask every account beneath it.
+      await this.update(`
+        UPDATE accounts SET enabled = 0
+        WHERE EXISTS (SELECT 1 FROM channels c
+                      WHERE c.id = accounts.channel_id AND c.enabled = 0)
+      `);
+
+      await this.setSetting('channels_folded_into_accounts', new Date().toISOString());
+    } catch {
+      // Leave the flag unset so the next request retries rather than starting
+      // the gateway on half-migrated credentials.
+    }
+  }
+
+  /**
+   * Add columns introduced after a database was first created.
+   *
+   * SQLite lacks `ADD COLUMN IF NOT EXISTS`, so the existing columns are read
+   * from `PRAGMA table_info` and only genuinely missing ones are added. This
+   * never rewrites or drops data.
+   */
+  private async applyAdditiveColumns(): Promise<void> {
+    const tables = [...new Set(ADDITIVE_COLUMNS.map(entry => entry.table))];
+    const existing = new Map<string, Set<string>>();
+
+    for (const table of tables) {
+      try {
+        const rows = await this.query<{ name: string }>(`PRAGMA table_info(${table})`);
+        existing.set(table, new Set(rows.map(row => row.name)));
+      } catch {
+        // Table absent entirely; the CREATE statements above already cover it.
+      }
+    }
+
+    for (const { table, column, definition } of ADDITIVE_COLUMNS) {
+      const columns = existing.get(table);
+      if (!columns || columns.has(column)) continue;
+      try {
+        await this.db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      } catch {
+        // A concurrent isolate may have added it between the read and write.
+      }
+    }
   }
 
   /** Read a persisted setting, or null when it has never been written. */
@@ -550,9 +607,9 @@ export class Database {
   async schemaReady(): Promise<boolean> {
     try {
       const row = await this.queryOne<{ total: number }>(
-        "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','channels','accounts','model_mappings','api_keys','usage_records','request_logs')"
+        "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','accounts','model_mappings','api_keys','usage_records','request_logs')"
       );
-      return Number(row?.total || 0) >= 8;
+      return Number(row?.total || 0) >= 7;
     } catch {
       return false;
     }

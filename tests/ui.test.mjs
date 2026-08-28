@@ -16,8 +16,7 @@ function check(name, ok, detail = '') {
 // ---- stub backend -----------------------------------------------------------
 const db = {
   groups: [{ id: 1, name: 'default', description: '默认分组', enabled: 1, priority: 0, error_threshold: 0.5, error_count_threshold: 5, window_seconds: 300 }],
-  channels: [{ id: 1, name: 'OpenAI 主渠道', provider: 'openai', base_url: '', enabled: 1, priority: 0, has_api_key: true, api_key: '***' }, { id: 2, name: 'Claude 主渠道', provider: 'anthropic', base_url: '', enabled: 1, priority: 0, has_api_key: true, api_key: '***' }],
-  accounts: [{ id: 1, name: 'acct-1', provider: 'openai', group_id: 1, channel_id: 1, group_name: 'default', channel_name: 'OpenAI 主渠道', enabled: 1, priority: 0, error_rate: 0, has_api_key: true, api_key: '***' }],
+  accounts: [{ id: 1, name: 'acct-1', provider: 'openai', group_id: 1, group_name: 'default', enabled: 1, priority: 0, error_rate: 0, rate_multiplier: 1, has_api_key: true, api_key: '***', base_url: '' }],
   models: [{ id: 1, requested_model: 'gpt-4o', provider: 'openai', upstream_model: 'gpt-4o-mini', group_id: 1, enabled: 1, priority: 0 }],
   keys: [{ id: 1, name: 'prod', enabled: 1, balance: 1.5, quota_limit: 0, created_at: '2026-01-01 00:00:00' }],
   usage: [{ id: 1, model: 'gpt-4o', provider: 'openai', total_tokens: 120, prompt_tokens: 100, completion_tokens: 20, cost: 0.002, status: 200, latency_ms: 850, created_at: '2026-01-01 00:00:00' }]
@@ -33,7 +32,6 @@ function statsPayload() {
       resources: {
         total_accounts: db.accounts.length, active_accounts: db.accounts.length,
         total_keys: db.keys.length, active_keys: db.keys.length,
-        total_channels: db.channels.length, active_channels: db.channels.length,
         total_groups: db.groups.length, active_groups: db.groups.length,
         total_models: db.models.length, active_models: db.models.length
       },
@@ -63,7 +61,7 @@ function fakeFetch(url, options = {}) {
   if (path.startsWith('/stats')) return respond(statsPayload())
   if (path.startsWith('/usage')) return respond({ data: db.usage })
 
-  const table = path.match(/^\/(keys|groups|channels|accounts|models)/)?.[1]
+  const table = path.match(/^\/(keys|groups|accounts|models)/)?.[1]
   if (!table) return respond({ error: `unhandled ${path}` }, 404)
   if (method === 'GET') return respond({ data: db[table] })
   if (method === 'POST') {
@@ -112,7 +110,6 @@ check('login hides login page', doc.getElementById('page-login').classList.conta
 // ---- the reported crash: every "add" dialog ---------------------------------
 const dialogs = [
   ['新建分组', 'btn-create-group'],
-  ['新建渠道', 'btn-create-channel'],
   ['添加账号', 'btn-create-account'],
   ['新建映射', 'btn-create-model'],
   ['创建 API Key', 'btn-create-key']
@@ -171,20 +168,23 @@ check('group POST carries name', groupPost?.body?.name === 'team-b', JSON.string
 check('group POST carries enabled', groupPost?.body?.enabled === 1)
 check('dialog closed after save', !doc.querySelector('.modal-card'))
 
-// ---- account dialog: channels filter by provider ---------------------------
-db.channels.push({ id: 2, name: 'Claude 渠道', provider: 'anthropic', base_url: '', enabled: 1, priority: 0, has_api_key: true })
+// ---- account dialog: credentials live on the account itself ----------------
 press(doc.getElementById('btn-create-account'))
-await tick(8)
+await tick(6)
 form = doc.querySelector('.modal-form')
 const providerSelect = form.querySelector('[name="provider"]')
-const channelSelect = form.querySelector('[name="channel_id"]')
-check('account dialog has provider + channel', Boolean(providerSelect && channelSelect))
+const groupSelect = form.querySelector('[name="group_id"]')
+const keyInput = form.querySelector('[name="api_key"]')
+const baseInput = form.querySelector('[name="base_url"]')
+const multiplierInput = form.querySelector('[name="rate_multiplier"]')
+check('account dialog has provider + group', Boolean(providerSelect && groupSelect))
+check('account dialog carries its own credentials', Boolean(keyInput && baseInput))
+check('account dialog exposes rate multiplier', Boolean(multiplierInput))
+check('account dialog has no channel field', !form.querySelector('[name="channel_id"]'))
 
 providerSelect.value = 'anthropic'
 providerSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
 await tick(4)
-const channelLabels = [...channelSelect.options].map(option => option.textContent).join('|')
-check('channel list follows provider', channelLabels.includes('Claude') && !channelLabels.includes('OpenAI'), channelLabels)
 check('dialog still open after provider change', Boolean(doc.querySelector('.modal-card')))
 
 fire(doc.querySelector('.modal-backdrop'), 'mousedown')

@@ -113,9 +113,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(status, {'error': {'message': f'stub failure {status}', 'type': 'stub'}})
 
         if want_stream or body.get('stream'):
+            # Real providers report usage in a late frame: OpenAI sends a final
+            # chunk carrying `usage`, Anthropic a `message_delta`. The gateway
+            # parses that frame to record streamed usage, so the stub must send
+            # one or the test would assert against data no provider omitted.
             frames = [
                 'data: ' + json.dumps({'id': f'chatcmpl-{port}', 'object': 'chat.completion.chunk',
                                        'choices': [{'index': 0, 'delta': {'content': 'hi'}}]}),
+                'data: ' + json.dumps({'id': f'chatcmpl-{port}', 'object': 'chat.completion.chunk',
+                                       'choices': [],
+                                       'usage': {'prompt_tokens': 11, 'completion_tokens': 5,
+                                                 'total_tokens': 16}}),
                 'data: [DONE]',
             ]
             payload = ('\n\n'.join(frames) + '\n\n').encode()

@@ -46,7 +46,10 @@ export const SCHEMA_STATEMENTS: string[] = [
     api_key TEXT NOT NULL,
     base_url TEXT,
     group_id INTEGER NOT NULL,
-    channel_id INTEGER NOT NULL,
+    -- Retired: the channel layer was folded into accounts. Kept with a default
+    -- so one INSERT statement works against databases created before the
+    -- change, where this column still carries a NOT NULL constraint.
+    channel_id INTEGER DEFAULT 0,
     enabled INTEGER DEFAULT 1,
     error_count INTEGER DEFAULT 0,
     error_rate REAL DEFAULT 0,
@@ -113,4 +116,35 @@ export const SCHEMA_STATEMENTS: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_records(created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_accounts_group ON accounts(group_id)`,
   `CREATE INDEX IF NOT EXISTS idx_accounts_channel ON accounts(channel_id)`
+];
+
+/**
+ * Columns added after the first release.
+ *
+ * SQLite has no `ADD COLUMN IF NOT EXISTS`, and a failed ALTER aborts the whole
+ * statement, so the migrator reads `PRAGMA table_info` first and adds only what
+ * is missing. Every entry must be nullable or carry a DEFAULT, otherwise adding
+ * it to a table that already holds rows fails.
+ */
+export const ADDITIVE_COLUMNS: Array<{ table: string; column: string; definition: string }> = [
+  // Time to first byte. Latency alone hides whether a slow response was slow to
+  // start or merely long, which is the number that matters for streaming.
+  { table: 'usage_records', column: 'ttft_ms', definition: 'INTEGER' },
+  { table: 'request_logs', column: 'ttft_ms', definition: 'INTEGER' },
+
+  // Upstream billing weight. Scheduling prefers cheaper accounts, so a 0.5x
+  // reseller is chosen ahead of a 2x one when both are healthy.
+  { table: 'accounts', column: 'rate_multiplier', definition: 'REAL DEFAULT 1' },
+  { table: 'channels', column: 'rate_multiplier', definition: 'REAL DEFAULT 1' },
+
+  // Health probe results, kept on the row so the console can show liveness
+  // without re-testing every upstream on each page load.
+  { table: 'accounts', column: 'last_check_at', definition: 'TEXT' },
+  { table: 'accounts', column: 'last_check_ok', definition: 'INTEGER' },
+  { table: 'accounts', column: 'last_check_latency_ms', definition: 'INTEGER' },
+  { table: 'accounts', column: 'last_check_message', definition: 'TEXT' },
+
+  // A client key may be pinned to one group. NULL keeps the previous behaviour
+  // of allowing every group, so existing keys are unaffected.
+  { table: 'api_keys', column: 'group_id', definition: 'INTEGER' }
 ];

@@ -1,11 +1,11 @@
 // Failover logic with error rate and error count thresholds
 import type { Env } from './index';
 import type { Database } from './db';
-import { Account, Channel, Group, AccountErrorStats, SelectAccountResult } from './types';
+import { Account, Group, AccountErrorStats, SelectAccountResult } from './types';
+import { accountRateMultiplier } from './utils/proxy';
 
 interface ErrorWindow {
   accountId: number;
-  channelId: number;
   groupId: number;
   timestamps: number[];
   errors: number[];
@@ -37,7 +37,7 @@ export class FailoverManager {
   }
 
   // Record request result for error tracking
-  recordRequest(accountId: number, channelId: number, groupId: number, isError: boolean): void {
+  recordRequest(accountId: number, groupId: number, isError: boolean): void {
     const now = Date.now();
     const key = accountId;
     
@@ -45,7 +45,6 @@ export class FailoverManager {
     if (!window) {
       window = {
         accountId,
-        channelId,
         groupId,
         timestamps: [],
         errors: []
@@ -72,7 +71,6 @@ export class FailoverManager {
     if (!window) {
       return {
         accountId,
-        channelId: 0,
         groupId: 0,
         windowStart: Date.now() - this.windowMs,
         totalRequests: 0,
@@ -90,7 +88,6 @@ export class FailoverManager {
     const errorCountThreshold = group?.error_count_threshold ?? this.errorCountThreshold;
     return {
       accountId,
-      channelId: window.channelId,
       groupId: window.groupId,
       windowStart: Date.now() - this.windowMs,
       totalRequests,
@@ -110,7 +107,6 @@ export class FailoverManager {
         const errorRate = totalRequests > 0 ? errorCount / totalRequests : 0;
         return {
           accountId,
-          channelId: 0,
           groupId: group?.id ?? 0,
           windowStart: Date.now() - windowSeconds * 1000,
           totalRequests,
@@ -129,18 +125,14 @@ export class FailoverManager {
   // Select best account from available accounts
   async selectAccount(
     accounts: Account[],
-    channels: Map<number, Channel>,
     groups: Map<number, Group>,
     preferredGroupId?: number
   ): Promise<SelectAccountResult | null> {
     if (accounts.length === 0) return null;
-    
+
     const usableAccounts = accounts.filter(acc => {
-      const channel = channels.get(acc.channel_id);
       const group = groups.get(acc.group_id);
-      return acc.enabled === 1
-        && Boolean(channel && group && channel.enabled === 1 && group.enabled === 1)
-        && channel?.provider === acc.provider;
+      return acc.enabled === 1 && Boolean(group && group.enabled === 1);
     });
     if (usableAccounts.length === 0) return null;
 
@@ -151,19 +143,16 @@ export class FailoverManager {
       : [];
     const candidateAccounts = preferred.length > 0 ? preferred : usableAccounts;
 
-    // Filter healthy accounts
     const statsByAccount = new Map<number, AccountErrorStats>(
       await Promise.all(candidateAccounts.map(async acc => [
         acc.id,
         await this.getErrorStats(acc.id, groups.get(acc.group_id))
       ] as const))
     );
-    let healthyAccounts = candidateAccounts.filter(acc => {
-      const stats = statsByAccount.get(acc.id)!;
-      return !stats.isUnhealthy;
-    });
-    
-    // If all accounts are unhealthy, use the least unhealthy one
+    let healthyAccounts = candidateAccounts.filter(acc => !statsByAccount.get(acc.id)!.isUnhealthy);
+
+    // Every account is circuit-broken: fall back to the least unhealthy rather
+    // than refusing the request outright.
     if (healthyAccounts.length === 0) {
       healthyAccounts = [...candidateAccounts].sort((a, b) => {
         const statsA = statsByAccount.get(a.id)!;
@@ -171,37 +160,43 @@ export class FailoverManager {
         return statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount;
       });
     }
-    
-    // Lower priority values are preferred. Error metrics break ties, then a
-    // least-recently-used tie breaker distributes traffic across equal peers.
+
+    // Explicit priority stays dominant so operators keep hard control of
+    // ordering. Billing weight only breaks ties between equally-prioritised
+    // accounts, where preferring the cheaper upstream costs nothing.
+    //
+    // This differs from sub2api, which is cost-blind: there the multiplier is
+    // only ever a pass/fail admission gate, never a ranking key.
     healthyAccounts.sort((a, b) => {
       const groupA = groups.get(a.group_id)!;
       const groupB = groups.get(b.group_id)!;
-      const channelA = channels.get(a.channel_id)!;
-      const channelB = channels.get(b.channel_id)!;
       const statsA = statsByAccount.get(a.id)!;
       const statsB = statsByAccount.get(b.id)!;
       return (groupA.priority - groupB.priority)
-        || (channelA.priority - channelB.priority)
         || (a.priority - b.priority)
+        || (accountRateMultiplier(a) - accountRateMultiplier(b))
         || (statsA.errorRate - statsB.errorRate)
         || (statsA.errorCount - statsB.errorCount)
         || ((this.lastUsed.get(a.id) ?? 0) - (this.lastUsed.get(b.id) ?? 0))
         || (a.id - b.id);
     });
-    
+
     const selected = healthyAccounts[0];
-    const channel = channels.get(selected.channel_id);
     const group = groups.get(selected.group_id);
-    if (!channel || !group) return null;
+    if (!group) return null;
     this.lastUsed.set(selected.id, Date.now());
-    
+
     return {
       account: selected,
-      channel: channel!,
-      group: group!,
+      group,
       stats: statsByAccount.get(selected.id) ?? null
     };
+  }
+
+  /** Persist a health probe result so the console can show liveness. */
+  async recordHealthCheck(accountId: number, ok: boolean, latencyMs: number, message: string): Promise<void> {
+    if (!this.db) return;
+    await this.db.recordAccountHealthCheck(accountId, ok, latencyMs, message).catch(() => {});
   }
 
   // Check if error should trigger failover
@@ -225,3 +220,4 @@ export class FailoverManager {
     }
   }
 }
+

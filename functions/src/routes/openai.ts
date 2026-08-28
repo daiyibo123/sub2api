@@ -3,10 +3,11 @@ import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { authenticateApiKey } from '../auth';
 import { FailoverManager } from '../failover';
-import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials } from '../utils/proxy';
+import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials , accountRateMultiplier } from '../utils/proxy';
+import { streamWithRecording } from '../utils/record';
 import { getModelFromHeader } from '../utils/headers';
 import { extractTokenUsage, calculateCost } from '../billing';
-import { Account, Channel, Group, ModelMapping } from '../types';
+import { Account, Group, ModelMapping } from '../types';
 
 export async function handleOpenAIRequest(request: Request, env: Env, failover: FailoverManager): Promise<Response> {
   const db = createDatabase(env.DB);
@@ -46,19 +47,30 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
   // Get OpenAI-compatible accounts
   let accounts = await db.listEnabledAccounts();
   accounts = accounts.filter(a => (a.provider === 'openai' || a.provider === 'xai') && a.enabled);
+
+  // A client key may be pinned to one group. That is a hard constraint: serving
+  // it from another group would bill and route traffic somewhere the operator
+  // deliberately excluded, so an empty result fails instead of falling back.
+  const keyGroupId = Number(keyRecord?.group_id) || 0;
+  if (keyGroupId) {
+    accounts = accounts.filter(account => Number(account.group_id) === keyGroupId);
+    if (accounts.length === 0) {
+      return new Response(JSON.stringify({
+        error: 'No available accounts',
+        message: '该 API 密钥绑定的分组下没有可用账号'
+      }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
   
   if (accounts.length === 0) {
     return new Response(JSON.stringify({ error: 'No available accounts' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
   }
   
   // Load supporting data
-  const [channelsRaw, groupsRaw, mappingsRaw] = await Promise.all([
-    db.listChannels(),
+  const [groupsRaw, mappingsRaw] = await Promise.all([
     db.listGroups(),
     db.listModelMappings()
   ]);
-  
-  const channels = new Map(channelsRaw.map(c => [c.id, c]));
   const groups = new Map(groupsRaw.map(g => [g.id, g]));
   const mappings = mappingsRaw;
   
@@ -81,16 +93,16 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
   }
   
   // Select account with failover
-  const selection = await failover.selectAccount(accounts, channels, groups, preferredGroupId);
+  const selection = await failover.selectAccount(accounts, groups, preferredGroupId);
   if (!selection) {
     return new Response(JSON.stringify({ error: 'No available accounts' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
   }
   
-  const { account, channel, group } = selection;
+  const { account, group } = selection;
   const provider = account.provider as 'openai' | 'xai';
   
   // Build upstream request
-  const credentials = resolveUpstreamCredentials(account, channel);
+  const credentials = resolveUpstreamCredentials(account);
   const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   const upstreamUrl = `${baseUrl}${endpoint}`;
   const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
@@ -113,14 +125,20 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     const isError = proxyResponse.status >= 400;
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => '');
-      failover.recordRequest(account.id, channel.id, group.id, true);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }).catch(() => {});
-      return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId);
+      failover.recordRequest(account.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }).catch(() => {});
+      return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime);
     }
     if (stream && proxyResponse.body) {
-      failover.recordRequest(account.id, channel.id, group.id, isError);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: isError ? 'Upstream error' : '', latency_ms: Date.now() - startTime }).catch(() => {});
-      return new Response(proxyResponse.body, { status: proxyResponse.status, headers: { ...proxyResponse.headers, 'content-type': proxyResponse.headers['content-type'] || 'text/event-stream' } });
+      // Streaming records usage from the stream's completion callback so
+      // first-byte latency is not delayed by bookkeeping.
+      return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+        db, failover, keyRecordId: keyRecord.id,
+        accountId: account.id, groupId: group.id,
+        provider: provider, model: upstreamModel,
+        rateMultiplier: accountRateMultiplier(account),
+        startedAt: startTime
+      });
     }
     const responseText = await proxyResponse.text();
     let responseBody: any = {};
@@ -143,7 +161,6 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     // Record request log
     db.createRequestLog({
       account_id: account.id,
-      channel_id: channel.id,
       group_id: group.id,
       model: upstreamModel,
       status: proxyResponse.status,
@@ -152,7 +169,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     }).catch(() => {});
     
     // Record for failover
-    failover.recordRequest(account.id, channel.id, group.id, isError);
+    failover.recordRequest(account.id, group.id, isError);
     
     return new Response(responseText, {
       status: proxyResponse.status,
@@ -164,11 +181,11 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    failover.recordRequest(account.id, channel.id, group.id, true);
-    db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {});
+    failover.recordRequest(account.id, group.id, true);
+    db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {});
     
     // Try failover
-    return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId);
+    return handleFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, startTime);
   }
 }
 
@@ -180,14 +197,14 @@ async function handleFailover(
   failover: FailoverManager,
   keyRecord: any,
   accounts: Account[],
-  channels: Map<number, Channel>,
   groups: Map<number, Group>,
   mappings: ModelMapping[],
   provider: string,
   upstreamModel: string,
   stream: boolean,
   errorMessage: string,
-  preferredGroupId?: number
+  preferredGroupId?: number,
+  originStart: number = Date.now()
 ): Promise<Response> {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
@@ -199,16 +216,16 @@ async function handleFailover(
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
     const nextAccounts = accounts.filter(a => a.enabled && !attempted.has(a.id));
-    const selection = await failover.selectAccount(nextAccounts, channels, groups, preferredGroupId);
+    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId);
     
     if (!selection) break;
     
-    const { account, channel, group } = selection;
+    const { account, group } = selection;
     attempted.add(account.id);
     const currentProvider = account.provider as 'openai' | 'xai';
     
     try {
-      const credentials = resolveUpstreamCredentials(account, channel);
+      const credentials = resolveUpstreamCredentials(account);
       const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, currentProvider);
       const upstreamUrl = `${baseUrl}${endpoint}`;
       const headers = buildUpstreamHeaders(request.headers, currentProvider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
@@ -226,27 +243,31 @@ async function handleFailover(
       
       const isError = proxyResponse.status >= 400;
       if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
-        failover.recordRequest(account.id, channel.id, group.id, true);
+        failover.recordRequest(account.id, group.id, true);
         continue;
       }
       
-      failover.recordRequest(account.id, channel.id, group.id, isError);
+      // Streaming records its own request log and usage from the stream
+      // completion callback, so return before the non-streaming bookkeeping.
+      if (stream && !isError && proxyResponse.body) {
+        return streamWithRecording(proxyResponse.body, proxyResponse.status, proxyResponse.headers, {
+          db, failover, keyRecordId: keyRecord.id,
+          accountId: account.id, groupId: group.id,
+          provider: currentProvider, model: upstreamModel,
+          rateMultiplier: accountRateMultiplier(account),
+          startedAt: originStart
+        });
+      }
+
+      failover.recordRequest(account.id, group.id, isError);
       db.createRequestLog({
         account_id: account.id,
-        channel_id: channel.id,
         group_id: group.id,
         model: upstreamModel,
         status: proxyResponse.status,
         error_message: isError ? errorMessage : '',
         latency_ms: 0
       }).catch(() => {});
-
-      if (stream && !isError && proxyResponse.body) {
-        return new Response(proxyResponse.body, {
-          status: proxyResponse.status,
-          headers: { ...proxyResponse.headers, 'content-type': proxyResponse.headers['content-type'] || 'text/event-stream' }
-        });
-      }
       const responseText = await proxyResponse.text();
       
       return new Response(responseText, {
@@ -255,8 +276,8 @@ async function handleFailover(
       });
       
     } catch (retryError) {
-      failover.recordRequest(account.id, channel.id, group.id, true);
-      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : 'Upstream request failed', latency_ms: 0 }).catch(() => {});
+      failover.recordRequest(account.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : 'Upstream request failed', latency_ms: 0 }).catch(() => {});
       continue;
     }
   }

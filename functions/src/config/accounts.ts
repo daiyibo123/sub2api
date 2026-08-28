@@ -2,6 +2,7 @@
 import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { verifySessionToken, resolveSessionSecret } from '../auth';
+import { probeAccount, probeAccounts } from '../utils/healthcheck';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
@@ -10,6 +11,37 @@ function jsonError(message: string, status: number): Response {
 }
 
 /** Never return stored upstream credentials to the dashboard. */
+/**
+ * Parse a billing weight. Returns a message when the value is unusable.
+ *
+ * 0 is allowed and means the upstream is free, so the check is `>= 0` rather
+ * than truthiness. The ceiling only guards against a typo that would otherwise
+ * push an account to the very end of the scheduling order forever.
+ */
+function readRateMultiplier(value: unknown): number | string {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return '倍率必须是不小于 0 的数字';
+  if (parsed > 100) return '倍率不能大于 100';
+  return parsed;
+}
+
+/**
+ * Blank means "use the provider default". Anything else must parse as an
+ * absolute http(s) URL, otherwise the mistake only surfaces later as a
+ * confusing upstream fetch failure instead of a clear message here.
+ */
+function normalizeBaseUrl(value: unknown): string | null {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    return raw.replace(/\/+$/, '');
+  } catch {
+    return null;
+  }
+}
+
 function maskAccount(account: any) {
   if (!account) return account;
   const { api_key, ...rest } = account;
@@ -45,51 +77,53 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
   }
   
   // POST /api/v1/accounts - create account
-  if (method === 'POST' && !url.pathname.endsWith('/test')) {
+  // `/test` and `/test-all` are probe endpoints, not creates. Checking only for
+  // a `/test` suffix would let `/test-all` fall through into account creation.
+  const isProbePath = url.pathname.endsWith('/test') || url.pathname.endsWith('/test-all');
+  if (method === 'POST' && !isProbePath) {
     let body: {
-      name?: string; provider?: string; api_key?: string; group_id?: number; channel_id?: number;
+      name?: string; provider?: string; api_key?: string; group_id?: number;
       base_url?: string; priority?: number; client_spoofing?: string; enabled?: number | boolean;
+      rate_multiplier?: number;
     };
     try { body = await request.json(); } catch { return jsonError('Invalid JSON body', 400); }
 
     const name = String(body.name || '').trim();
     const provider = String(body.provider || '').trim();
     const groupId = Number(body.group_id);
-    const channelId = Number(body.channel_id);
 
-    if (!name || !provider || !groupId || !channelId) {
-      return jsonError('请填写账号名称，并选择服务商、分组和渠道', 400);
+    if (!name || !provider || !groupId) {
+      return jsonError('请填写账号名称，并选择服务商和分组', 400);
     }
     if (!['openai', 'anthropic', 'xai'].includes(provider)) {
       return jsonError('服务商必须是 openai、anthropic 或 xai', 400);
     }
 
-    // Referenced group and channel must exist, and the channel provider has to
-    // match, otherwise scheduling would silently skip this account forever.
-    const [group, channel] = await Promise.all([db.getGroup(groupId), db.getChannel(channelId)]);
-    if (!group) return jsonError('所选分组不存在', 400);
-    if (!channel) return jsonError('所选渠道不存在', 400);
-    if (channel.provider !== provider) {
-      return jsonError(`所选渠道属于 ${channel.provider}，与账号服务商 ${provider} 不一致`, 400);
-    }
+    // The group must exist, otherwise scheduling would silently skip this
+    // account forever.
+    if (!(await db.getGroup(groupId))) return jsonError('所选分组不存在', 400);
 
-    // An empty account key inherits the channel key at request time, so only
-    // reject when neither side can supply credentials.
+    // The account now carries its own credential; there is no channel left to
+    // inherit one from.
+    const baseUrl = normalizeBaseUrl(body.base_url);
+    if (baseUrl === null) return jsonError('基础地址必须是 http(s) 开头的合法地址，例如 https://api.openai.com', 400);
+
     const apiKey = String(body.api_key || '').trim();
-    if (!apiKey && !String(channel.api_key || '').trim()) {
-      return jsonError('账号密钥为空时，所选渠道必须配置默认密钥', 400);
-    }
+    if (!apiKey) return jsonError('请填写上游密钥', 400);
+
+    const multiplier = readRateMultiplier(body.rate_multiplier ?? 1);
+    if (typeof multiplier === 'string') return jsonError(multiplier, 400);
 
     const result = await db.createAccount(
       name,
       provider,
       apiKey,
       groupId,
-      channelId,
-      body.base_url,
+      baseUrl,
       Number(body.priority) || 0,
       body.client_spoofing,
-      body.enabled === false || body.enabled === 0 ? 0 : 1
+      body.enabled === false || body.enabled === 0 ? 0 : 1,
+      multiplier
     );
 
     const account = await db.getAccount(result.lastRowId);
@@ -122,10 +156,19 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
       }
       updates.provider = String(body.provider);
     }
-    if (body.base_url !== undefined) updates.base_url = String(body.base_url || '').trim();
+    if (body.base_url !== undefined) {
+      const baseUrl = normalizeBaseUrl(body.base_url);
+      if (baseUrl === null) return jsonError('基础地址必须是 http(s) 开头的合法地址，例如 https://api.openai.com', 400);
+      updates.base_url = baseUrl;
+    }
     if (body.client_spoofing !== undefined) updates.client_spoofing = String(body.client_spoofing || '').trim();
     if (body.priority !== undefined && Number.isFinite(Number(body.priority))) updates.priority = Number(body.priority);
     if (body.enabled !== undefined) updates.enabled = body.enabled === true || body.enabled === 1 ? 1 : 0;
+    if (body.rate_multiplier !== undefined) {
+      const multiplier = readRateMultiplier(body.rate_multiplier);
+      if (typeof multiplier === 'string') return jsonError(multiplier, 400);
+      updates.rate_multiplier = multiplier;
+    }
     // A blank key means "keep the stored credential" so the masked list value
     // can never be written back over the real secret.
     if (typeof body.api_key === 'string' && body.api_key.trim() && body.api_key.trim() !== '***') {
@@ -136,17 +179,6 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
       if (!groupId || !(await db.getGroup(groupId))) return jsonError('所选分组不存在', 400);
       updates.group_id = groupId;
     }
-    if (body.channel_id !== undefined) {
-      const channelId = Number(body.channel_id);
-      const channel = channelId ? await db.getChannel(channelId) : null;
-      if (!channel) return jsonError('所选渠道不存在', 400);
-      const provider = String(updates.provider ?? existing.provider);
-      if (channel.provider !== provider) {
-        return jsonError(`所选渠道属于 ${channel.provider}，与账号服务商 ${provider} 不一致`, 400);
-      }
-      updates.channel_id = channelId;
-    }
-
     await db.updateAccount(id, updates);
     const account = await db.getAccount(id);
 
@@ -171,99 +203,45 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
     });
   }
   
-  // POST /api/v1/accounts/:id/test - test account connection
+  // POST /api/v1/accounts/test-all - probe every enabled account (批量测活)
+  if (method === 'POST' && url.pathname.endsWith('/test-all')) {
+    const accounts = await db.listAccounts();
+    const ids = accounts
+      .filter(account => Number(account.enabled) === 1)
+      .map(account => Number(account.id));
+
+    if (!ids.length) return jsonError('没有启用的账号可测试', 400);
+
+    const results = await probeAccounts(db, ids);
+    const healthy = results.filter(result => result.success).length;
+    return new Response(JSON.stringify({
+      data: {
+        total: results.length,
+        healthy,
+        failed: results.length - healthy,
+        results
+      }
+    }), { status: 200, headers: JSON_HEADERS });
+  }
+
+  // POST /api/v1/accounts/:id/test - probe one account (测活)
   if (method === 'POST' && url.pathname.endsWith('/test')) {
     const segments = url.pathname.split('/');
     const id = parseInt(segments[segments.length - 2] || '0');
-    if (!id) {
-      return new Response(JSON.stringify({ error: 'Invalid account ID' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-    }
-    
-    const account = await db.getAccount(id);
-    if (!account) return jsonError('账号不存在', 404);
+    if (!id) return jsonError('Invalid account ID', 400);
 
-    // The scheduler falls back to the channel key when the account key is
-    // blank, so the test has to resolve credentials and base URL the same way.
-    const channel = await db.getChannel(account.channel_id);
-    const apiKey = String(account.api_key || '').trim() || String(channel?.api_key || '').trim();
-    if (!apiKey) {
-      return new Response(JSON.stringify({ success: false, message: '账号和渠道都没有配置密钥' }), {
-        status: 200, headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    const baseUrl = String(account.base_url || '').trim()
-      || String(channel?.base_url || '').trim()
-      || getDefaultBaseUrl(account.provider);
-
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15000);
-      // Anthropic has no public GET /v1/models on every plan, so probe the
-      // endpoint the gateway actually forwards to with a 1-token request.
-      const isAnthropic = account.provider === 'anthropic';
-      const testUrl = isAnthropic
-        ? `${baseUrl.replace(/\/$/, '')}/v1/messages`
-        : `${baseUrl.replace(/\/$/, '')}/v1/models`;
-
-      const response = await fetch(testUrl, {
-        method: isAnthropic ? 'POST' : 'GET',
-        headers: { ...getAuthHeaders(account.provider, apiKey), 'content-type': 'application/json' },
-        body: isAnthropic ? JSON.stringify({
-          model: 'claude-3-5-haiku-20241022',
-          max_tokens: 1,
-          messages: [{ role: 'user', content: 'ping' }]
-        }) : undefined,
-        signal: controller.signal
-      }).finally(() => clearTimeout(timer));
-
-      let detail = '';
-      if (!response.ok) {
-        const raw = await response.text().catch(() => '');
-        try { detail = JSON.parse(raw)?.error?.message || ''; } catch { detail = raw.slice(0, 160); }
-      }
-
-      return new Response(JSON.stringify({
-        success: response.ok,
-        status: response.status,
-        message: response.ok
-          ? `连接成功（HTTP ${response.status}）`
-          : `连接失败（HTTP ${response.status}）${detail ? `：${detail}` : ''}`
-      }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    } catch (error) {
-      const message = error instanceof Error && error.name === 'AbortError'
-        ? '连接超时（15 秒）'
-        : error instanceof Error ? error.message : 'Unknown error';
-      return new Response(JSON.stringify({ success: false, message }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
+    const result = await probeAccount(db, id);
+    // A failed probe is a valid answer about the upstream, not a failed API
+    // call, so the transport stays 200 and the verdict rides in the body.
+    return new Response(JSON.stringify({
+      success: result.success,
+      status: result.status,
+      latency_ms: result.latencyMs,
+      message: result.message
+    }), { status: 200, headers: JSON_HEADERS });
   }
-  
+
   return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405, headers: { 'Content-Type': 'application/json' } });
 }
 
-function getDefaultBaseUrl(provider: string): string {
-  switch (provider) {
-    case 'anthropic': return 'https://api.anthropic.com';
-    case 'xai': return 'https://api.x.ai';
-    case 'openai': return 'https://api.openai.com';
-    default: return 'https://api.openai.com';
-  }
-}
 
-function getAuthHeaders(provider: string, apiKey: string): Record<string, string> {
-  switch (provider) {
-    case 'anthropic':
-      return { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' };
-    case 'openai':
-    case 'xai':
-      return { 'authorization': `Bearer ${apiKey}` };
-    default:
-      return { 'authorization': `Bearer ${apiKey}` };
-  }
-}

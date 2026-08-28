@@ -1,139 +1,144 @@
-# Sub2API Cloudflare Gateway
+# Sub2API Gateway (Cloudflare)
 
-一个运行在 Cloudflare Pages Functions + D1 上的多模型中转网关。提供 OpenAI、Anthropic、xAI 的统一入口，支持模型映射、分组/渠道/账号三层调度、错误率熔断、自动故障切换、用量统计和管理后台。
+一个运行在 Cloudflare Pages Functions + D1 上的多模型中转网关。提供 OpenAI、Anthropic、xAI 的统一入口，支持分组/账号两层调度、倍率感知选号、错误率熔断、自动故障切换、上游测活、首字时间统计和管理后台。
 
-界面参考 [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api) 的设计语言（teal 主色 + slate 中性色、可折叠侧栏、玻璃态顶栏、卡片式统计），但实现是零依赖的原生 HTML/CSS/JS，不需要构建前端。
+前端是原生 HTML/CSS/JS，不打包任何运行时依赖；后端用 esbuild 打成单个 Worker 脚本。整站冷启动只需加载一个约 115 KB 的 bundle。
 
-## 部署到 Cloudflare Pages
+## 部署
 
-### 1. 创建资源
+1. **创建 D1 数据库**
 
-创建一个 Pages 项目和一个 D1 数据库（例如 `sub2api-db`）。
+   ```bash
+   npx wrangler d1 create sub2api-db
+   ```
 
-构建设置：
+   把返回的 `database_id` 填进 [wrangler.jsonc](wrangler.jsonc)。
 
-| 项目 | 值 |
-| --- | --- |
-| 构建命令 | `npm run build` |
-| 构建输出目录 | `frontend` |
-| 根目录 | 留空 |
+2. **在 Pages 项目里绑定 D1**
 
-**根目录必须留空**。本仓库的 `frontend` 和 `functions` 是同级目录；把根目录设为 `functions` 会让 Wrangler 把输出目录解析到仓库外，Cloudflare 会拒绝部署。
+   Settings → Functions → Bindings → 添加 D1，变量名必须是 `DB`。缺这个绑定所有接口都会报错。
 
-### 2. 绑定 D1
+3. **（建议）设置签名密钥**
 
-进入 **Settings → Functions → Bindings**，选择 **Production** 环境并绑定：
+   ```bash
+   npx wrangler pages secret put JWT_SECRET --project-name sub2api-gateway
+   ```
 
-- D1：变量名必须是 `DB`
-- KV（可选）：变量名 `CONFIG_KV`
+   不设也能跑：首次初始化时会生成一个随机密钥存进 D1，登录态可以跨重启保持。显式设置更稳妥——万一 D1 数据被清空，已签发的会话不会失效。
 
-不要配置 Functions 目录。Worker 在构建时生成到 `frontend/_worker.js`。
+4. **部署**
 
-### 3. 部署并初始化
+   ```bash
+   npm install
+   npm run deploy
+   ```
 
-部署完成后直接访问站点。首次打开会显示初始化表单，填写管理员用户名和密码即可——**建表会自动完成，不需要预先执行 SQL**。
+   或者直接推到 GitHub，由 Pages 自动构建。`frontend/_worker.js` 是提交进仓库的构建产物，Pages 直接取用，所以改完 TypeScript 记得 `npm run build` 再提交。
 
-如果你更习惯命令行：
+**不需要手动执行 `wrangler d1 execute`。** 建表语句在代码里（[functions/src/schema.ts](functions/src/schema.ts)），首次初始化管理员时自动创建，全部是 `IF NOT EXISTS` 的增量语句，对已有数据只增不改。
 
-```bash
-curl -X POST https://<your-domain>/api/v1/auth/setup \
-  -H "content-type: application/json" \
-  -d '{"username":"admin","password":"至少 8 位强密码"}'
+## 首次使用
+
+打开站点，登录页会自动检测数据库未初始化，显示「初始化管理员」表单。
+
+之后按顺序创建：**分组 → 上游账号 → 模型映射（可选）→ API Key**。
+
+- **分组**是调度单元，决定优先级和熔断阈值（错误率、错误次数、统计窗口）。
+- **上游账号**是具体凭据，自带服务商、请求地址、密钥、倍率和优先级，归属于一个分组。
+- **模型映射**把客户端模型名改写成上游模型名，可选。支持末尾通配符（`gpt-4*`）。
+- **API Key** 是客户端凭据，可以绑定到指定分组。
+
+### 客户端接入
+
+```
+OpenAI 兼容：      POST https://<你的域名>/v1/chat/completions
+Anthropic Messages：POST https://<你的域名>/v1/messages
 ```
 
-初始化接口在管理员存在后自动关闭。
+密钥放进 `Authorization: Bearer <key>` 或 `x-api-key: <key>`。
 
-### 4. 设置 JWT_SECRET（建议）
+## 调度逻辑
 
-```bash
-npx wrangler pages secret put JWT_SECRET --project-name sub2api-gateway
-```
+每次请求先筛掉不可用的账号：已停用的、分组已停用的、服务商与请求不匹配的、以及所属分组已熔断的。如果 API Key 绑定了分组，只有该分组下的账号进入候选——这是硬约束，绑定分组下没有可用账号时直接返回 503，不会跨组兜底。
 
-不设置也能正常运行：首次需要签名时会生成一个 256 位随机密钥并存入 D1 的 `settings` 表，重启和多实例之间共享，登录态不会失效。显式配置 `JWT_SECRET` 的好处是可以随时轮换密钥（改环境变量即会使所有旧 token 失效）。
+候选账号按以下顺序排序，逐级比较：
 
-## 使用流程
+1. 分组优先级（数值越小越优先）
+2. 账号优先级
+3. **计费倍率**（同优先级下倍率低的先用）
+4. 窗口内错误率
+5. 窗口内错误次数
+6. 最近使用时间（越久未用越优先，用于均摊流量）
+7. 账号 ID（保证结果稳定）
 
-登录后按顺序创建：**分组 → 渠道 → 上游账号 → 模型映射（可选）→ API Key**。
+倍率只在同优先级时生效，优先级始终压过成本——运营上需要保留强制指定的能力。
 
-- **分组**决定调度优先级和熔断阈值（错误率、错误次数、统计窗口）。
-- **渠道**定义服务商、请求地址和可选的默认密钥。
-- **上游账号**是具体凭据。账号密钥留空会继承所属渠道的密钥，因此同一批 key 可以只填一次。
-- **模型映射**把客户端模型名改写成上游模型名，并可指定目标分组。支持后缀通配符，例如 `gpt-4*`。
-- **API Key** 供客户端使用，完整值只在创建时显示一次。
+> 这里和 sub2api 有意不同：sub2api 的调度是成本无关的，倍率只作为利润控制的准入开关（`U ≤ D × (1 - margin - buffer)`），从不参与排序。本项目按你的要求把倍率作为排序键，但放在优先级之后，避免破坏优先级语义。
 
-## 客户端地址
+### 故障切换
 
-| 客户端 | 地址 | 认证 |
-| --- | --- | --- |
-| OpenAI / Codex | `https://<your-domain>/v1` | `Authorization: Bearer <key>` |
-| Claude Code | `https://<your-domain>` | `x-api-key` 或 `Authorization: Bearer` |
-| Grok | `https://<your-domain>/v1` | `Authorization: Bearer <key>` |
+上游返回 `0`（连接失败）、`408`、`425`、`429` 或 `5xx` 时切到下一个账号，最多重试 `MAX_SAME_ACCOUNT_RETRIES` 次（默认 3，上限 5）。`4xx` 客户端错误直接透传，不重试——重试改不了请求本身的问题，只会浪费额度。
 
-## 调度与故障切换
+熔断按分组阈值统计：窗口内错误率或错误次数超限就临时跳过该账号。全部账号都不健康时，退化为选择「最不坏」的那个，而不是直接失败。
 
-每次请求先校验账号、渠道、分组均已启用，并要求渠道服务商与账号服务商一致；不一致的账号永远不会被选中，因此后台在保存时就会拦截这种组合。
+### 首字时间（TTFT）
 
-调度顺序：
+流式响应的首字节时间记录在 `usage_records.ttft_ms`，使用记录页有独立的「首字」列。
 
-1. 模型映射指定的分组优先；该分组没有可用账号时回退到同服务商的其他分组。
-2. 依次比较分组优先级、渠道优先级、账号优先级（数值越小越优先）。
-3. 读取 D1 `request_logs` 中统计窗口内的错误率和错误次数；达到分组阈值的账号会被暂时熔断跳过。
-4. 条件相同时按最近使用时间分散请求。
+测量不做缓冲：每个 chunk 先转发给客户端，再记时间戳。缓冲测量会抬高被测指标本身。用量统计从流结束回调里写入，不阻塞响应。
 
-上游返回 `408`、`425`、`429`、`5xx` 或发生网络错误时自动切换账号重试；`4xx` 客户端错误直接透传，不浪费重试次数。重试上限由 `MAX_SAME_ACCOUNT_RETRIES` 控制（限制在 1–5）。流式响应在切换账号后仍保持 SSE 格式。
+## 上游测活
+
+- 单个账号：账号列表里点「测试」
+- 批量：账号页右上角「批量测活」，并发 4 个，只测已启用的账号
+
+探测请求走真实网关路径：Anthropic 发一个 `max_tokens: 1` 的 `/v1/messages`（不是所有套餐都开放 `GET /v1/models`，用它会把正常 key 误判成失效），其余服务商用 `GET /v1/models`。结果写回账号行，列表直接显示延迟和时间，不用每次翻页都重测。
+
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `JWT_SECRET` | 自动生成 | 会话签名密钥 |
+| `WINDOW_SECONDS` | 300 | 错误统计窗口 |
+| `ERROR_RATE_THRESHOLD` | 0.5 | 熔断错误率阈值 |
+| `ERROR_COUNT_THRESHOLD` | 5 | 熔断错误次数阈值 |
+| `MAX_SAME_ACCOUNT_RETRIES` | 3 | 单次请求最大重试次数 |
+
+分组可以单独覆盖前三项。
 
 ## 本地开发
 
 ```bash
 npm install
-npm run dev
+npm run build
+npx wrangler pages dev frontend --port 8788 --local \
+  --d1 DB=sub2api-db --compatibility-flag=nodejs_compat \
+  --persist-to .wrangler/devstate
 ```
-
-`npm run dev` 会打包 Worker 并启动 `wrangler pages dev`。本地 D1 数据是空的，首次访问同样会引导初始化。
 
 ## 测试
 
 ```bash
-npm run typecheck      # TypeScript 检查
-npm run test:ui        # 后台界面（jsdom，53 项）
-npm run test:api       # 管理 API 契约（41 项，需先启动 dev）
-npm run test:gateway   # 调度 / 故障切换 / 流式（36 项，需先启动 dev）
+npm run typecheck      # tsc
+npm run test:ui        # 49 项，jsdom 驱动真实 DOM
+npm run test:api       # 37 项，配置面 CRUD 与校验
+npm run test:gateway   # 36 项，调度/故障切换/流式（带假上游）
+npm run test:features  # 32 项，倍率/测活/TTFT/密钥分组
 ```
 
-`test:api` 和 `test:gateway` 需要一个干净的本地数据库：
+后三个需要本地 dev server 在 8788 端口运行，并且数据库是干净的（它们会创建管理员）。`tests/upstream_stub.py` 是假的上游服务商，用来验证真实转发行为而不是 mock 断言。
 
-```bash
-rm -rf .wrangler/state
-npx wrangler pages dev frontend --port 8788 --d1 DB=sub2api-db --compatibility-flag=nodejs_compat
-```
+`tests/migration.test.py` 验证旧版（含 channels 表）数据库的迁移，需要两阶段运行：停服务器时 seed，起服务器后验证。
 
-`test:gateway` 会在 9101–9103 端口启动假上游，覆盖优先级选择、错误熔断、跨分组回退、模型映射改写、SSE 流式转发、Anthropic 头部处理和客户端伪装。
+## 从旧版升级
 
-## 配置变量
+早期版本有独立的「渠道」层，账号必须挂在渠道下、可以留空密钥继承渠道密钥。渠道的 11 个字段全是 accounts 的子集，只提供默认值，却带来 500 多处耦合，因此已合并进账号。
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `JWT_SECRET` | 自动生成并持久化 | 会话签名密钥 |
-| `ERROR_RATE_THRESHOLD` | `0.5` | 全局错误率阈值，分组可覆盖 |
-| `ERROR_COUNT_THRESHOLD` | `5` | 全局错误次数阈值，分组可覆盖 |
-| `WINDOW_SECONDS` | `300` | 全局统计窗口，分组可覆盖 |
-| `MAX_SAME_ACCOUNT_RETRIES` | `3` | 故障切换重试上限（1–5） |
+**迁移是自动的**，首次登录时执行，只跑一次：
 
-## 目录
+- 密钥为空的账号写入其渠道的密钥
+- 地址为空的账号写入其渠道的地址
+- 未单独设置倍率的账号继承渠道倍率
+- **挂在已停用渠道下的账号会被停用** —— 原先这些账号被渠道屏蔽，去掉渠道层后如果不处理会突然开始接收流量
 
-```text
-frontend/              静态管理后台（index.html / styles.css / app.js）
-frontend/_worker.js    构建产物，Pages 高级模式入口
-functions/_worker.ts   Worker 源码入口与路由
-functions/src/         认证、调度、代理、配置 API
-functions/src/schema.ts 建表语句（首次运行自动执行）
-functions/schema.sql   同等内容的 SQL 版本，供手动执行
-tests/                 API / UI / 网关测试
-wrangler.jsonc         本地开发配置
-```
-
-## License
-
-MIT
-
-使用前请阅读 [DISCLAIMER.md](DISCLAIMER.md)。
+迁移失败时不写完成标记，下次请求重试，避免网关运行在半迁移的凭据上。`channel_id` 列保留但不再使用，不做表重建——为省一个整数字段去 copy-and-rename 有丢数据的风险，不值得。

@@ -16,7 +16,7 @@ const state = {
   token: localStorage.getItem('auth_token') || '',
   user: readStorage('auth_user', null),
   page: 'dashboard',
-  data: { keys: [], usage: [], groups: [], channels: [], accounts: [], models: [] },
+  data: { keys: [], usage: [], groups: [], accounts: [], models: [] },
   stats: null,
   filters: { keys: '', usage: '' },
   statsRange: { hours: 24, bucket: 'hour' },
@@ -29,7 +29,6 @@ const pageMeta = {
   keys: { title: 'API 密钥', subtitle: '客户端访问凭据' },
   models: { title: '模型映射', subtitle: '模型名与上游模型对应关系' },
   groups: { title: '分组管理', subtitle: '调度优先级与故障切换' },
-  channels: { title: '渠道管理', subtitle: '服务商入口配置' },
   accounts: { title: '账号管理', subtitle: '上游服务商凭据' },
   settings: { title: '系统设置', subtitle: '接入地址与账号安全' }
 }
@@ -82,8 +81,10 @@ function providerLabel(provider) { return PROVIDERS[provider] || provider || '-'
 function records(payload) { return Array.isArray(payload) ? payload : (Array.isArray(payload?.data) ? payload.data : []) }
 function isOn(value) { return num(value) === 1 || value === true }
 
+// `name` is the full sprite id (e.g. 'i-edit'). Callers pass the prefix, so
+// adding another one here would resolve to a nonexistent '#i-i-edit' symbol.
 function icon(name, size = '') {
-  return `<svg class="ico ${size}" aria-hidden="true"><use href="#i-${name}"/></svg>`
+  return `<svg class="ico ${size}" aria-hidden="true"><use href="#${name}"/></svg>`
 }
 function statusBadge(ok, label) {
   return `<span class="badge ${ok ? 'badge-on' : 'badge-off'}"><span class="dot"></span>${esc(label ?? (ok ? '启用' : '停用'))}</span>`
@@ -99,6 +100,38 @@ function providerBadge(provider) {
 function emptyState(iconName, title, description) {
   return `<div class="empty-state">${icon(iconName, 'ico-xl')}<strong>${esc(title)}</strong><span>${esc(description || '')}</span></div>`
 }
+// Time to first token. Streaming responses report it; a non-streaming call has no
+// meaningful first-token moment, so an absent value stays blank rather than
+// showing a misleading zero.
+function ttftCell(value) {
+  const ms = num(value)
+  if (!ms) return '<span class="cell-dim">-</span>'
+  const tone = ms <= 800 ? 'badge-on' : ms <= 2500 ? 'badge-warn' : 'badge-err'
+  return `<span class="badge ${tone} mono">${fmtLatency(ms)}</span>`
+}
+
+// Billing weight. 1x is the neutral default and stays dimmed so only accounts
+// that actually cost more or less draw the eye.
+function multiplierCell(value) {
+  const rate = num(value, 1)
+  const label = `${Number(rate.toFixed(4))}x`
+  if (rate === 1) return `<span class="cell-dim mono">${label}</span>`
+  return `<span class="badge ${rate < 1 ? 'badge-on' : 'badge-warn'} mono">${label}</span>`
+}
+
+// Liveness from the last probe, with the failure reason available on hover.
+function healthCell(item) {
+  const checked = item.last_check_at
+  if (checked === null || checked === undefined || checked === '') {
+    return '<span class="cell-dim">未测试</span>'
+  }
+  const ok = isOn(item.last_check_ok)
+  const latency = num(item.last_check_latency_ms)
+  const label = ok ? (latency ? fmtLatency(latency) : '正常') : '异常'
+  return `<span class="badge ${ok ? 'badge-on' : 'badge-err'}" title="${esc(item.last_check_message || '')}"><span class="dot"></span>${label}</span>`
+    + `<span class="cell-sub">${esc(fmtDate(checked))}</span>`
+}
+
 function skeletonTable(rows = 4) {
   return `<div class="skeleton-wrap">${Array.from({ length: rows }, () => '<div class="skeleton-row"></div>').join('')}</div>`
 }
@@ -178,7 +211,7 @@ function logout(notify = true) {
   state.token = ''
   state.user = null
   state.stats = null
-  state.data = { keys: [], usage: [], groups: [], channels: [], accounts: [], models: [] }
+  state.data = { keys: [], usage: [], groups: [], accounts: [], models: [] }
   localStorage.removeItem('auth_token')
   localStorage.removeItem('auth_user')
   closeModal()
@@ -196,7 +229,7 @@ async function detectSetupState() {
     $('auth-title').textContent = needsSetup ? '初始化管理员' : '登录控制台'
     $('auth-subtitle').textContent = needsSetup
       ? '首次部署，请创建控制台管理员账号'
-      : '统一管理模型、渠道、账号与调用密钥'
+      : '统一管理上游账号、分组与调用密钥'
   } catch {
     // Probe failures leave the login form in place; the login call reports why.
   }
@@ -251,7 +284,6 @@ const ENDPOINTS = {
   keys: '/keys',
   usage: '/usage?limit=500',
   groups: '/groups',
-  channels: '/channels',
   accounts: '/accounts',
   models: '/models'
 }
@@ -260,7 +292,6 @@ const RENDERERS = {
   keys: renderKeys,
   usage: renderUsage,
   groups: renderGroups,
-  channels: renderChannels,
   accounts: renderAccounts,
   models: renderModels
 }
@@ -273,21 +304,18 @@ async function loadPage(page, silent = false) {
   if (!endpoint) return
   const target = $(`${page}-list`)
 
-  // Groups and channels are referenced by the account and model forms, so keep
-  // them loaded whenever those pages are open.
-  const needsRefs = page === 'accounts' || page === 'models'
+  // Groups are referenced by the account, key and model forms, so keep them
+  // loaded whenever those pages are open.
+  const needsRefs = page === 'accounts' || page === 'models' || page === 'keys'
 
   try {
     if (target && !silent && !state.data[page].length) target.innerHTML = skeletonTable()
     const requests = [api(endpoint)]
-    if (needsRefs) requests.push(api('/groups'), api('/channels'))
-    const [payload, groups, channels] = await Promise.all(requests)
+    if (needsRefs) requests.push(api('/groups'))
+    const [payload, groups] = await Promise.all(requests)
 
     state.data[page] = records(payload)
-    if (needsRefs) {
-      state.data.groups = records(groups)
-      state.data.channels = records(channels)
-    }
+    if (needsRefs) state.data.groups = records(groups)
     setHealth(true)
     RENDERERS[page]?.()
     updateNavCounts()
@@ -299,16 +327,15 @@ async function loadPage(page, silent = false) {
 
 async function loadDashboard(silent = false) {
   try {
-    const [stats, usage, keys, groups, channels, accounts, models] = await Promise.all([
+    const [stats, usage, keys, groups, accounts, models] = await Promise.all([
       api(`/stats?hours=${state.statsRange.hours}&bucket=${state.statsRange.bucket}`),
       api('/usage?limit=50'),
-      api('/keys'), api('/groups'), api('/channels'), api('/accounts'), api('/models')
+      api('/keys'), api('/groups'), api('/accounts'), api('/models')
     ])
     state.stats = stats?.data || stats || null
     state.data.usage = records(usage)
     state.data.keys = records(keys)
     state.data.groups = records(groups)
-    state.data.channels = records(channels)
     state.data.accounts = records(accounts)
     state.data.models = records(models)
     setHealth(true)
@@ -475,20 +502,31 @@ function renderDashboard() {
   ].join('')
 
   const resources = [
-    ['i-users', '上游账号', res.active_accounts, res.total_accounts, 'accounts'],
-    ['i-server', '渠道', res.active_channels, res.total_channels, 'channels'],
-    ['i-layers', '分组', res.active_groups, res.total_groups, 'groups'],
-    ['i-route', '模型映射', res.active_models, res.total_models, 'models']
+    ['i-users', '上游账号', res.active_accounts, res.total_accounts, 'accounts', 'tint-sky'],
+    ['i-layers', '分组', res.active_groups, res.total_groups, 'groups', 'tint-emerald'],
+    ['i-route', '模型映射', res.active_models, res.total_models, 'models', 'tint-amber']
   ]
-  $('resource-health').innerHTML = resources.map(([iconName, label, active, total, page]) => {
-    const warn = !num(total)
-    return `<button class="quick-action" data-navigate="${page}" type="button">
-      <span class="stat-icon ${warn ? 'tint-amber' : 'tint-teal'}">${icon(iconName)}</span>
-      <span class="quick-action-body">
-        <strong>${esc(label)}</strong>
-        <span>${warn ? '尚未配置' : `${fmtInt(active)} 个启用 · 共 ${fmtInt(total)} 个`}</span>
+  $('resource-health').innerHTML = resources.map(([iconName, label, active, total, page, tint]) => {
+    const totalCount = num(total)
+    const activeCount = num(active)
+    // An unconfigured resource is the actionable case, so it gets the amber
+    // treatment and a call to action rather than a meaningless "0 / 0".
+    const empty = !totalCount
+    const ratio = totalCount ? Math.min(activeCount / totalCount * 100, 100) : 0
+    const allOn = totalCount && activeCount === totalCount
+    return `<button class="res-card${empty ? ' is-empty' : ''}" data-navigate="${page}" type="button">
+      <span class="res-top">
+        <span class="stat-icon ${empty ? 'tint-amber' : tint}">${icon(iconName)}</span>
+        <span class="res-label">${esc(label)}</span>
+        ${icon('i-chevron', 'ico-sm chevron')}
       </span>
-      ${icon('i-chevron', 'ico-sm chevron')}
+      <span class="res-figure">
+        <strong>${empty ? '—' : fmtInt(activeCount)}</strong>
+        ${empty ? '<em>尚未配置</em>' : `<em>/ ${fmtInt(totalCount)} 启用</em>`}
+      </span>
+      ${empty
+        ? '<span class="res-hint">点击前往配置</span>'
+        : `<span class="meter${allOn ? ' is-full' : ''}"><span style="width:${ratio}%"></span></span>`}
     </button>`
   }).join('')
 
@@ -537,13 +575,16 @@ function renderKeys() {
 
   $('keys-list').innerHTML = items.length
     ? table(
-        ['名称', '状态', '已用额度', '额度上限', '创建时间', '操作'],
+        ['名称', '分组', '状态', '已用额度', '额度上限', '创建时间', '操作'],
         items.map(item => {
           const used = num(item.balance)
           const limit = num(item.quota_limit)
           const ratio = limit > 0 ? Math.min(used / limit * 100, 100) : 0
           return [
             `<span class="cell-main">${esc(item.name || '未命名密钥')}</span><span class="cell-sub">ID #${item.id}</span>`,
+            item.group_id
+              ? `<span class="badge badge-group">${esc(item.group_name || `#${item.group_id}`)}</span>`
+              : '<span class="cell-dim">全部分组</span>',
             toggleControl('toggle-key', item.id, isOn(item.enabled)),
             limit > 0
               ? `<span class="cell-main">$${used.toFixed(4)}</span><div class="meter"><span style="width:${ratio}%"></span></div>`
@@ -568,7 +609,7 @@ function renderUsage() {
 
   $('usage-list').innerHTML = items.length
     ? table(
-        ['模型', '服务商', '输入', '输出', '合计', '费用', '状态', '耗时', '时间'],
+        ['模型', '服务商', '输入', '输出', '合计', '费用', '状态', '首字', '耗时', '时间'],
         items.map(item => [
           `<span class="cell-main">${esc(item.model || '-')}</span>${item.error_message ? `<span class="cell-sub err" title="${esc(item.error_message)}">${esc(item.error_message)}</span>` : ''}`,
           providerBadge(item.provider),
@@ -577,6 +618,7 @@ function renderUsage() {
           `<span class="cell-main">${fmtTokens(item.total_tokens)}</span>`,
           fmtCost(item.cost),
           httpBadge(item.status),
+          ttftCell(item.ttft_ms),
           fmtLatency(item.latency_ms),
           `<span class="cell-dim">${fmtDate(item.created_at)}</span>`
         ])
@@ -606,40 +648,24 @@ function renderGroups() {
           ]
         })
       )
-    : emptyState('i-layers', '暂无分组', '先创建一个分组，再添加渠道和上游账号。')
+    : emptyState('i-layers', '暂无分组', '先创建一个分组，再把上游账号加进去。')
 }
 
-function renderChannels() {
-  const items = state.data.channels
-  $('channels-list').innerHTML = items.length
-    ? table(
-        ['渠道', '服务商', '基础地址', '默认密钥', '状态', '优先级', '操作'],
-        items.map(item => [
-          `<span class="cell-main">${esc(item.name)}</span><span class="cell-sub">ID #${item.id}</span>`,
-          providerBadge(item.provider),
-          `<span class="cell-dim mono">${esc(item.base_url || '服务商默认地址')}</span>`,
-          item.api_key ? '<span class="badge badge-on"><span class="dot"></span>已配置</span>' : '<span class="cell-dim">未配置</span>',
-          toggleControl('toggle-channel', item.id, isOn(item.enabled)),
-          `<span class="mono">${fmtInt(item.priority)}</span>`,
-          rowActions([
-            actionButton('edit-channel', item.id, '编辑', 'i-edit'),
-            actionButton('delete-channel', item.id, '删除', 'i-trash', 'danger')
-          ])
-        ])
-      )
-    : emptyState('i-server', '暂无渠道', '渠道定义服务商入口地址和默认密钥。')
-}
 
 function renderAccounts() {
   const items = state.data.accounts
   $('accounts-list').innerHTML = items.length
     ? table(
-        ['账号', '服务商', '分组 / 渠道', '密钥', '状态', '错误率', '优先级', '操作'],
+        ['账号', '服务商', '分组', '地址', '倍率', '测活', '状态', '错误率', '优先级', '操作'],
         items.map(item => [
           `<span class="cell-main">${esc(item.name)}</span><span class="cell-sub">ID #${item.id}${item.client_spoofing ? ` · 伪装 ${esc(item.client_spoofing)}` : ''}</span>`,
           providerBadge(item.provider),
-          `<span class="cell-main">${esc(item.group_name || `分组 #${item.group_id}`)}</span><span class="cell-sub">${esc(item.channel_name || `渠道 #${item.channel_id}`)}</span>`,
-          item.api_key ? '<span class="badge badge-on"><span class="dot"></span>独立</span>' : '<span class="badge badge-neutral">继承渠道</span>',
+          `<span class="badge badge-group">${esc(item.group_name || `分组 #${item.group_id}`)}</span>`,
+          item.base_url
+            ? `<span class="cell-dim mono" title="${esc(item.base_url)}">${esc(item.base_url.replace(/^https?:\/\//, ''))}</span>`
+            : '<span class="cell-dim">服务商默认</span>',
+          multiplierCell(item.rate_multiplier),
+          healthCell(item),
           toggleControl('toggle-account', item.id, isOn(item.enabled)),
           num(item.error_rate)
             ? `<span class="badge badge-warn">${(num(item.error_rate) * 100).toFixed(1)}%</span>`
@@ -652,7 +678,7 @@ function renderAccounts() {
           ])
         ])
       )
-    : emptyState('i-users', '暂无上游账号', '先配置分组和渠道，再添加上游服务商账号。')
+    : emptyState('i-users', '暂无上游账号', '先创建一个分组，再添加上游服务商账号。')
 }
 
 function renderModels() {
@@ -827,13 +853,8 @@ function option(value, label, selected) {
 function providerOptions(selected) {
   return Object.entries(PROVIDERS).map(([value, label]) => option(value, label, selected)).join('')
 }
-function groupOptions(selected) {
-  return option('', '请选择分组', selected) + state.data.groups.map(g => option(g.id, `${g.name}${isOn(g.enabled) ? '' : '（已停用）'}`, selected)).join('')
-}
-function channelOptions(selected, provider = '') {
-  const list = provider ? state.data.channels.filter(c => c.provider === provider) : state.data.channels
-  if (!list.length) return option('', provider ? `无 ${providerLabel(provider)} 渠道` : '请先创建渠道', '')
-  return option('', '请选择渠道', selected) + list.map(c => option(c.id, `${c.name}${isOn(c.enabled) ? '' : '（已停用）'}`, selected)).join('')
+function groupOptions(selected, placeholder = '请选择分组') {
+  return option('', placeholder, selected) + state.data.groups.map(g => option(g.id, `${g.name}${isOn(g.enabled) ? '' : '（已停用）'}`, selected)).join('')
 }
 function switchField(name, checked, label = '启用') {
   return `<label class="check-row">
@@ -856,6 +877,10 @@ function openKeyModal(key = null) {
       field('额度上限（USD）', textInput('quota_limit', key?.quota_limit ?? 0, '0 表示不限额', 'number', 'min="0" step="0.01"'), {
         id: 'f-quota_limit', hint: '按累计费用计算，达到上限后密钥自动拒绝请求。'
       }) +
+      field('绑定分组', selectInput('group_id', groupOptions(key?.group_id, '不限（全部分组）')), {
+        id: 'f-group_id', full: true,
+        hint: '绑定后该密钥只会调度所选分组内的账号；分组内无可用账号时请求直接失败，不会跨分组。'
+      }) +
       (editing ? field('已用额度（USD）', textInput('balance', num(key.balance).toFixed(4), '', 'number', 'min="0" step="0.0001"'), { id: 'f-balance', hint: '可手动重置，例如续费后清零。' }) : '') +
       field('状态', switchField('enabled', editing ? isOn(key.enabled) : true), { full: !editing })
     ),
@@ -864,7 +889,13 @@ function openKeyModal(key = null) {
       const name = String(values.name || '').trim()
       if (!name) throw new Error('请填写密钥名称')
 
-      const payload = { name, quota_limit: num(values.quota_limit), enabled: values.enabled === 'on' ? 1 : 0 }
+      const payload = {
+        name,
+        quota_limit: num(values.quota_limit),
+        enabled: values.enabled === 'on' ? 1 : 0,
+        // Empty string means "any group"; the API stores NULL for that.
+        group_id: values.group_id ? num(values.group_id) : null
+      }
       if (editing) {
         payload.balance = num(values.balance)
         await api(`/keys/${key.id}`, { method: 'PUT', body: payload })
@@ -934,72 +965,40 @@ function openGroupModal(group = null) {
   })
 }
 
-function openChannelModal(channel = null) {
-  const editing = Boolean(channel)
-  const provider = channel?.provider || 'openai'
-  openModal({
-    title: editing ? '编辑渠道' : '新建渠道',
-    subtitle: '渠道提供服务商入口地址，并可作为账号的默认密钥来源。',
-    submitLabel: '保存渠道',
-    body: formGrid(
-      field('渠道名称', textInput('name', channel?.name || '', '例如 OpenAI 主渠道', 'text', 'required'), { id: 'f-name', required: true }) +
-      field('服务商', selectInput('provider', providerOptions(provider), 'required'), { id: 'f-provider', required: true }) +
-      field('基础地址', textInput('base_url', channel?.base_url || '', '留空使用服务商默认地址'), {
-        id: 'f-base_url', full: true, hint: '例如 https://api.openai.com，末尾不需要斜杠。'
-      }) +
-      field('默认密钥', textInput('api_key', '', editing && channel.api_key ? '留空保持原值' : '可选，账号可继承此密钥', 'password', 'autocomplete="new-password"'), {
-        id: 'f-api_key', full: true, hint: '账号密钥留空时会使用这里配置的渠道密钥。'
-      }) +
-      field('优先级', textInput('priority', channel?.priority ?? 0, '数字越小越优先', 'number'), { id: 'f-priority' }) +
-      field('状态', switchField('enabled', editing ? isOn(channel.enabled) : true))
-    ),
-    async onSubmit(form) {
-      const values = Object.fromEntries(form.entries())
-      const name = String(values.name || '').trim()
-      if (!name) throw new Error('请填写渠道名称')
-
-      const payload = {
-        name,
-        provider: values.provider,
-        base_url: String(values.base_url || '').trim(),
-        priority: num(values.priority),
-        enabled: values.enabled === 'on' ? 1 : 0
-      }
-      if (values.api_key) payload.api_key = String(values.api_key).trim()
-      await api(editing ? `/channels/${channel.id}` : '/channels', { method: editing ? 'PUT' : 'POST', body: payload })
-      await loadPage('channels', true)
-      showToast(editing ? '渠道已更新' : '渠道已创建', 'success')
-    }
-  })
-}
 
 function openAccountModal(account = null) {
   const editing = Boolean(account)
   const provider = account?.provider || 'openai'
-  const missingRefs = !state.data.groups.length || !state.data.channels.length
+  const missingRefs = !state.data.groups.length
 
   const warning = missingRefs
-    ? `<div class="notice notice-warn">${icon('i-alert', 'ico-sm')}<span>请先创建至少一个分组和一个渠道，再添加上游账号。</span></div>`
+    ? `<div class="notice notice-warn">${icon('i-alert', 'ico-sm')}<span>请先创建至少一个分组，再添加上游账号。</span></div>`
     : ''
 
   openModal({
     title: editing ? '编辑上游账号' : '添加上游账号',
-    subtitle: '账号提供具体凭据；密钥留空时继承所属渠道的默认密钥。',
+    subtitle: '账号直接持有上游凭据，并按所属分组参与调度。',
     submitLabel: '保存账号',
     body: warning + formGrid(
       field('账号名称', textInput('name', account?.name || '', '例如 OpenAI 主账号', 'text', 'required'), { id: 'f-name', required: true }) +
       field('服务商', selectInput('provider', providerOptions(provider), 'required'), {
-        id: 'f-provider', required: true, hint: '切换服务商会同时筛选可选渠道。'
+        id: 'f-provider', required: true, hint: '决定请求转发到哪个上游协议。'
       }) +
-      field('上游密钥', textInput('api_key', '', editing ? '留空保持原值' : '留空则继承渠道密钥', 'password', 'autocomplete="new-password"'), {
-        id: 'f-api_key', full: true
+      field('上游密钥', textInput('api_key', '', editing ? '留空保持原值' : '例如 sk-...', 'password', 'autocomplete="new-password"'), {
+        id: 'f-api_key', full: true, required: !editing, hint: '仅用于服务端转发，保存后在界面和接口中始终脱敏。'
       }) +
-      field('所属分组', selectInput('group_id', groupOptions(account?.group_id), 'required'), { id: 'f-group_id', required: true }) +
-      field('所属渠道', selectInput('channel_id', channelOptions(account?.channel_id, provider), 'required'), { id: 'f-channel_id', required: true }) +
-      field('基础地址', textInput('base_url', account?.base_url || '', '留空使用渠道或服务商默认地址'), { id: 'f-base_url', full: true }) +
+      field('所属分组', selectInput('group_id', groupOptions(account?.group_id), 'required'), {
+        id: 'f-group_id', required: true, hint: '分组决定调度顺序、熔断策略，以及哪些 API 密钥可以用到它。'
+      }) +
+      field('基础地址', textInput('base_url', account?.base_url || '', '留空使用服务商默认地址'), {
+        id: 'f-base_url', full: true, hint: '中转或自建入口填写完整地址，例如 https://api.example.com。'
+      }) +
       field('优先级', textInput('priority', account?.priority ?? 0, '数字越小越优先', 'number'), { id: 'f-priority' }) +
+      field('计费倍率', textInput('rate_multiplier', account?.rate_multiplier ?? 1, '1 = 原价', 'number', 'min="0" max="100" step="0.01"'), {
+        id: 'f-rate_multiplier', hint: '上游折扣。同优先级下倍率低的账号优先调度。'
+      }) +
       field('客户端伪装', textInput('client_spoofing', account?.client_spoofing || '', '可选，例如 claude-code'), {
-        id: 'f-client_spoofing', hint: '支持预设名或 JSON 请求头对象。'
+        id: 'f-client_spoofing', full: true, hint: '支持预设名或 JSON 请求头对象。'
       }) +
       field('状态', switchField('enabled', editing ? isOn(account.enabled) : true), { full: true })
     ),
@@ -1008,19 +1007,18 @@ function openAccountModal(account = null) {
       const name = String(values.name || '').trim()
       if (!name) throw new Error('请填写账号名称')
       const groupId = num(values.group_id)
-      const channelId = num(values.channel_id)
       if (!groupId) throw new Error('请选择所属分组')
-      if (!channelId) throw new Error('请选择所属渠道')
+      if (!editing && !String(values.api_key || '').trim()) throw new Error('请填写上游密钥')
 
       const payload = {
         name,
         provider: values.provider,
         base_url: String(values.base_url || '').trim(),
         group_id: groupId,
-        channel_id: channelId,
         priority: num(values.priority),
         client_spoofing: String(values.client_spoofing || '').trim(),
-        enabled: values.enabled === 'on' ? 1 : 0
+        enabled: values.enabled === 'on' ? 1 : 0,
+        rate_multiplier: num(values.rate_multiplier, 1)
       }
       if (values.api_key) payload.api_key = String(values.api_key).trim()
 
@@ -1167,16 +1165,6 @@ document.addEventListener('click', async event => {
         break
       }
 
-      case 'edit-channel': { const record = findRecord('channels', id); if (record) openChannelModal(record); break }
-      case 'toggle-channel': await toggleEntity('/channels', 'channels', id, action); break
-      case 'delete-channel': {
-        const record = findRecord('channels', id)
-        const bound = state.data.accounts.filter(a => num(a.channel_id) === id).length
-        if (bound) { showToast(`该渠道下还有 ${bound} 个账号，请先转移或删除`, 'error'); break }
-        requestDelete({ path: `/channels/${id}`, label: '渠道', name: record?.name || `#${id}`, page: 'channels' })
-        break
-      }
-
       case 'edit-account': { const record = findRecord('accounts', id); if (record) openAccountModal(record); break }
       case 'toggle-account': await toggleEntity('/accounts', 'accounts', id, action); break
       case 'delete-account': {
@@ -1193,6 +1181,8 @@ document.addEventListener('click', async event => {
           const ok = result?.success === true || result?.data?.success === true
           const message = result?.message || result?.data?.message || (ok ? '连接测试成功' : '连接测试失败')
           showToast(message, ok ? 'success' : 'error')
+          // The probe stores its verdict on the row, so reload to surface it.
+          await loadPage('accounts', true)
         } finally {
           action.disabled = false
           action.innerHTML = original
@@ -1211,16 +1201,6 @@ document.addEventListener('click', async event => {
   } catch (error) {
     showToast(error.message, 'error')
   }
-})
-
-// Switching the provider inside a form re-filters the channel list so an
-// account can never be bound to a mismatched channel.
-document.addEventListener('change', event => {
-  const target = event.target
-  if (!(target instanceof HTMLSelectElement) || target.name !== 'provider') return
-  const form = target.closest('.modal-form')
-  const channelSelect = form?.querySelector('select[name="channel_id"]')
-  if (channelSelect) channelSelect.innerHTML = channelOptions('', target.value)
 })
 
 /* ------------------------------------------------------------- app chrome */
@@ -1269,8 +1249,28 @@ $('btn-refresh-usage').addEventListener('click', () => loadPage('usage'))
 
 $('btn-create-key').addEventListener('click', () => openKeyModal())
 $('btn-create-group').addEventListener('click', () => openGroupModal())
-$('btn-create-channel').addEventListener('click', () => openChannelModal())
 $('btn-create-account').addEventListener('click', () => openAccountModal())
+$('btn-test-accounts').addEventListener('click', async event => {
+  const button = event.currentTarget
+  const original = button.innerHTML
+  button.disabled = true
+  button.innerHTML = `${icon('i-clock', 'ico-sm')}<span>测活中…</span>`
+  try {
+    const result = await api('/accounts/test-all', { method: 'POST' })
+    const summary = result?.data || {}
+    const failed = num(summary.failed)
+    showToast(
+      `测活完成：${num(summary.healthy)} 个正常${failed ? `，${failed} 个异常` : ''}`,
+      failed ? 'warn' : 'success'
+    )
+    await loadPage('accounts', true)
+  } catch (error) {
+    showToast(error.message || '批量测活失败', 'error')
+  } finally {
+    button.disabled = false
+    button.innerHTML = original
+  }
+})
 $('btn-create-model').addEventListener('click', () => openModelModal())
 
 $('keys-search').addEventListener('input', event => { state.filters.keys = event.target.value; renderKeys() })
