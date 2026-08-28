@@ -42,7 +42,7 @@ npm install
 npm run deploy
 ```
 
-`npm run deploy` 会先将 `functions/_worker.ts` 打包成 Pages 可识别的 `functions/_worker.js`，然后上传 `frontend` 静态文件和 Functions。
+`npm run deploy` 会先将 `functions/_worker.ts` 打包成 Pages 可识别的 `functions/_worker.js` 和 `frontend/_worker.js`，然后上传 `frontend` 静态文件和 Functions。双入口兼容 Pages 的 Functions 部署和构建输出目录部署方式。
 
 ## 首次使用
 

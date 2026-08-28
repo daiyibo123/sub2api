@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:functions": "esbuild functions/_worker.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=functions/_worker.js",
+    "build:functions": "esbuild functions/_worker.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=functions/_worker.js && esbuild functions/_worker.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=frontend/_worker.js",
     "build": "npm run build:functions",
     "typecheck": "tsc --noEmit -p functions/tsconfig.json",
     "dev": "npm run build:functions && wrangler pages dev frontend --compatibility-flag=nodejs_compat",
