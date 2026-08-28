@@ -3,6 +3,19 @@
   "compatibility_flags": ["nodejs_compat"],
   "compatibility_date": "2025-10-25",
   "pages_build_output_dir": "frontend",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "sub2api-db",
+      "database_id": "00e845e2-7690-44e2-a70f-3249d87d7a23"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "CONFIG_KV",
+      "id": "b8674b89affa40889d3d869951de5eb4"
+    }
+  ],
   "vars": {
     "ERROR_RATE_THRESHOLD": "0.5",
     "ERROR_COUNT_THRESHOLD": "5",
