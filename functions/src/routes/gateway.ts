@@ -3,7 +3,7 @@ import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { authenticateApiKey, hashApiKey } from '../auth';
 import { FailoverManager } from '../failover';
-import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping } from '../utils/proxy';
+import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials } from '../utils/proxy';
 import { extractTokenUsage, calculateCost } from '../billing';
 import { Account, Channel, Group, ModelMapping } from '../types';
 
@@ -83,7 +83,8 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   const { account, channel, group, stats } = selection;
   
   // Build upstream URL
-  const baseUrl = getUpstreamBaseUrl(account.base_url, provider);
+  const credentials = resolveUpstreamCredentials(account, channel);
+  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   let upstreamPath = url.pathname;
   
   // Map paths for different providers
@@ -105,7 +106,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   if (provider === 'anthropic') upstreamUrl.searchParams.set('beta', 'true');
   
   // Build headers
-  const headers = buildUpstreamHeaders(request.headers, provider, account.api_key, account.base_url, account.client_spoofing);
+  const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
   
   // Update request body with mapped model
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
@@ -242,7 +243,8 @@ async function handleFailover(
     attempted.add(account.id);
     
     try {
-      const baseUrl = getUpstreamBaseUrl(account.base_url, provider);
+      const credentials = resolveUpstreamCredentials(account, channel);
+      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
       const url = new URL(request.url);
       let upstreamPath = url.pathname;
       
@@ -254,7 +256,7 @@ async function handleFailover(
       
       const retryUrl = new URL(`${baseUrl}${upstreamPath}`);
       if (provider === 'anthropic') retryUrl.searchParams.set('beta', 'true');
-      const headers = buildUpstreamHeaders(request.headers, provider, account.api_key, account.base_url, account.client_spoofing);
+      const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
       
       const proxyResponse = await proxyRequest({
         url: retryUrl.toString(),

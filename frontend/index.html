@@ -3,16 +3,58 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#101828">
+  <meta name="theme-color" content="#14b8a6">
   <title>Sub2API Gateway</title>
   <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2314b8a6'/%3E%3Ctext x='16' y='23' font-family='system-ui' font-size='20' font-weight='bold' fill='white' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E">
 </head>
 <body>
-  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <!-- Inline sprite: referenced through <use href="#i-*"> -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <g id="i-dashboard"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></g>
+      <g id="i-activity"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></g>
+      <g id="i-key"><path d="m15.5 7.5 3 3L22 7l-3-3"/><path d="m2 22 5.5-5.5"/><circle cx="10.5" cy="13.5" r="4.5"/><path d="m13.7 10.3 5.8-5.8"/></g>
+      <g id="i-route"><circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></g>
+      <g id="i-layers"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></g>
+      <g id="i-server"><rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01"/></g>
+      <g id="i-users"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></g>
+      <g id="i-chart"><path d="M3 3v18h18"/><path d="m7 15 4-5 3 3 5-7"/></g>
+      <g id="i-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></g>
+      <g id="i-moon"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></g>
+      <g id="i-collapse"><path d="m11 17-5-5 5-5"/><path d="m18 17-5-5 5-5"/></g>
+      <g id="i-expand"><path d="m13 17 5-5-5-5"/><path d="m6 17 5-5-5-5"/></g>
+      <g id="i-menu"><path d="M3 6h18M3 12h18M3 18h18"/></g>
+      <g id="i-close"><path d="M18 6 6 18M6 6l12 12"/></g>
+      <g id="i-refresh"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></g>
+      <g id="i-plus"><path d="M12 5v14M5 12h14"/></g>
+      <g id="i-search"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></g>
+      <g id="i-logout"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></g>
+      <g id="i-copy"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></g>
+      <g id="i-check"><path d="m4 12.5 5 5L20 6.5"/></g>
+      <g id="i-alert"><path d="M12 9v4m0 4h.01"/><circle cx="12" cy="12" r="9"/></g>
+      <g id="i-info"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5m0-3h.01"/></g>
+      <g id="i-clock"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></g>
+      <g id="i-coin"><circle cx="12" cy="12" r="9"/><path d="M15 9.5A2.5 2.5 0 0 0 12.5 8h-1a2.5 2.5 0 0 0 0 5h1a2.5 2.5 0 0 1 0 5h-1A2.5 2.5 0 0 1 9 14.5"/><path d="M12 6v12"/></g>
+      <g id="i-zap"><path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12l1-8.5Z"/></g>
+      <g id="i-token"><path d="M4 7V5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2"/><path d="M9 20h6"/><path d="M12 4v16"/></g>
+      <g id="i-chevron"><path d="m9 18 6-6-6-6"/></g>
+      <g id="i-shield"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></g>
+      <g id="i-link"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></g>
+      <g id="i-inbox"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5h13l3.5 7v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-7l3.5-7Z"/></g>
+      <g id="i-lock"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></g>
+      <g id="i-play"><path d="m6 4 14 8-14 8V4Z"/></g>
+      <g id="i-edit"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5Z"/></g>
+      <g id="i-trash"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5m4-5v5"/></g>
+      <g id="i-sliders"><path d="M4 21v-7M4 10V3m8 18v-9m0-3V3m8 18v-5m0-4V3"/><path d="M1 14h6M9 9h6m2 7h6"/></g>
+    </defs>
+  </svg>
 
-  <section id="page-login" class="auth-page">
-    <div class="auth-glow auth-glow-one"></div>
-    <div class="auth-glow auth-glow-two"></div>
+  <div class="mesh-bg" aria-hidden="true"></div>
+  <div id="toast-region" class="toast-region" aria-live="polite" role="status"></div>
+
+  <!-- ============================================================ Login -->
+  <section id="page-login" class="auth-page hidden">
     <div class="auth-shell">
       <div class="auth-brand">
         <div class="brand-mark">S</div>
@@ -22,102 +64,387 @@
         </div>
       </div>
       <div class="auth-card">
-        <div class="auth-card-heading">
-          <span class="eyebrow">CONTROL CENTER</span>
-          <h1>登录管理控制台</h1>
-          <p>统一管理模型、渠道、账号与调用密钥</p>
+        <div class="auth-head">
+          <h1 id="auth-title">登录控制台</h1>
+          <p id="auth-subtitle">统一管理模型、渠道、账号与调用密钥</p>
         </div>
-        <form id="login-form" novalidate>
-          <label class="field-label" for="login-username">用户名</label>
-          <input class="field-input" type="text" id="login-username" autocomplete="username" placeholder="输入管理员用户名" required>
-          <label class="field-label" for="login-password">密码</label>
-          <input class="field-input" type="password" id="login-password" autocomplete="current-password" placeholder="输入管理员密码" required>
-          <button class="btn btn-primary btn-block" type="submit"><span>进入控制台</span><span class="btn-arrow">→</span></button>
-          <button class="btn btn-ghost btn-block" type="button" id="btn-setup">首次初始化管理员</button>
+
+        <form id="login-form" class="auth-form" novalidate>
+          <div class="field">
+            <label class="field-label" for="login-username">用户名</label>
+            <input class="field-input" id="login-username" name="username" type="text" autocomplete="username" placeholder="输入管理员用户名" required>
+          </div>
+          <div class="field">
+            <label class="field-label" for="login-password">密码</label>
+            <input class="field-input" id="login-password" name="password" type="password" autocomplete="current-password" placeholder="输入管理员密码" required>
+          </div>
+          <button class="btn btn-primary btn-block" type="submit">进入控制台</button>
           <p id="login-error" class="form-message" role="alert"></p>
         </form>
+
+        <!-- Shown only while the instance has no administrator -->
+        <form id="setup-form" class="auth-form hidden" novalidate>
+          <div class="notice">
+            <svg class="ico ico-sm" aria-hidden="true"><use href="#i-info"/></svg>
+            <span>这是首次部署，请创建管理员账号。创建后此表单会自动关闭。</span>
+          </div>
+          <div class="field">
+            <label class="field-label" for="setup-username">管理员用户名</label>
+            <input class="field-input" id="setup-username" name="username" type="text" autocomplete="username" placeholder="例如 admin" required>
+          </div>
+          <div class="field">
+            <label class="field-label" for="setup-password">登录密码</label>
+            <input class="field-input" id="setup-password" name="password" type="password" autocomplete="new-password" placeholder="至少 8 位" required>
+          </div>
+          <div class="field">
+            <label class="field-label" for="setup-confirm">确认密码</label>
+            <input class="field-input" id="setup-confirm" name="confirm" type="password" autocomplete="new-password" placeholder="再次输入密码" required>
+          </div>
+          <button class="btn btn-primary btn-block" type="submit">创建管理员</button>
+          <p id="setup-error" class="form-message" role="alert"></p>
+        </form>
+
+        <p class="auth-footnote">运行在 Cloudflare Pages · D1 · KV</p>
       </div>
-      <p class="auth-footnote">运行在 Cloudflare Pages · D1 · KV</p>
     </div>
   </section>
 
+  <!-- ============================================================== App -->
   <section id="page-app" class="app-shell hidden">
+    <div id="sidebar-scrim" class="sidebar-scrim"></div>
+
     <aside id="sidebar" class="sidebar">
-      <div class="sidebar-top">
-        <div class="sidebar-brand"><div class="brand-mark small">S</div><div><strong>Sub2API</strong><span>Gateway</span></div></div>
-        <button id="sidebar-close" class="icon-btn mobile-only" type="button" aria-label="关闭菜单">×</button>
+      <div class="sidebar-head">
+        <div class="sidebar-brand">
+          <div class="brand-mark sm">S</div>
+          <div class="brand-text">
+            <strong>Sub2API</strong>
+            <span>GATEWAY</span>
+          </div>
+        </div>
+        <button id="sidebar-close" class="icon-btn mobile-only" style="margin-left:auto" type="button" aria-label="关闭菜单">
+          <svg class="ico" aria-hidden="true"><use href="#i-close"/></svg>
+        </button>
       </div>
-      <div class="workspace-switcher"><span class="status-dot"></span><span>生产环境</span><span class="switcher-chevron">⌄</span></div>
-      <nav class="nav-menu" aria-label="主导航">
-        <p class="nav-label">工作台</p>
-        <button class="nav-item active" data-page="dashboard" type="button"><span class="nav-icon">⌂</span><span>概览</span></button>
-        <button class="nav-item" data-page="usage" type="button"><span class="nav-icon">◷</span><span>用量记录</span></button>
-        <button class="nav-item" data-page="keys" type="button"><span class="nav-icon">⌁</span><span>API Keys</span></button>
-        <p class="nav-label">资源配置</p>
-        <button class="nav-item" data-page="models" type="button"><span class="nav-icon">◇</span><span>模型映射</span></button>
-        <button class="nav-item" data-page="groups" type="button"><span class="nav-icon">▦</span><span>分组</span></button>
-        <button class="nav-item" data-page="channels" type="button"><span class="nav-icon">◈</span><span>渠道</span></button>
-        <button class="nav-item" data-page="accounts" type="button"><span class="nav-icon">◎</span><span>上游账号</span></button>
+
+      <nav class="sidebar-nav scroll-soft" aria-label="主导航">
+        <p class="nav-section">工作台</p>
+        <div class="nav-rule"></div>
+        <button class="nav-item active" data-page="dashboard" type="button">
+          <svg class="ico" aria-hidden="true"><use href="#i-dashboard"/></svg><span>仪表盘</span>
+        </button>
+        <button class="nav-item" data-page="usage" type="button">
+          <svg class="ico" aria-hidden="true"><use href="#i-activity"/></svg><span>使用记录</span>
+        </button>
+        <button class="nav-item" data-page="keys" type="button">
+          <svg class="ico" aria-hidden="true"><use href="#i-key"/></svg><span>API 密钥</span><span class="nav-badge" data-count="keys"></span>
+        </button>
+
+        <p class="nav-section">资源配置</p>
+        <div class="nav-rule"></div>
+        <button class="nav-item" data-page="models" type="button">
+          <svg class="ico" aria-hidden="true"><use href="#i-route"/></svg><span>模型映射</span><span class="nav-badge" data-count="models"></span>
+        </button>
+        <button class="nav-item" data-page="groups" type="button">
+          <svg class="ico" aria-hidden="true"><use href="#i-layers"/></svg><span>分组管理</span><span class="nav-badge" data-count="groups"></span>
+        </button>
+        <button class="nav-item" data-page="channels" type="button">
+          <svg class="ico" aria-hidden="true"><use href="#i-server"/></svg><span>渠道管理</span><span class="nav-badge" data-count="channels"></span>
+        </button>
+        <button class="nav-item" data-page="accounts" type="button">
+          <svg class="ico" aria-hidden="true"><use href="#i-users"/></svg><span>账号管理</span><span class="nav-badge" data-count="accounts"></span>
+        </button>
+
+        <p class="nav-section">系统</p>
+        <div class="nav-rule"></div>
+        <button class="nav-item" data-page="settings" type="button">
+          <svg class="ico" aria-hidden="true"><use href="#i-sliders"/></svg><span>系统设置</span>
+        </button>
       </nav>
-      <div class="sidebar-bottom">
-        <div class="sidebar-help"><span class="help-icon">?</span><div><strong>需要帮助？</strong><span>查看接入地址与说明</span></div></div>
-        <div class="sidebar-user"><div id="user-avatar" class="avatar">A</div><div class="user-meta"><strong id="user-name">管理员</strong><span>系统管理员</span></div><button id="nav-logout" class="icon-btn" type="button" aria-label="退出登录">↪</button></div>
+
+      <div class="sidebar-foot">
+        <button id="theme-toggle" class="nav-item" type="button">
+          <svg class="ico" id="theme-icon" aria-hidden="true"><use href="#i-moon"/></svg>
+          <span id="theme-label">深色模式</span>
+        </button>
+        <button id="sidebar-collapse" class="nav-item desktop-only" type="button">
+          <svg class="ico" id="collapse-icon" aria-hidden="true"><use href="#i-collapse"/></svg>
+          <span id="collapse-label">收起侧栏</span>
+        </button>
       </div>
     </aside>
 
     <div class="app-main">
       <header class="topbar">
-        <button id="sidebar-open" class="icon-btn mobile-only" type="button" aria-label="打开菜单">☰</button>
-        <div class="topbar-context"><span class="topbar-kicker">SUB2API GATEWAY</span><span id="topbar-title">概览</span></div>
-        <div class="topbar-actions"><span id="health-badge" class="health-badge"><span class="status-dot"></span>连接正常</span><button id="topbar-refresh" class="btn btn-soft" type="button">刷新数据</button></div>
+        <button id="sidebar-open" class="icon-btn mobile-only" type="button" aria-label="打开菜单">
+          <svg class="ico" aria-hidden="true"><use href="#i-menu"/></svg>
+        </button>
+        <div class="topbar-title">
+          <strong id="topbar-title">仪表盘</strong>
+          <span id="topbar-subtitle">系统概览与统计数据</span>
+        </div>
+        <div class="topbar-actions">
+          <span id="health-pill" class="health-pill"><span class="dot"></span><span id="health-text">连接正常</span></span>
+          <button id="topbar-refresh" class="icon-btn" type="button" aria-label="刷新数据" title="刷新数据">
+            <svg class="ico" aria-hidden="true"><use href="#i-refresh"/></svg>
+          </button>
+          <button id="user-menu" class="user-chip" type="button">
+            <span id="user-avatar" class="avatar">A</span>
+            <span class="user-chip-meta">
+              <strong id="user-name">管理员</strong>
+              <span>系统管理员</span>
+            </span>
+          </button>
+          <button id="nav-logout" class="icon-btn" type="button" aria-label="退出登录" title="退出登录">
+            <svg class="ico" aria-hidden="true"><use href="#i-logout"/></svg>
+          </button>
+        </div>
       </header>
 
       <main class="main-content">
+        <!-- Dashboard -->
         <section id="page-dashboard" class="page-section">
-          <div class="page-heading"><div><span class="eyebrow">OVERVIEW</span><h1>欢迎回来，<span id="heading-user">管理员</span></h1><p>实时查看网关运行状态和最近的调用活动。</p></div><button id="dashboard-refresh" class="btn btn-primary" type="button">刷新概览</button></div>
-          <div class="stats-grid">
-            <article class="stat-card accent-blue"><div class="stat-card-top"><span class="stat-label">总请求数</span><span class="stat-symbol">↗</span></div><strong id="stat-requests" class="stat-value">--</strong><span class="stat-caption">已记录的 API 请求</span></article>
-            <article class="stat-card accent-green"><div class="stat-card-top"><span class="stat-label">成功率</span><span class="stat-symbol">✓</span></div><strong id="stat-success" class="stat-value">--</strong><span id="stat-success-caption" class="stat-caption">基于最近记录</span></article>
-            <article class="stat-card accent-purple"><div class="stat-card-top"><span class="stat-label">活跃账号</span><span class="stat-symbol">◎</span></div><strong id="stat-accounts" class="stat-value">--</strong><span id="stat-accounts-caption" class="stat-caption">可参与调度的账号</span></article>
-            <article class="stat-card accent-orange"><div class="stat-card-top"><span class="stat-label">可用 Key</span><span class="stat-symbol">⌁</span></div><strong id="stat-keys" class="stat-value">--</strong><span id="stat-keys-caption" class="stat-caption">已启用的客户端密钥</span></article>
+          <div class="page-heading">
+            <div>
+              <h1>管理控制台</h1>
+              <p>系统概览与统计数据</p>
+            </div>
+            <div class="page-heading-actions">
+              <button id="dashboard-refresh" class="btn btn-secondary" type="button">
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-refresh"/></svg>刷新
+              </button>
+            </div>
           </div>
-          <div class="dashboard-grid">
-            <article class="panel panel-wide"><div class="panel-heading"><div><h2>最近请求</h2><p>最近 8 条网关调用记录</p></div><button class="text-btn" data-navigate="usage" type="button">查看全部 →</button></div><div id="dashboard-activity" class="table-wrap"></div></article>
-            <article class="panel"><div class="panel-heading"><div><h2>资源状态</h2><p>当前配置概况</p></div></div><div id="resource-health" class="resource-list"></div></article>
+
+          <div id="stats-grid" class="stats-grid"></div>
+
+          <div class="grid-2">
+            <article class="card">
+              <div class="card-head">
+                <div><h2>快捷操作</h2><p>常用配置入口</p></div>
+              </div>
+              <div class="quick-actions">
+                <button class="quick-action" data-navigate="accounts" type="button">
+                  <span class="stat-icon tint-teal"><svg class="ico" aria-hidden="true"><use href="#i-users"/></svg></span>
+                  <span class="quick-action-body"><strong>添加上游账号</strong><span>配置服务商凭据</span></span>
+                  <svg class="ico ico-sm chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
+                </button>
+                <button class="quick-action" data-navigate="keys" type="button">
+                  <span class="stat-icon tint-sky"><svg class="ico" aria-hidden="true"><use href="#i-key"/></svg></span>
+                  <span class="quick-action-body"><strong>创建 API 密钥</strong><span>供客户端接入</span></span>
+                  <svg class="ico ico-sm chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
+                </button>
+                <button class="quick-action" data-navigate="models" type="button">
+                  <span class="stat-icon tint-violet"><svg class="ico" aria-hidden="true"><use href="#i-route"/></svg></span>
+                  <span class="quick-action-body"><strong>配置模型映射</strong><span>指定上游模型</span></span>
+                  <svg class="ico ico-sm chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
+                </button>
+                <button class="quick-action" data-navigate="settings" type="button">
+                  <span class="stat-icon tint-amber"><svg class="ico" aria-hidden="true"><use href="#i-link"/></svg></span>
+                  <span class="quick-action-body"><strong>查看接入地址</strong><span>客户端配置说明</span></span>
+                  <svg class="ico ico-sm chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
+                </button>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head">
+                <div><h2>资源状态</h2><p>当前配置概况</p></div>
+              </div>
+              <div id="resource-health" class="quick-actions"></div>
+            </article>
           </div>
+
+          <article class="card">
+            <div class="filter-bar">
+              <label class="field-label" for="stats-range">时间范围</label>
+              <select class="field-select" id="stats-range">
+                <option value="24">最近 24 小时</option>
+                <option value="72">最近 3 天</option>
+                <option value="168">最近 7 天</option>
+                <option value="720">最近 30 天</option>
+              </select>
+              <div class="filter-spacer"></div>
+              <label class="field-label" for="stats-bucket">粒度</label>
+              <select class="field-select" id="stats-bucket">
+                <option value="hour">按小时</option>
+                <option value="day">按天</option>
+              </select>
+            </div>
+          </article>
+
+          <div class="grid-2">
+            <article class="card">
+              <div class="card-head"><div><h2>模型分布</h2><p>按请求次数统计</p></div></div>
+              <div id="chart-models"></div>
+            </article>
+            <article class="card">
+              <div class="card-head"><div><h2>Token 趋势</h2><p>输入与输出 Token</p></div></div>
+              <div id="chart-tokens"></div>
+            </article>
+          </div>
+
+          <article class="card">
+            <div class="card-head">
+              <div><h2>最近请求</h2><p>最新 8 条网关调用</p></div>
+              <button class="text-btn" data-navigate="usage" type="button">查看全部
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-chevron"/></svg>
+              </button>
+            </div>
+            <div id="dashboard-activity" class="table-wrap"></div>
+          </article>
         </section>
 
+        <!-- API Keys -->
         <section id="page-keys" class="page-section hidden">
-          <div class="page-heading"><div><span class="eyebrow">ACCESS</span><h1>API Keys</h1><p>为客户端创建和管理访问网关的密钥。</p></div><button id="btn-create-key" class="btn btn-primary" type="button">＋ 创建 API Key</button></div>
-          <div class="toolbar"><div class="search-box"><span>⌕</span><input id="keys-search" type="search" placeholder="搜索名称或状态"></div><span id="keys-count" class="toolbar-count"></span></div>
-          <article class="panel"><div id="keys-list" class="table-wrap"></div></article>
+          <div class="page-heading">
+            <div><h1>API 密钥</h1><p>为客户端创建和管理访问网关的密钥</p></div>
+            <div class="page-heading-actions">
+              <button id="btn-create-key" class="btn btn-primary" type="button">
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-plus"/></svg>创建密钥
+              </button>
+            </div>
+          </div>
+          <div class="toolbar">
+            <div class="search-box">
+              <svg class="ico ico-sm" aria-hidden="true"><use href="#i-search"/></svg>
+              <input id="keys-search" type="search" placeholder="搜索名称或状态" aria-label="搜索密钥">
+            </div>
+            <span id="keys-count" class="toolbar-count"></span>
+          </div>
+          <article class="card"><div id="keys-list" class="table-wrap"></div></article>
         </section>
 
+        <!-- Usage -->
         <section id="page-usage" class="page-section hidden">
-          <div class="page-heading"><div><span class="eyebrow">OBSERVABILITY</span><h1>用量记录</h1><p>查看请求状态、模型、耗时与 Token 使用情况。</p></div><button id="btn-refresh-usage" class="btn btn-soft" type="button">刷新记录</button></div>
-          <div class="toolbar"><div class="search-box"><span>⌕</span><input id="usage-search" type="search" placeholder="搜索模型、服务商或状态"></div><span id="usage-count" class="toolbar-count"></span></div>
-          <article class="panel"><div id="usage-list" class="table-wrap"></div></article>
+          <div class="page-heading">
+            <div><h1>使用记录</h1><p>请求状态、模型、耗时与 Token 使用情况</p></div>
+            <div class="page-heading-actions">
+              <button id="btn-refresh-usage" class="btn btn-secondary" type="button">
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-refresh"/></svg>刷新
+              </button>
+            </div>
+          </div>
+          <div class="toolbar">
+            <div class="search-box">
+              <svg class="ico ico-sm" aria-hidden="true"><use href="#i-search"/></svg>
+              <input id="usage-search" type="search" placeholder="搜索模型、服务商或状态" aria-label="搜索记录">
+            </div>
+            <span id="usage-count" class="toolbar-count"></span>
+          </div>
+          <article class="card"><div id="usage-list" class="table-wrap"></div></article>
         </section>
 
+        <!-- Model mappings -->
         <section id="page-models" class="page-section hidden">
-          <div class="page-heading"><div><span class="eyebrow">ROUTING</span><h1>模型映射</h1><p>将客户端模型名映射到指定服务商和上游模型。</p></div><button id="btn-create-model" class="btn btn-primary" type="button">＋ 新建映射</button></div>
-          <article class="panel"><div id="models-list" class="table-wrap"></div></article>
+          <div class="page-heading">
+            <div><h1>模型映射</h1><p>将客户端模型名映射到指定服务商和上游模型</p></div>
+            <div class="page-heading-actions">
+              <button id="btn-create-model" class="btn btn-primary" type="button">
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-plus"/></svg>新建映射
+              </button>
+            </div>
+          </div>
+          <div class="notice">
+            <svg class="ico ico-sm" aria-hidden="true"><use href="#i-info"/></svg>
+            <span>支持前缀通配，例如 <code>claude-*</code> 会匹配所有以 claude- 开头的模型名。没有匹配映射时，网关按模型名自动选择服务商。</span>
+          </div>
+          <article class="card"><div id="models-list" class="table-wrap"></div></article>
         </section>
 
+        <!-- Groups -->
         <section id="page-groups" class="page-section hidden">
-          <div class="page-heading"><div><span class="eyebrow">ROUTING</span><h1>分组管理</h1><p>为账号设置调度优先级和故障切换策略。</p></div><button id="btn-create-group" class="btn btn-primary" type="button">＋ 新建分组</button></div>
-          <article class="panel"><div id="groups-list" class="table-wrap"></div></article>
+          <div class="page-heading">
+            <div><h1>分组管理</h1><p>为账号设置调度优先级和故障切换策略</p></div>
+            <div class="page-heading-actions">
+              <button id="btn-create-group" class="btn btn-primary" type="button">
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-plus"/></svg>新建分组
+              </button>
+            </div>
+          </div>
+          <article class="card"><div id="groups-list" class="table-wrap"></div></article>
         </section>
 
+        <!-- Channels -->
         <section id="page-channels" class="page-section hidden">
-          <div class="page-heading"><div><span class="eyebrow">PROVIDERS</span><h1>渠道管理</h1><p>配置服务商入口和默认请求地址。</p></div><button id="btn-create-channel" class="btn btn-primary" type="button">＋ 新建渠道</button></div>
-          <article class="panel"><div id="channels-list" class="table-wrap"></div></article>
+          <div class="page-heading">
+            <div><h1>渠道管理</h1><p>配置服务商入口、默认地址和默认密钥</p></div>
+            <div class="page-heading-actions">
+              <button id="btn-create-channel" class="btn btn-primary" type="button">
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-plus"/></svg>新建渠道
+              </button>
+            </div>
+          </div>
+          <article class="card"><div id="channels-list" class="table-wrap"></div></article>
         </section>
 
+        <!-- Accounts -->
         <section id="page-accounts" class="page-section hidden">
-          <div class="page-heading"><div><span class="eyebrow">UPSTREAM</span><h1>上游账号</h1><p>管理服务商 API Key、归属分组和调度状态。</p></div><button id="btn-create-account" class="btn btn-primary" type="button">＋ 添加账号</button></div>
-          <div class="notice-bar"><span class="notice-icon">i</span><span>API Key 仅用于服务端请求，上游密钥在列表中会自动脱敏。</span></div>
-          <article class="panel"><div id="accounts-list" class="table-wrap"></div></article>
+          <div class="page-heading">
+            <div><h1>账号管理</h1><p>管理上游服务商密钥、归属分组和调度状态</p></div>
+            <div class="page-heading-actions">
+              <button id="btn-create-account" class="btn btn-primary" type="button">
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-plus"/></svg>添加账号
+              </button>
+            </div>
+          </div>
+          <div class="notice">
+            <svg class="ico ico-sm" aria-hidden="true"><use href="#i-shield"/></svg>
+            <span>上游密钥只用于服务端请求，保存后在列表和接口中始终脱敏显示。账号密钥留空时会继承所属渠道的默认密钥。</span>
+          </div>
+          <article class="card"><div id="accounts-list" class="table-wrap"></div></article>
+        </section>
+
+        <!-- Settings -->
+        <section id="page-settings" class="page-section hidden">
+          <div class="page-heading">
+            <div><h1>系统设置</h1><p>接入地址、调度说明与管理员安全</p></div>
+          </div>
+
+          <article class="card">
+            <div class="card-head"><div><h2>客户端接入地址</h2><p>把下面的地址填进对应客户端，密钥使用本站创建的 API Key</p></div></div>
+            <div class="card-pad">
+              <div id="endpoint-list" class="endpoint-list"></div>
+            </div>
+          </article>
+
+          <div class="grid-2">
+            <article class="card">
+              <div class="card-head"><div><h2>修改登录密码</h2><p>修改后当前令牌仍然有效，直到过期</p></div></div>
+              <div class="card-pad">
+                <form id="password-form" class="auth-form" novalidate>
+                  <div class="field">
+                    <label class="field-label" for="pw-current">当前密码</label>
+                    <input class="field-input" id="pw-current" name="current" type="password" autocomplete="current-password" required>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="pw-next">新密码</label>
+                    <input class="field-input" id="pw-next" name="next" type="password" autocomplete="new-password" placeholder="至少 8 位" required>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="pw-confirm">确认新密码</label>
+                    <input class="field-input" id="pw-confirm" name="confirm" type="password" autocomplete="new-password" required>
+                  </div>
+                  <button class="btn btn-primary" type="submit">更新密码</button>
+                  <p id="password-message" class="form-message" role="alert"></p>
+                </form>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head"><div><h2>调度与故障切换</h2><p>当前生效的选路规则</p></div></div>
+              <div class="card-pad">
+                <ol style="margin:0;padding-left:20px;color:var(--text-2);font-size:13px;line-height:1.9">
+                  <li>校验账号、渠道、分组均已启用，且渠道服务商与账号一致。</li>
+                  <li>优先使用模型映射指定的分组；该分组无可用账号时回退到同服务商其他分组。</li>
+                  <li>依次比较分组优先级、渠道优先级、账号优先级，数值越小越优先。</li>
+                  <li>按统计窗口内的错误率和错误次数熔断异常账号。</li>
+                  <li>同等条件下按最近使用时间分散请求。</li>
+                  <li>上游返回 408 / 425 / 429 / 5xx 或网络超时时自动切换账号重试。</li>
+                </ol>
+              </div>
+            </article>
+          </div>
         </section>
       </main>
     </div>

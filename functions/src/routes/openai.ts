@@ -3,7 +3,7 @@ import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { authenticateApiKey } from '../auth';
 import { FailoverManager } from '../failover';
-import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping } from '../utils/proxy';
+import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials } from '../utils/proxy';
 import { getModelFromHeader } from '../utils/headers';
 import { extractTokenUsage, calculateCost } from '../billing';
 import { Account, Channel, Group, ModelMapping } from '../types';
@@ -90,9 +90,10 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
   const provider = account.provider as 'openai' | 'xai';
   
   // Build upstream request
-  const baseUrl = getUpstreamBaseUrl(account.base_url, provider);
+  const credentials = resolveUpstreamCredentials(account, channel);
+  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   const upstreamUrl = `${baseUrl}${endpoint}`;
-  const headers = buildUpstreamHeaders(request.headers, provider, account.api_key, account.base_url, account.client_spoofing);
+  const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
   
   const startTime = Date.now();
   
@@ -207,9 +208,10 @@ async function handleFailover(
     const currentProvider = account.provider as 'openai' | 'xai';
     
     try {
-      const baseUrl = getUpstreamBaseUrl(account.base_url, currentProvider);
+      const credentials = resolveUpstreamCredentials(account, channel);
+      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, currentProvider);
       const upstreamUrl = `${baseUrl}${endpoint}`;
-      const headers = buildUpstreamHeaders(request.headers, currentProvider, account.api_key, account.base_url, account.client_spoofing);
+      const headers = buildUpstreamHeaders(request.headers, currentProvider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
       const proxyResponse = await proxyRequest({
         url: upstreamUrl,
         method: request.method,

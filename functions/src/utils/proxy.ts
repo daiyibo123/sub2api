@@ -148,6 +148,21 @@ function applyClientSpoofing(headers: Record<string, string>, provider: string, 
   }
 }
 
+/**
+ * Resolve the credentials a request should actually use. An account may leave
+ * its key or base URL empty to inherit the channel's values; the provider
+ * default is applied later by getUpstreamBaseUrl.
+ */
+export function resolveUpstreamCredentials(
+  account: { api_key?: string; base_url?: string },
+  channel?: { api_key?: string; base_url?: string }
+): { apiKey: string; baseUrl: string } {
+  return {
+    apiKey: String(account?.api_key || '').trim() || String(channel?.api_key || '').trim(),
+    baseUrl: String(account?.base_url || '').trim() || String(channel?.base_url || '').trim()
+  };
+}
+
 export function getUpstreamBaseUrl(baseUrl?: string, provider?: string): string {
   if (baseUrl && baseUrl.trim()) {
     return baseUrl.replace(/\/$/, '');

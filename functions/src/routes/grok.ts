@@ -3,7 +3,7 @@ import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { authenticateApiKey } from '../auth';
 import { FailoverManager } from '../failover';
-import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping } from '../utils/proxy';
+import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials } from '../utils/proxy';
 import { getModelFromHeader } from '../utils/headers';
 import { extractTokenUsage, calculateCost } from '../billing';
 import { Account, Channel, Group, ModelMapping } from '../types';
@@ -75,9 +75,10 @@ export async function handleGrokRequest(request: Request, env: Env, failover: Fa
   const { account, channel, group } = selection;
   
   // Build upstream request
-  const baseUrl = getUpstreamBaseUrl(account.base_url, 'xai');
+  const credentials = resolveUpstreamCredentials(account, channel);
+  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, 'xai');
   const upstreamUrl = `${baseUrl}/v1/chat/completions`;
-  const headers = buildUpstreamHeaders(request.headers, 'xai', account.api_key, account.base_url, account.client_spoofing);
+  const headers = buildUpstreamHeaders(request.headers, 'xai', credentials.apiKey, credentials.baseUrl, account.client_spoofing);
   
   const startTime = Date.now();
   
@@ -186,9 +187,10 @@ async function handleGrokFailover(
     attempted.add(account.id);
     
     try {
-      const baseUrl = getUpstreamBaseUrl(account.base_url, 'xai');
+      const credentials = resolveUpstreamCredentials(account, channel);
+      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, 'xai');
       const upstreamUrl = `${baseUrl}/v1/chat/completions`;
-      const headers = buildUpstreamHeaders(request.headers, 'xai', account.api_key, account.base_url, account.client_spoofing);
+      const headers = buildUpstreamHeaders(request.headers, 'xai', credentials.apiKey, credentials.baseUrl, account.client_spoofing);
       const proxyResponse = await proxyRequest({
         url: upstreamUrl,
         method: request.method,

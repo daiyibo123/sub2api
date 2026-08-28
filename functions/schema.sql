@@ -107,8 +107,20 @@ CREATE TABLE IF NOT EXISTS request_logs (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- 运行时设置（例如未配置 JWT_SECRET 时自动生成的会话密钥）
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_req_logs_account_created ON request_logs(account_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_req_logs_channel_created ON request_logs(channel_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_req_logs_group_created ON request_logs(group_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_records(created_at);
+CREATE INDEX IF NOT EXISTS idx_accounts_group ON accounts(group_id);
+CREATE INDEX IF NOT EXISTS idx_accounts_channel ON accounts(channel_id);
 
 -- The first administrator is created through POST /api/v1/auth/setup.
+-- Applying this file is optional: POST /api/v1/auth/setup runs the same
+-- statements from functions/src/schema.ts when tables are missing.

@@ -1,3 +1,111 @@
+// functions/src/schema.ts
+var SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    enabled INTEGER DEFAULT 1,
+    priority INTEGER DEFAULT 0,
+    error_threshold REAL DEFAULT 0.5,
+    error_count_threshold INTEGER DEFAULT 5,
+    window_seconds INTEGER DEFAULT 300,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    provider TEXT NOT NULL,
+    base_url TEXT,
+    api_key TEXT,
+    enabled INTEGER DEFAULT 1,
+    priority INTEGER DEFAULT 0,
+    error_count INTEGER DEFAULT 0,
+    error_rate REAL DEFAULT 0,
+    last_error_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    provider TEXT NOT NULL CHECK(provider IN ('openai','anthropic','xai')),
+    api_key TEXT NOT NULL,
+    base_url TEXT,
+    group_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    enabled INTEGER DEFAULT 1,
+    error_count INTEGER DEFAULT 0,
+    error_rate REAL DEFAULT 0,
+    last_error_at TEXT,
+    last_error_msg TEXT,
+    priority INTEGER DEFAULT 0,
+    client_spoofing TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS model_mappings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    requested_model TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    upstream_model TEXT NOT NULL,
+    group_id INTEGER NOT NULL,
+    enabled INTEGER DEFAULT 1,
+    priority INTEGER DEFAULT 0
+  )`,
+  `CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_hash TEXT NOT NULL UNIQUE,
+    name TEXT,
+    enabled INTEGER DEFAULT 1,
+    balance REAL DEFAULT 0,
+    quota_limit REAL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS usage_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    api_key_id INTEGER,
+    model TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    cost REAL DEFAULT 0,
+    status INTEGER DEFAULT 200,
+    error_message TEXT,
+    latency_ms INTEGER,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS request_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    group_id INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    error_message TEXT,
+    latency_ms INTEGER,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  // Internal key/value store. Holds the auto-generated JWT signing secret so a
+  // deployment that never set the JWT_SECRET variable still signs sessions with
+  // a value unique to that database rather than a constant from the repository.
+  `CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_req_logs_account_created ON request_logs(account_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_req_logs_channel_created ON request_logs(channel_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_req_logs_group_created ON request_logs(group_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_records(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_accounts_group ON accounts(group_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_accounts_channel ON accounts(channel_id)`
+];
+
 // functions/src/db.ts
 var Database = class {
   constructor(db) {
@@ -40,10 +148,26 @@ var Database = class {
   async getGroup(id) {
     return this.queryOne("SELECT * FROM groups WHERE id = ?", [id]);
   }
-  async createGroup(name, description, priority = 0) {
+  /**
+   * groups.name is UNIQUE. Look the name up first so a collision returns a
+   * readable message instead of a raw D1 constraint error.
+   */
+  async getGroupByName(name) {
+    return this.queryOne("SELECT * FROM groups WHERE name = ?", [name]);
+  }
+  async createGroup(name, description, priority = 0, options = {}) {
     return this.insert(
-      "INSERT INTO groups (name, description, priority) VALUES (?, ?, ?)",
-      [name, description || "", priority]
+      `INSERT INTO groups (name, description, priority, enabled, error_threshold, error_count_threshold, window_seconds)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        name,
+        description || "",
+        priority,
+        options.enabled ?? 1,
+        options.error_threshold ?? 0.5,
+        options.error_count_threshold ?? 5,
+        options.window_seconds ?? 300
+      ]
     );
   }
   async updateGroup(id, updates) {
@@ -91,10 +215,14 @@ var Database = class {
   async getChannel(id) {
     return this.queryOne("SELECT * FROM channels WHERE id = ?", [id]);
   }
-  async createChannel(name, provider, baseUrl, apiKey, priority = 0) {
+  /** channels.name is UNIQUE; pre-check so collisions get a readable message. */
+  async getChannelByName(name) {
+    return this.queryOne("SELECT * FROM channels WHERE name = ?", [name]);
+  }
+  async createChannel(name, provider, baseUrl, apiKey, priority = 0, enabled = 1) {
     return this.insert(
-      "INSERT INTO channels (name, provider, base_url, api_key, priority) VALUES (?, ?, ?, ?, ?)",
-      [name, provider, baseUrl || "", apiKey || "", priority]
+      "INSERT INTO channels (name, provider, base_url, api_key, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+      [name, provider, baseUrl || "", apiKey || "", priority, enabled]
     );
   }
   async updateChannel(id, updates) {
@@ -144,10 +272,10 @@ var Database = class {
   async getAccount(id) {
     return this.queryOne("SELECT * FROM accounts WHERE id = ?", [id]);
   }
-  async createAccount(name, provider, apiKey, groupId, channelId, baseUrl, priority = 0, clientSpoofing) {
+  async createAccount(name, provider, apiKey, groupId, channelId, baseUrl, priority = 0, clientSpoofing, enabled = 1) {
     return this.insert(
-      "INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [name, provider, apiKey, baseUrl || "", groupId, channelId, priority, clientSpoofing || ""]
+      "INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [name, provider, apiKey, baseUrl || "", groupId, channelId, priority, clientSpoofing || "", enabled]
     );
   }
   async updateAccount(id, updates) {
@@ -207,8 +335,72 @@ var Database = class {
   async listAccountsByGroup(groupId) {
     return this.query("SELECT * FROM accounts WHERE group_id = ? AND enabled = 1 ORDER BY priority ASC, id ASC", [groupId]);
   }
+  /**
+   * An account with a blank api_key falls back to its channel's key, so a
+   * channel can hold one shared credential for several accounts.
+   */
   async listEnabledAccounts() {
-    return this.query("SELECT * FROM accounts WHERE enabled = 1 ORDER BY priority ASC, id ASC");
+    return this.query(`
+      SELECT a.*, COALESCE(NULLIF(a.api_key, ''), c.api_key, '') AS api_key
+      FROM accounts a
+      LEFT JOIN channels c ON a.channel_id = c.id
+      WHERE a.enabled = 1
+      ORDER BY a.priority ASC, a.id ASC
+    `);
+  }
+  /** Dependants that would break if a group were removed. */
+  async countAccountsInGroup(groupId) {
+    const row = await this.queryOne(
+      "SELECT COUNT(*) AS total FROM accounts WHERE group_id = ?",
+      [groupId]
+    );
+    return Number(row?.total || 0);
+  }
+  async countModelMappingsForGroup(groupId) {
+    const row = await this.queryOne(
+      "SELECT COUNT(*) AS total FROM model_mappings WHERE group_id = ?",
+      [groupId]
+    );
+    return Number(row?.total || 0);
+  }
+  /**
+   * Count accounts that would be orphaned by switching a channel's provider.
+   * Scheduling requires channel.provider === account.provider, so such accounts
+   * would silently stop receiving traffic.
+   */
+  async countAccountsForChannelWithOtherProvider(channelId, nextProvider) {
+    const row = await this.queryOne(
+      "SELECT COUNT(*) AS total FROM accounts WHERE channel_id = ? AND provider != ?",
+      [channelId, nextProvider]
+    );
+    return Number(row?.total || 0);
+  }
+  /**
+   * Name lookups back friendly duplicate errors. Both groups and channels have
+   * a UNIQUE(name) constraint, which would otherwise surface as a raw D1 500.
+   */
+  async findGroupByName(name) {
+    return this.queryOne("SELECT * FROM groups WHERE name = ?", [name]);
+  }
+  async findChannelByName(name) {
+    return this.queryOne("SELECT * FROM channels WHERE name = ?", [name]);
+  }
+  /** Accounts still pointing at a channel, used to block unsafe deletes. */
+  async countAccountsForChannel(channelId) {
+    const row = await this.queryOne(
+      "SELECT COUNT(*) AS total FROM accounts WHERE channel_id = ?",
+      [channelId]
+    );
+    return Number(row?.total || 0);
+  }
+  /** Resolve an account with the channel key fallback applied. */
+  async getAccountWithKey(id) {
+    return this.queryOne(`
+      SELECT a.*, COALESCE(NULLIF(a.api_key, ''), c.api_key, '') AS api_key
+      FROM accounts a
+      LEFT JOIN channels c ON a.channel_id = c.id
+      WHERE a.id = ?
+    `, [id]);
   }
   // Model mapping operations
   async listModelMappings() {
@@ -217,10 +409,21 @@ var Database = class {
   async getModelMapping(id) {
     return this.queryOne("SELECT * FROM model_mappings WHERE id = ?", [id]);
   }
-  async createModelMapping(requestedModel, provider, upstreamModel, groupId, priority = 0) {
+  /**
+   * findModelMapping resolves a single rule per (client model, provider) pair,
+   * so a second identical pair would never be reachable. Surface it as a
+   * conflict instead of silently storing dead configuration.
+   */
+  async findModelMappingByModel(requestedModel, provider) {
+    return this.queryOne(
+      "SELECT * FROM model_mappings WHERE requested_model = ? AND provider = ?",
+      [requestedModel, provider]
+    );
+  }
+  async createModelMapping(requestedModel, provider, upstreamModel, groupId, priority = 0, enabled = 1) {
     return this.insert(
-      "INSERT INTO model_mappings (requested_model, provider, upstream_model, group_id, priority) VALUES (?, ?, ?, ?, ?)",
-      [requestedModel, provider, upstreamModel, groupId, priority]
+      "INSERT INTO model_mappings (requested_model, provider, upstream_model, group_id, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+      [requestedModel, provider, upstreamModel, groupId, priority, enabled]
     );
   }
   async updateModelMapping(id, updates) {
@@ -368,6 +571,121 @@ var Database = class {
     );
     return result || { total_requests: 0, error_count: 0 };
   }
+  /**
+   * Dashboard aggregates computed in D1 rather than by paging every row into
+   * the browser, so the numbers stay correct beyond the usage page limit.
+   */
+  async getDashboardStats(windowHours = 24, bucket = "hour") {
+    const since = sqliteTimestamp(Date.now() - windowHours * 60 * 60 * 1e3);
+    const bucketFormat = bucket === "day" ? "%Y-%m-%d" : "%Y-%m-%d %H:00";
+    const todayStart = sqliteTimestamp((/* @__PURE__ */ new Date()).setHours(0, 0, 0, 0));
+    const [totals, today, resources] = await Promise.all([
+      this.queryOne(`
+        SELECT
+          COUNT(*) AS total_requests,
+          SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END) AS success_requests,
+          COALESCE(SUM(total_tokens), 0) AS total_tokens,
+          COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+          COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+          COALESCE(SUM(cost), 0) AS total_cost,
+          COALESCE(AVG(NULLIF(latency_ms, 0)), 0) AS avg_latency
+        FROM usage_records
+      `),
+      this.queryOne(`
+        SELECT
+          COUNT(*) AS today_requests,
+          COALESCE(SUM(total_tokens), 0) AS today_tokens,
+          COALESCE(SUM(cost), 0) AS today_cost
+        FROM usage_records WHERE created_at >= ?
+      `, [todayStart]),
+      this.queryOne(`
+        SELECT
+          (SELECT COUNT(*) FROM accounts) AS total_accounts,
+          (SELECT COUNT(*) FROM accounts WHERE enabled = 1) AS active_accounts,
+          (SELECT COUNT(*) FROM api_keys) AS total_keys,
+          (SELECT COUNT(*) FROM api_keys WHERE enabled = 1) AS active_keys,
+          (SELECT COUNT(*) FROM channels) AS total_channels,
+          (SELECT COUNT(*) FROM channels WHERE enabled = 1) AS active_channels,
+          (SELECT COUNT(*) FROM groups) AS total_groups,
+          (SELECT COUNT(*) FROM groups WHERE enabled = 1) AS active_groups,
+          (SELECT COUNT(*) FROM model_mappings) AS total_models,
+          (SELECT COUNT(*) FROM model_mappings WHERE enabled = 1) AS active_models
+      `)
+    ]);
+    const [trend, byModel, byProvider] = await Promise.all([
+      this.query(`
+        SELECT
+          strftime('${bucketFormat}', created_at) AS bucket,
+          COUNT(*) AS requests,
+          SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
+          COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+          COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+          COALESCE(SUM(cost), 0) AS cost
+        FROM usage_records WHERE created_at >= ?
+        GROUP BY bucket ORDER BY bucket ASC
+      `, [since]),
+      this.query(`
+        SELECT model, COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens, COALESCE(SUM(cost), 0) AS cost
+        FROM usage_records GROUP BY model ORDER BY requests DESC LIMIT 12
+      `),
+      this.query(`
+        SELECT provider, COUNT(*) AS requests, COALESCE(SUM(cost), 0) AS cost
+        FROM usage_records GROUP BY provider ORDER BY requests DESC
+      `)
+    ]);
+    return { totals: totals || {}, today: today || {}, resources: resources || {}, trend, byModel, byProvider };
+  }
+  /**
+   * Apply the schema when tables are missing. Pages deployments often have no
+   * access to `wrangler d1 execute`, so first run would otherwise fail with a
+   * raw "no such table" error. Every statement is idempotent.
+   */
+  async ensureSchema() {
+    const wasReady = await this.schemaReady();
+    for (const statement of SCHEMA_STATEMENTS) {
+      await this.db.prepare(statement).run();
+    }
+    return !wasReady;
+  }
+  /** Read a persisted setting, or null when it has never been written. */
+  async getSetting(key) {
+    try {
+      const row = await this.queryOne("SELECT value FROM settings WHERE key = ?", [key]);
+      return row?.value ?? null;
+    } catch {
+      return null;
+    }
+  }
+  async setSetting(key, value) {
+    await this.update(
+      `INSERT INTO settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+      [key, value]
+    );
+  }
+  /**
+   * Store a value only if the key is unset, then return whatever is stored.
+   *
+   * Concurrent isolates can each generate a candidate session secret. Keeping
+   * the first writer's value means tokens issued by one isolate still verify in
+   * another, instead of logging users out at random.
+   */
+  async setSettingIfAbsent(key, value) {
+    await this.update("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", [key, value]);
+    const row = await this.queryOne("SELECT value FROM settings WHERE key = ?", [key]);
+    return row?.value ?? value;
+  }
+  /** Cheap probe used to decide whether migration is needed. */
+  async schemaReady() {
+    try {
+      const row = await this.queryOne(
+        "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','channels','accounts','model_mappings','api_keys','usage_records','request_logs')"
+      );
+      return Number(row?.total || 0) >= 8;
+    } catch {
+      return false;
+    }
+  }
   // Cleanup old logs
   async cleanupOldLogs(days = 7) {
     const cutoff = sqliteTimestamp(Date.now() - days * 24 * 60 * 60 * 1e3);
@@ -467,6 +785,14 @@ async function verifySessionToken(token, secret) {
   } catch {
     return null;
   }
+}
+async function resolveSessionSecret(db, configured) {
+  const explicit = String(configured || "").trim();
+  if (explicit) return explicit;
+  const stored = await db.getSetting("session_secret");
+  if (stored) return stored;
+  const generated = toHex(crypto.getRandomValues(new Uint8Array(32)));
+  return db.setSettingIfAbsent("session_secret", generated);
 }
 async function hashApiKey(apiKey) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(apiKey));
@@ -759,6 +1085,12 @@ function applyClientSpoofing(headers, provider, clientSpoofing) {
   } catch {
   }
 }
+function resolveUpstreamCredentials(account, channel) {
+  return {
+    apiKey: String(account?.api_key || "").trim() || String(channel?.api_key || "").trim(),
+    baseUrl: String(account?.base_url || "").trim() || String(channel?.base_url || "").trim()
+  };
+}
 function getUpstreamBaseUrl(baseUrl, provider) {
   if (baseUrl && baseUrl.trim()) {
     return baseUrl.replace(/\/$/, "");
@@ -899,7 +1231,8 @@ async function handleGatewayRequest(request, env, failover) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
   const { account, channel, group, stats } = selection;
-  const baseUrl = getUpstreamBaseUrl(account.base_url, provider);
+  const credentials = resolveUpstreamCredentials(account, channel);
+  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   let upstreamPath = url.pathname;
   if (provider === "anthropic") {
     if (!upstreamPath.includes("/v1/messages")) {
@@ -913,7 +1246,7 @@ async function handleGatewayRequest(request, env, failover) {
   }
   const upstreamUrl = new URL(`${baseUrl}${upstreamPath}`);
   if (provider === "anthropic") upstreamUrl.searchParams.set("beta", "true");
-  const headers = buildUpstreamHeaders(request.headers, provider, account.api_key, account.base_url, account.client_spoofing);
+  const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
@@ -1009,7 +1342,8 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
     const { account, channel, group } = selection;
     attempted.add(account.id);
     try {
-      const baseUrl = getUpstreamBaseUrl(account.base_url, provider);
+      const credentials = resolveUpstreamCredentials(account, channel);
+      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
       const url = new URL(request.url);
       let upstreamPath = url.pathname;
       if (provider === "anthropic" && !upstreamPath.includes("/v1/messages")) {
@@ -1019,7 +1353,7 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
       }
       const retryUrl = new URL(`${baseUrl}${upstreamPath}`);
       if (provider === "anthropic") retryUrl.searchParams.set("beta", "true");
-      const headers = buildUpstreamHeaders(request.headers, provider, account.api_key, account.base_url, account.client_spoofing);
+      const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
       const proxyResponse = await proxyRequest({
         url: retryUrl.toString(),
         method: request.method,
@@ -1149,9 +1483,10 @@ async function handleOpenAIRequest(request, env, failover) {
   }
   const { account, channel, group } = selection;
   const provider = account.provider;
-  const baseUrl = getUpstreamBaseUrl(account.base_url, provider);
+  const credentials = resolveUpstreamCredentials(account, channel);
+  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, provider);
   const upstreamUrl = `${baseUrl}${endpoint}`;
-  const headers = buildUpstreamHeaders(request.headers, provider, account.api_key, account.base_url, account.client_spoofing);
+  const headers = buildUpstreamHeaders(request.headers, provider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
   const startTime = Date.now();
   try {
     const proxyResponse = await proxyRequest({
@@ -1235,9 +1570,10 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
     attempted.add(account.id);
     const currentProvider = account.provider;
     try {
-      const baseUrl = getUpstreamBaseUrl(account.base_url, currentProvider);
+      const credentials = resolveUpstreamCredentials(account, channel);
+      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, currentProvider);
       const upstreamUrl = `${baseUrl}${endpoint}`;
-      const headers = buildUpstreamHeaders(request.headers, currentProvider, account.api_key, account.base_url, account.client_spoofing);
+      const headers = buildUpstreamHeaders(request.headers, currentProvider, credentials.apiKey, credentials.baseUrl, account.client_spoofing);
       const proxyResponse = await proxyRequest({
         url: upstreamUrl,
         method: request.method,
@@ -1332,9 +1668,10 @@ async function handleClaudeRequest(request, env, failover) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
   const { account, channel, group } = selection;
-  const baseUrl = getUpstreamBaseUrl(account.base_url, "anthropic");
+  const credentials = resolveUpstreamCredentials(account, channel);
+  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, "anthropic");
   const upstreamUrl = `${baseUrl}/v1/messages?beta=true`;
-  const headers = buildUpstreamHeaders(request.headers, "anthropic", account.api_key, account.base_url, account.client_spoofing);
+  const headers = buildUpstreamHeaders(request.headers, "anthropic", credentials.apiKey, credentials.baseUrl, account.client_spoofing);
   const startTime = Date.now();
   try {
     const proxyResponse = await proxyRequest({
@@ -1413,9 +1750,10 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
     const { account, channel, group } = selection;
     attempted.add(account.id);
     try {
-      const baseUrl = getUpstreamBaseUrl(account.base_url, "anthropic");
+      const credentials = resolveUpstreamCredentials(account, channel);
+      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, "anthropic");
       const upstreamUrl = `${baseUrl}/v1/messages?beta=true`;
-      const headers = buildUpstreamHeaders(request.headers, "anthropic", account.api_key, account.base_url, account.client_spoofing);
+      const headers = buildUpstreamHeaders(request.headers, "anthropic", credentials.apiKey, credentials.baseUrl, account.client_spoofing);
       const proxyResponse = await proxyRequest({
         url: upstreamUrl,
         method: request.method,
@@ -1475,66 +1813,109 @@ async function handleGroupsRequest(request, env, ctx) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
     }
     const token = authHeader.slice(7);
-    const session = await verifySessionToken(token, env.JWT_SECRET || "change-me-in-dashboard");
+    const session = await verifySessionToken(token, await resolveSessionSecret(db, env.JWT_SECRET));
     if (!session) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
     }
   }
   if (method === "GET") {
     const groups = await db.listGroups();
-    return new Response(JSON.stringify({ data: groups }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    return jsonData(groups);
   }
   if (method === "POST") {
-    const body = await request.json();
-    if (!body.name) {
-      return new Response(JSON.stringify({ error: "Name is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return jsonError("Invalid JSON body", 400);
     }
-    const result = await db.createGroup(
-      body.name,
-      body.description,
-      body.priority || 0
-    );
-    if (body.error_threshold !== void 0 || body.error_count_threshold !== void 0 || body.window_seconds !== void 0) {
-      await db.updateGroup(result.lastRowId, {
-        error_threshold: body.error_threshold ?? 0.5,
-        error_count_threshold: body.error_count_threshold ?? 5,
-        window_seconds: body.window_seconds ?? 300
-      });
-    }
-    const group = await db.getGroup(result.lastRowId);
-    return new Response(JSON.stringify({ data: group }), {
-      status: 201,
-      headers: { "Content-Type": "application/json" }
+    const name = String(body.name || "").trim();
+    if (!name) return jsonError("\u8BF7\u586B\u5199\u5206\u7EC4\u540D\u79F0", 400);
+    const thresholds = readThresholds(body);
+    if (typeof thresholds === "string") return jsonError(thresholds, 400);
+    if (await db.getGroupByName(name)) return jsonError(`\u5206\u7EC4\u540D\u79F0\u300C${name}\u300D\u5DF2\u5B58\u5728`, 409);
+    const result = await db.createGroup(name, String(body.description || "").trim(), Number(body.priority) || 0, {
+      enabled: body.enabled === false || body.enabled === 0 ? 0 : 1,
+      ...thresholds
     });
+    const group = await db.getGroup(result.lastRowId);
+    return jsonData(group, 201);
   }
   if (method === "PUT") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
-    const body = await request.json();
-    if (!id) {
-      return new Response(JSON.stringify({ error: "Invalid group ID" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    if (!id) return jsonError("Invalid group ID", 400);
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return jsonError("Invalid JSON body", 400);
     }
-    await db.updateGroup(id, body);
+    if (!await db.getGroup(id)) return jsonError("\u5206\u7EC4\u4E0D\u5B58\u5728", 404);
+    const updates = {};
+    if (body.name !== void 0) {
+      const name = String(body.name).trim();
+      if (!name) return jsonError("\u5206\u7EC4\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A", 400);
+      const clash = await db.getGroupByName(name);
+      if (clash && Number(clash.id) !== id) return jsonError(`\u5206\u7EC4\u540D\u79F0\u300C${name}\u300D\u5DF2\u5B58\u5728`, 409);
+      updates.name = name;
+    }
+    if (body.description !== void 0) updates.description = String(body.description).trim();
+    if (body.priority !== void 0) updates.priority = Number(body.priority) || 0;
+    if (body.enabled !== void 0) updates.enabled = body.enabled === true || body.enabled === 1 ? 1 : 0;
+    const thresholds = readThresholds(body, true);
+    if (typeof thresholds === "string") return jsonError(thresholds, 400);
+    Object.assign(updates, thresholds);
+    await db.updateGroup(id, updates);
     const group = await db.getGroup(id);
-    return new Response(JSON.stringify({ data: group }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    return jsonData(group);
   }
   if (method === "DELETE") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
-    if (!id) {
-      return new Response(JSON.stringify({ error: "Invalid group ID" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    if (!id) return jsonError("Invalid group ID", 400);
+    const attached = await db.countAccountsInGroup(id);
+    if (attached > 0) {
+      return jsonError(`\u8BE5\u5206\u7EC4\u4E0B\u8FD8\u6709 ${attached} \u4E2A\u8D26\u53F7\uFF0C\u8BF7\u5148\u79FB\u52A8\u6216\u5220\u9664\u8FD9\u4E9B\u8D26\u53F7`, 400);
+    }
+    const mapped = await db.countModelMappingsForGroup(id);
+    if (mapped > 0) {
+      return jsonError(`\u8BE5\u5206\u7EC4\u4ECD\u88AB ${mapped} \u6761\u6A21\u578B\u6620\u5C04\u5F15\u7528\uFF0C\u8BF7\u5148\u8C03\u6574\u6620\u5C04`, 400);
     }
     await db.deleteGroup(id);
-    return new Response(JSON.stringify({ success: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    return new Response(JSON.stringify({ success: true }), { status: 200, headers: JSON_HEADERS });
   }
-  return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
+  return jsonError("Method not allowed", 405);
+}
+var JSON_HEADERS = { "Content-Type": "application/json" };
+function jsonData(data, status = 200) {
+  return new Response(JSON.stringify({ data }), { status, headers: JSON_HEADERS });
+}
+function jsonError(message, status) {
+  return new Response(JSON.stringify({ error: message }), { status, headers: JSON_HEADERS });
+}
+function readThresholds(body, partial = false) {
+  const result = {};
+  if (body.error_threshold !== void 0) {
+    const rate = Number(body.error_threshold);
+    if (!Number.isFinite(rate) || rate < 0 || rate > 1) return "\u9519\u8BEF\u7387\u9608\u503C\u5FC5\u987B\u5728 0 \u5230 1 \u4E4B\u95F4";
+    result.error_threshold = rate;
+  } else if (!partial) {
+    result.error_threshold = 0.5;
+  }
+  if (body.error_count_threshold !== void 0) {
+    const count = Number(body.error_count_threshold);
+    if (!Number.isInteger(count) || count < 1) return "\u9519\u8BEF\u6B21\u6570\u9608\u503C\u5FC5\u987B\u662F\u4E0D\u5C0F\u4E8E 1 \u7684\u6574\u6570";
+    result.error_count_threshold = count;
+  } else if (!partial) {
+    result.error_count_threshold = 5;
+  }
+  if (body.window_seconds !== void 0) {
+    const window = Number(body.window_seconds);
+    if (!Number.isInteger(window) || window < 10 || window > 86400) return "\u7EDF\u8BA1\u7A97\u53E3\u5FC5\u987B\u662F 10 \u5230 86400 \u79D2\u4E4B\u95F4\u7684\u6574\u6570";
+    result.window_seconds = window;
+  } else if (!partial) {
+    result.window_seconds = 300;
+  }
+  return result;
 }
 
 // functions/src/config/channels.ts
@@ -1548,64 +1929,133 @@ async function handleChannelsRequest(request, env) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
     }
     const token = authHeader.slice(7);
-    const session = await verifySessionToken(token, env.JWT_SECRET || "change-me-in-dashboard");
+    const session = await verifySessionToken(token, await resolveSessionSecret(db, env.JWT_SECRET));
     if (!session) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
     }
   }
   if (method === "GET") {
     const channels = await db.listChannels();
-    return new Response(JSON.stringify({ data: channels.map(({ api_key, ...channel }) => ({ ...channel, api_key: api_key ? "***" : "" })) }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    return jsonData2(channels.map(maskChannel));
   }
   if (method === "POST") {
-    const body = await request.json();
-    if (!body.name || !body.provider) {
-      return new Response(JSON.stringify({ error: "Name and provider are required" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return jsonError2("Invalid JSON body", 400);
     }
+    const name = String(body.name || "").trim();
+    const provider = String(body.provider || "").trim();
+    if (!name) return jsonError2("\u8BF7\u586B\u5199\u6E20\u9053\u540D\u79F0", 400);
+    if (!PROVIDERS.includes(provider)) return jsonError2("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+    const baseUrl = normalizeBaseUrl(body.base_url);
+    if (baseUrl === null) return jsonError2("\u57FA\u7840\u5730\u5740\u5FC5\u987B\u662F http(s) \u5F00\u5934\u7684\u5408\u6CD5\u5730\u5740", 400);
+    if (await db.getChannelByName(name)) return jsonError2(`\u6E20\u9053\u540D\u79F0\u300C${name}\u300D\u5DF2\u5B58\u5728`, 409);
     const result = await db.createChannel(
-      body.name,
-      body.provider,
-      body.base_url,
-      body.api_key,
-      body.priority || 0
+      name,
+      provider,
+      baseUrl,
+      String(body.api_key || "").trim(),
+      Number(body.priority) || 0,
+      body.enabled === false || body.enabled === 0 ? 0 : 1
     );
     const channel = await db.getChannel(result.lastRowId);
-    return new Response(JSON.stringify({ data: channel }), {
-      status: 201,
-      headers: { "Content-Type": "application/json" }
-    });
+    return jsonData2(maskChannel(channel), 201);
   }
   if (method === "PUT") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
-    const body = await request.json();
-    if (!id) {
-      return new Response(JSON.stringify({ error: "Invalid channel ID" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    if (!id) return jsonError2("Invalid channel ID", 400);
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return jsonError2("Invalid JSON body", 400);
     }
-    await db.updateChannel(id, body);
+    const existing = await db.getChannel(id);
+    if (!existing) return jsonError2("\u6E20\u9053\u4E0D\u5B58\u5728", 404);
+    const updates = {};
+    if (body.name !== void 0) {
+      const name = String(body.name).trim();
+      if (!name) return jsonError2("\u8BF7\u586B\u5199\u6E20\u9053\u540D\u79F0", 400);
+      const clash = await db.getChannelByName(name);
+      if (clash && Number(clash.id) !== id) return jsonError2(`\u6E20\u9053\u540D\u79F0\u300C${name}\u300D\u5DF2\u5B58\u5728`, 409);
+      updates.name = name;
+    }
+    if (body.provider !== void 0) {
+      const provider = String(body.provider).trim();
+      if (!PROVIDERS.includes(provider)) return jsonError2("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+      updates.provider = provider;
+    }
+    if (body.base_url !== void 0) {
+      const baseUrl = normalizeBaseUrl(body.base_url);
+      if (baseUrl === null) return jsonError2("\u57FA\u7840\u5730\u5740\u5FC5\u987B\u662F http(s) \u5F00\u5934\u7684\u5408\u6CD5\u5730\u5740", 400);
+      updates.base_url = baseUrl;
+    }
+    if (body.api_key !== void 0 && String(body.api_key).trim()) {
+      updates.api_key = String(body.api_key).trim();
+    }
+    if (body.priority !== void 0) updates.priority = Number(body.priority) || 0;
+    if (body.enabled !== void 0) updates.enabled = body.enabled === true || body.enabled === 1 ? 1 : 0;
+    const nextProvider = String(updates.provider ?? existing.provider);
+    if (nextProvider !== existing.provider) {
+      const conflicting = await db.countAccountsForChannelWithOtherProvider(id, nextProvider);
+      if (conflicting > 0) {
+        return jsonError2(`\u8BE5\u6E20\u9053\u4E0B\u6709 ${conflicting} \u4E2A ${existing.provider} \u8D26\u53F7\uFF0C\u8BF7\u5148\u8C03\u6574\u8D26\u53F7\u670D\u52A1\u5546`, 400);
+      }
+    }
+    await db.updateChannel(id, updates);
     const channel = await db.getChannel(id);
-    return new Response(JSON.stringify({ data: channel }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    return jsonData2(maskChannel(channel));
   }
   if (method === "DELETE") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
-    if (!id) {
-      return new Response(JSON.stringify({ error: "Invalid channel ID" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    if (!id) return jsonError2("Invalid channel ID", 400);
+    if (!await db.getChannel(id)) return jsonError2("\u6E20\u9053\u4E0D\u5B58\u5728", 404);
+    const dependants = await db.countAccountsForChannel(id);
+    if (dependants > 0) {
+      return jsonError2(`\u8BE5\u6E20\u9053\u4E0B\u8FD8\u6709 ${dependants} \u4E2A\u4E0A\u6E38\u8D26\u53F7\uFF0C\u8BF7\u5148\u5220\u9664\u6216\u8FC1\u79FB\u8FD9\u4E9B\u8D26\u53F7`, 400);
     }
     await db.deleteChannel(id);
-    return new Response(JSON.stringify({ success: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    return new Response(JSON.stringify({ success: true }), { status: 200, headers: JSON_HEADERS2 });
   }
-  return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
+  return jsonError2("Method not allowed", 405);
+}
+var PROVIDERS = ["openai", "anthropic", "xai"];
+var JSON_HEADERS2 = { "Content-Type": "application/json" };
+function jsonData2(data, status = 200) {
+  return new Response(JSON.stringify({ data }), { status, headers: JSON_HEADERS2 });
+}
+function jsonError2(message, status) {
+  return new Response(JSON.stringify({ error: message }), { status, headers: JSON_HEADERS2 });
+}
+function maskChannel(channel) {
+  if (!channel) return channel;
+  const { api_key, ...rest } = channel;
+  return { ...rest, has_api_key: Boolean(api_key), api_key: api_key ? "***" : "" };
+}
+function normalizeBaseUrl(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return raw.replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
 }
 
 // functions/src/config/accounts.ts
+var JSON_HEADERS3 = { "Content-Type": "application/json" };
+function jsonError3(message, status) {
+  return new Response(JSON.stringify({ error: message }), { status, headers: JSON_HEADERS3 });
+}
+function maskAccount(account) {
+  if (!account) return account;
+  const { api_key, ...rest } = account;
+  return { ...rest, api_key: api_key ? "***" : "", has_api_key: Boolean(api_key) };
+}
 async function handleAccountsRequest(request, env) {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
@@ -1616,47 +2066,110 @@ async function handleAccountsRequest(request, env) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
     }
     const token = authHeader.slice(7);
-    const session = await verifySessionToken(token, env.JWT_SECRET || "change-me-in-dashboard");
+    const session = await verifySessionToken(token, await resolveSessionSecret(db, env.JWT_SECRET));
     if (!session) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
     }
   }
   if (method === "GET") {
     const accounts = await db.listAccounts();
-    return new Response(JSON.stringify({ data: accounts.map(({ api_key, ...account }) => ({ ...account, api_key: api_key ? "***" : "" })) }), {
+    return new Response(JSON.stringify({ data: accounts.map(maskAccount) }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
     });
   }
   if (method === "POST" && !url.pathname.endsWith("/test")) {
-    const body = await request.json();
-    if (!body.name || !body.provider || !body.api_key || !body.group_id || !body.channel_id) {
-      return new Response(JSON.stringify({ error: "Missing required fields" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return jsonError3("Invalid JSON body", 400);
+    }
+    const name = String(body.name || "").trim();
+    const provider = String(body.provider || "").trim();
+    const groupId = Number(body.group_id);
+    const channelId = Number(body.channel_id);
+    if (!name || !provider || !groupId || !channelId) {
+      return jsonError3("\u8BF7\u586B\u5199\u8D26\u53F7\u540D\u79F0\uFF0C\u5E76\u9009\u62E9\u670D\u52A1\u5546\u3001\u5206\u7EC4\u548C\u6E20\u9053", 400);
+    }
+    if (!["openai", "anthropic", "xai"].includes(provider)) {
+      return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+    }
+    const [group, channel] = await Promise.all([db.getGroup(groupId), db.getChannel(channelId)]);
+    if (!group) return jsonError3("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
+    if (!channel) return jsonError3("\u6240\u9009\u6E20\u9053\u4E0D\u5B58\u5728", 400);
+    if (channel.provider !== provider) {
+      return jsonError3(`\u6240\u9009\u6E20\u9053\u5C5E\u4E8E ${channel.provider}\uFF0C\u4E0E\u8D26\u53F7\u670D\u52A1\u5546 ${provider} \u4E0D\u4E00\u81F4`, 400);
+    }
+    const apiKey = String(body.api_key || "").trim();
+    if (!apiKey && !String(channel.api_key || "").trim()) {
+      return jsonError3("\u8D26\u53F7\u5BC6\u94A5\u4E3A\u7A7A\u65F6\uFF0C\u6240\u9009\u6E20\u9053\u5FC5\u987B\u914D\u7F6E\u9ED8\u8BA4\u5BC6\u94A5", 400);
     }
     const result = await db.createAccount(
-      body.name,
-      body.provider,
-      body.api_key,
-      body.group_id,
-      body.channel_id,
+      name,
+      provider,
+      apiKey,
+      groupId,
+      channelId,
       body.base_url,
-      body.priority || 0
+      Number(body.priority) || 0,
+      body.client_spoofing,
+      body.enabled === false || body.enabled === 0 ? 0 : 1
     );
     const account = await db.getAccount(result.lastRowId);
-    return new Response(JSON.stringify({ data: account }), {
+    return new Response(JSON.stringify({ data: maskAccount(account) }), {
       status: 201,
       headers: { "Content-Type": "application/json" }
     });
   }
   if (method === "PUT") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
-    const body = await request.json();
-    if (!id) {
-      return new Response(JSON.stringify({ error: "Invalid account ID" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    if (!id) return jsonError3("Invalid account ID", 400);
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return jsonError3("Invalid JSON body", 400);
     }
-    await db.updateAccount(id, body);
+    const existing = await db.getAccount(id);
+    if (!existing) return jsonError3("\u8D26\u53F7\u4E0D\u5B58\u5728", 404);
+    const updates = {};
+    if (body.name !== void 0) {
+      const name = String(body.name).trim();
+      if (!name) return jsonError3("\u8D26\u53F7\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A", 400);
+      updates.name = name;
+    }
+    if (body.provider !== void 0) {
+      if (!["openai", "anthropic", "xai"].includes(String(body.provider))) {
+        return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+      }
+      updates.provider = String(body.provider);
+    }
+    if (body.base_url !== void 0) updates.base_url = String(body.base_url || "").trim();
+    if (body.client_spoofing !== void 0) updates.client_spoofing = String(body.client_spoofing || "").trim();
+    if (body.priority !== void 0 && Number.isFinite(Number(body.priority))) updates.priority = Number(body.priority);
+    if (body.enabled !== void 0) updates.enabled = body.enabled === true || body.enabled === 1 ? 1 : 0;
+    if (typeof body.api_key === "string" && body.api_key.trim() && body.api_key.trim() !== "***") {
+      updates.api_key = body.api_key.trim();
+    }
+    if (body.group_id !== void 0) {
+      const groupId = Number(body.group_id);
+      if (!groupId || !await db.getGroup(groupId)) return jsonError3("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
+      updates.group_id = groupId;
+    }
+    if (body.channel_id !== void 0) {
+      const channelId = Number(body.channel_id);
+      const channel = channelId ? await db.getChannel(channelId) : null;
+      if (!channel) return jsonError3("\u6240\u9009\u6E20\u9053\u4E0D\u5B58\u5728", 400);
+      const provider = String(updates.provider ?? existing.provider);
+      if (channel.provider !== provider) {
+        return jsonError3(`\u6240\u9009\u6E20\u9053\u5C5E\u4E8E ${channel.provider}\uFF0C\u4E0E\u8D26\u53F7\u670D\u52A1\u5546 ${provider} \u4E0D\u4E00\u81F4`, 400);
+      }
+      updates.channel_id = channelId;
+    }
+    await db.updateAccount(id, updates);
     const account = await db.getAccount(id);
-    return new Response(JSON.stringify({ data: account }), {
+    return new Response(JSON.stringify({ data: maskAccount(account) }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
     });
@@ -1679,28 +2192,51 @@ async function handleAccountsRequest(request, env) {
       return new Response(JSON.stringify({ error: "Invalid account ID" }), { status: 400, headers: { "Content-Type": "application/json" } });
     }
     const account = await db.getAccount(id);
-    if (!account) {
-      return new Response(JSON.stringify({ error: "Account not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-    }
-    try {
-      const baseUrl = account.base_url || getDefaultBaseUrl(account.provider);
-      const testUrl = `${baseUrl}/v1/models`;
-      const response = await fetch(testUrl, {
-        headers: getAuthHeaders(account.provider, account.api_key)
+    if (!account) return jsonError3("\u8D26\u53F7\u4E0D\u5B58\u5728", 404);
+    const channel = await db.getChannel(account.channel_id);
+    const apiKey = String(account.api_key || "").trim() || String(channel?.api_key || "").trim();
+    if (!apiKey) {
+      return new Response(JSON.stringify({ success: false, message: "\u8D26\u53F7\u548C\u6E20\u9053\u90FD\u6CA1\u6709\u914D\u7F6E\u5BC6\u94A5" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
       });
+    }
+    const baseUrl = String(account.base_url || "").trim() || String(channel?.base_url || "").trim() || getDefaultBaseUrl(account.provider);
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15e3);
+      const isAnthropic = account.provider === "anthropic";
+      const testUrl = isAnthropic ? `${baseUrl.replace(/\/$/, "")}/v1/messages` : `${baseUrl.replace(/\/$/, "")}/v1/models`;
+      const response = await fetch(testUrl, {
+        method: isAnthropic ? "POST" : "GET",
+        headers: { ...getAuthHeaders(account.provider, apiKey), "content-type": "application/json" },
+        body: isAnthropic ? JSON.stringify({
+          model: "claude-3-5-haiku-20241022",
+          max_tokens: 1,
+          messages: [{ role: "user", content: "ping" }]
+        }) : void 0,
+        signal: controller.signal
+      }).finally(() => clearTimeout(timer));
+      let detail = "";
+      if (!response.ok) {
+        const raw = await response.text().catch(() => "");
+        try {
+          detail = JSON.parse(raw)?.error?.message || "";
+        } catch {
+          detail = raw.slice(0, 160);
+        }
+      }
       return new Response(JSON.stringify({
         success: response.ok,
         status: response.status,
-        message: response.ok ? "Connection successful" : "Connection failed"
+        message: response.ok ? `\u8FDE\u63A5\u6210\u529F\uFF08HTTP ${response.status}\uFF09` : `\u8FDE\u63A5\u5931\u8D25\uFF08HTTP ${response.status}\uFF09${detail ? `\uFF1A${detail}` : ""}`
       }), {
         status: 200,
         headers: { "Content-Type": "application/json" }
       });
     } catch (error) {
-      return new Response(JSON.stringify({
-        success: false,
-        message: error instanceof Error ? error.message : "Unknown error"
-      }), {
+      const message = error instanceof Error && error.name === "AbortError" ? "\u8FDE\u63A5\u8D85\u65F6\uFF0815 \u79D2\uFF09" : error instanceof Error ? error.message : "Unknown error";
+      return new Response(JSON.stringify({ success: false, message }), {
         status: 200,
         headers: { "Content-Type": "application/json" }
       });
@@ -1743,48 +2279,87 @@ async function handleModelsRequest(request, env) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
     }
     const token = authHeader.slice(7);
-    const session = await verifySessionToken(token, env.JWT_SECRET || "change-me-in-dashboard");
+    const session = await verifySessionToken(token, await resolveSessionSecret(db, env.JWT_SECRET));
     if (!session) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
     }
   }
   if (method === "GET") {
     const mappings = await db.listModelMappings();
-    return new Response(JSON.stringify({ data: mappings }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    return jsonData3(mappings);
   }
   if (method === "POST") {
-    const body = await request.json();
-    if (!body.requested_model || !body.provider || !body.upstream_model || !body.group_id) {
-      return new Response(JSON.stringify({ error: "Missing required fields" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return jsonError4("Invalid JSON body", 400);
+    }
+    const requestedModel = String(body.requested_model || "").trim();
+    const upstreamModel = String(body.upstream_model || "").trim();
+    const provider = String(body.provider || "").trim();
+    const groupId = Number(body.group_id);
+    if (!requestedModel || !upstreamModel) return jsonError4("\u8BF7\u586B\u5199\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u548C\u4E0A\u6E38\u6A21\u578B\u540D", 400);
+    if (!PROVIDERS2.includes(provider)) return jsonError4("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+    if (!groupId) return jsonError4("\u8BF7\u9009\u62E9\u76EE\u6807\u5206\u7EC4", 400);
+    if (!await db.getGroup(groupId)) return jsonError4("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
+    if (requestedModel.includes("*") && !requestedModel.endsWith("*")) {
+      return jsonError4("\u901A\u914D\u7B26\u53EA\u80FD\u653E\u5728\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u672B\u5C3E\uFF0C\u4F8B\u5982 gpt-4*", 400);
+    }
+    const duplicate = await db.findModelMappingByModel(requestedModel, provider);
+    if (duplicate) {
+      return jsonError4(`\u5DF2\u5B58\u5728 ${requestedModel} \u5230 ${provider} \u7684\u6620\u5C04\uFF0C\u8BF7\u5148\u7F16\u8F91\u6216\u5220\u9664\u539F\u89C4\u5219`, 409);
     }
     const result = await db.createModelMapping(
-      body.requested_model,
-      body.provider,
-      body.upstream_model,
-      body.group_id,
-      body.priority || 0
+      requestedModel,
+      provider,
+      upstreamModel,
+      groupId,
+      Number(body.priority) || 0,
+      body.enabled === false || body.enabled === 0 ? 0 : 1
     );
     const mapping = await db.getModelMapping(result.lastRowId);
-    return new Response(JSON.stringify({ data: mapping }), {
-      status: 201,
-      headers: { "Content-Type": "application/json" }
-    });
+    return jsonData3(mapping, 201);
   }
   if (method === "PUT") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
-    const body = await request.json();
-    if (!id) {
-      return new Response(JSON.stringify({ error: "Invalid mapping ID" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    if (!id) return jsonError4("Invalid mapping ID", 400);
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return jsonError4("Invalid JSON body", 400);
     }
-    await db.updateModelMapping(id, body);
+    if (!await db.getModelMapping(id)) return jsonError4("\u6A21\u578B\u6620\u5C04\u4E0D\u5B58\u5728", 404);
+    const updates = {};
+    if (body.requested_model !== void 0) {
+      const requestedModel = String(body.requested_model).trim();
+      if (!requestedModel) return jsonError4("\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u4E0D\u80FD\u4E3A\u7A7A", 400);
+      if (requestedModel.includes("*") && !requestedModel.endsWith("*")) {
+        return jsonError4("\u901A\u914D\u7B26\u53EA\u80FD\u653E\u5728\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u672B\u5C3E\uFF0C\u4F8B\u5982 gpt-4*", 400);
+      }
+      updates.requested_model = requestedModel;
+    }
+    if (body.upstream_model !== void 0) {
+      const upstreamModel = String(body.upstream_model).trim();
+      if (!upstreamModel) return jsonError4("\u4E0A\u6E38\u6A21\u578B\u540D\u4E0D\u80FD\u4E3A\u7A7A", 400);
+      updates.upstream_model = upstreamModel;
+    }
+    if (body.provider !== void 0) {
+      const provider = String(body.provider).trim();
+      if (!PROVIDERS2.includes(provider)) return jsonError4("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+      updates.provider = provider;
+    }
+    if (body.group_id !== void 0) {
+      const groupId = Number(body.group_id);
+      if (!groupId || !await db.getGroup(groupId)) return jsonError4("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
+      updates.group_id = groupId;
+    }
+    if (body.priority !== void 0) updates.priority = Number(body.priority) || 0;
+    if (body.enabled !== void 0) updates.enabled = body.enabled === true || body.enabled === 1 ? 1 : 0;
+    await db.updateModelMapping(id, updates);
     const mapping = await db.getModelMapping(id);
-    return new Response(JSON.stringify({ data: mapping }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
+    return jsonData3(mapping);
   }
   if (method === "DELETE") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
@@ -1797,7 +2372,15 @@ async function handleModelsRequest(request, env) {
       headers: { "Content-Type": "application/json" }
     });
   }
-  return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers: { "Content-Type": "application/json" } });
+  return jsonError4("Method not allowed", 405);
+}
+var PROVIDERS2 = ["openai", "anthropic", "xai"];
+var JSON_HEADERS4 = { "Content-Type": "application/json" };
+function jsonData3(data, status = 200) {
+  return new Response(JSON.stringify({ data }), { status, headers: JSON_HEADERS4 });
+}
+function jsonError4(message, status) {
+  return new Response(JSON.stringify({ error: message }), { status, headers: JSON_HEADERS4 });
 }
 
 // functions/_worker.ts
@@ -1824,8 +2407,14 @@ var worker_default = {
     }
     if (path === "/api/v1/auth/setup") {
       if (request.method === "POST") return handleSetup(request, env);
-      if (request.method === "GET") return json({ method: "POST", message: "Send username and password as JSON to initialize the administrator." });
+      if (request.method === "GET") return handleSetupStatus(env);
       return json({ error: "Method not allowed" }, 405);
+    }
+    if (path === "/api/v1/auth/password" && request.method === "POST") {
+      return handlePasswordChange(request, env);
+    }
+    if (path === "/api/v1/stats" && request.method === "GET") {
+      return handleStats(request, env);
     }
     if (path.startsWith("/api/v1/keys")) {
       return handleApiKeys(request, env);
@@ -1896,7 +2485,7 @@ async function handleLogin(request, env) {
   const db = createDatabase(env.DB);
   const session = await authenticateUser(db, body.username, body.password);
   if (!session) return json({ error: "Invalid credentials" }, 401);
-  const token = await createSessionToken(session, env.JWT_SECRET || "change-me-in-dashboard");
+  const token = await createSessionToken(session, await resolveSessionSecret(db, env.JWT_SECRET));
   return json({
     token,
     user: { id: session.userId, username: session.username, is_admin: session.isAdmin }
@@ -1904,7 +2493,6 @@ async function handleLogin(request, env) {
 }
 async function handleSetup(request, env) {
   const db = createDatabase(env.DB);
-  const existing = await db.queryOne("SELECT id, password_hash FROM users LIMIT 1");
   let body;
   try {
     body = await request.json();
@@ -1912,8 +2500,15 @@ async function handleSetup(request, env) {
     return json({ error: "Invalid JSON body" }, 400);
   }
   if (!body.username || !body.password || body.username.length > 128 || body.password.length < 8) {
-    return json({ error: "Username and password required" }, 400);
+    return json({ error: "\u8BF7\u586B\u5199\u7528\u6237\u540D\uFF0C\u5BC6\u7801\u81F3\u5C11 8 \u4F4D" }, 400);
   }
+  let created = false;
+  try {
+    created = await db.ensureSchema();
+  } catch (error) {
+    return json({ error: `\u6570\u636E\u5E93\u521D\u59CB\u5316\u5931\u8D25\uFF1A${error instanceof Error ? error.message : "\u672A\u77E5\u9519\u8BEF"}` }, 500);
+  }
+  const existing = await db.queryOne("SELECT id, password_hash FROM users LIMIT 1");
   const passwordHash = await hashPassword(body.password);
   if (existing && existing.password_hash.startsWith("$2a$")) {
     await db.update("UPDATE users SET username = ?, password_hash = ? WHERE id = ?", [body.username, passwordHash, existing.id]);
@@ -1922,7 +2517,49 @@ async function handleSetup(request, env) {
   } else {
     await db.createUser(body.username, passwordHash);
   }
-  return json({ success: true, message: "Admin user created" });
+  return json({ success: true, message: created ? "\u6570\u636E\u5E93\u5DF2\u521D\u59CB\u5316\uFF0C\u7BA1\u7406\u5458\u521B\u5EFA\u6210\u529F" : "\u7BA1\u7406\u5458\u521B\u5EFA\u6210\u529F", schema_created: created });
+}
+async function handleSetupStatus(env) {
+  const db = createDatabase(env.DB);
+  if (!await db.schemaReady()) {
+    return json({ data: { initialized: false, setup_available: true, schema_ready: false } });
+  }
+  const existing = await db.queryOne("SELECT id, password_hash FROM users LIMIT 1");
+  const claimable = !existing || existing.password_hash.startsWith("$2a$");
+  return json({ data: { initialized: Boolean(existing), setup_available: claimable, schema_ready: true } });
+}
+async function handlePasswordChange(request, env) {
+  const session = await checkAuth(request, env);
+  if (!session) return json({ error: "Unauthorized" }, 401);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+  if (!body.current_password || !body.new_password) {
+    return json({ error: "Current and new password are required" }, 400);
+  }
+  if (body.new_password.length < 8) {
+    return json({ error: "New password must be at least 8 characters" }, 400);
+  }
+  const db = createDatabase(env.DB);
+  const user = await db.getUserByUsername(session.username);
+  if (!user || !await verifyPassword(body.current_password, user.password_hash)) {
+    return json({ error: "Current password is incorrect" }, 401);
+  }
+  await db.update("UPDATE users SET password_hash = ? WHERE id = ?", [await hashPassword(body.new_password), user.id]);
+  return json({ success: true });
+}
+async function handleStats(request, env) {
+  const session = await checkAuth(request, env);
+  if (!session) return json({ error: "Unauthorized" }, 401);
+  const url = new URL(request.url);
+  const hours = Math.min(Math.max(parseInt(url.searchParams.get("hours") || "24", 10) || 24, 1), 720);
+  const bucket = url.searchParams.get("bucket") === "day" ? "day" : "hour";
+  const db = createDatabase(env.DB);
+  const stats = await db.getDashboardStats(hours, bucket);
+  return json({ data: { hours, bucket, ...stats } });
 }
 async function handleApiKeys(request, env) {
   const session = await checkAuth(request, env);
@@ -2001,7 +2638,8 @@ async function checkAuth(request, env) {
     return null;
   }
   const token = authHeader.slice(7);
-  const session = await verifySessionToken(token, env.JWT_SECRET || "change-me-in-dashboard");
+  const db = createDatabase(env.DB);
+  const session = await verifySessionToken(token, await resolveSessionSecret(db, env.JWT_SECRET));
   return session;
 }
 async function handleProviderModels(request, env) {

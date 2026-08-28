@@ -2,7 +2,7 @@
 // This file acts as the unified entry for all requests in Cloudflare Pages Functions
 
 import { createDatabase } from './src/db'
-import { verifySessionToken, hashApiKey, hashPassword, authenticateUser, authenticateApiKey, createSessionToken } from './src/auth'
+import { verifySessionToken, hashApiKey, hashPassword, verifyPassword, authenticateUser, authenticateApiKey, createSessionToken, resolveSessionSecret } from './src/auth'
 import type { Env } from './src/index'
 import { FailoverManager } from './src/failover'
 import { handleGatewayRequest } from './src/routes/gateway'
@@ -46,11 +46,22 @@ export default {
       return handleLogin(request, env)
     }
 
-    // Setup
+    // Setup. GET reports whether an administrator already exists so the login
+    // screen can offer initialization only on a fresh deployment.
     if (path === '/api/v1/auth/setup') {
       if (request.method === 'POST') return handleSetup(request, env)
-      if (request.method === 'GET') return json({ method: 'POST', message: 'Send username and password as JSON to initialize the administrator.' })
+      if (request.method === 'GET') return handleSetupStatus(env)
       return json({ error: 'Method not allowed' }, 405)
+    }
+
+    // Change the signed-in administrator password.
+    if (path === '/api/v1/auth/password' && request.method === 'POST') {
+      return handlePasswordChange(request, env)
+    }
+
+    // Aggregated dashboard metrics
+    if (path === '/api/v1/stats' && request.method === 'GET') {
+      return handleStats(request, env)
     }
 
     // API Key management
@@ -137,7 +148,7 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
   const db = createDatabase(env.DB)
   const session = await authenticateUser(db, body.username, body.password)
   if (!session) return json({ error: 'Invalid credentials' }, 401)
-  const token = await createSessionToken(session, env.JWT_SECRET || 'change-me-in-dashboard')
+  const token = await createSessionToken(session, await resolveSessionSecret(db, env.JWT_SECRET))
 
   return json({
     token,
@@ -147,14 +158,24 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
 
 async function handleSetup(request: Request, env: Env): Promise<Response> {
   const db = createDatabase(env.DB)
-  const existing = await db.queryOne<{ id: number; password_hash: string }>('SELECT id, password_hash FROM users LIMIT 1')
 
   let body: { username?: string; password?: string }
   try { body = await request.json() } catch { return json({ error: 'Invalid JSON body' }, 400) }
 
   if (!body.username || !body.password || body.username.length > 128 || body.password.length < 8) {
-    return json({ error: 'Username and password required' }, 400)
+    return json({ error: '请填写用户名，密码至少 8 位' }, 400)
   }
+
+  // Create the tables on first run so a fresh Pages deployment does not require
+  // shell access to apply schema.sql before the console can be used.
+  let created = false
+  try {
+    created = await db.ensureSchema()
+  } catch (error) {
+    return json({ error: `数据库初始化失败：${error instanceof Error ? error.message : '未知错误'}` }, 500)
+  }
+
+  const existing = await db.queryOne<{ id: number; password_hash: string }>('SELECT id, password_hash FROM users LIMIT 1')
 
   const passwordHash = await hashPassword(body.password)
   if (existing && existing.password_hash.startsWith('$2a$')) {
@@ -165,7 +186,60 @@ async function handleSetup(request: Request, env: Env): Promise<Response> {
     await db.createUser(body.username, passwordHash)
   }
 
-  return json({ success: true, message: 'Admin user created' })
+  return json({ success: true, message: created ? '数据库已初始化，管理员创建成功' : '管理员创建成功', schema_created: created })
+}
+
+async function handleSetupStatus(env: Env): Promise<Response> {
+  const db = createDatabase(env.DB)
+
+  // Before the tables exist, setup is what creates them, so report it as
+  // available rather than surfacing a database error on the login screen.
+  if (!(await db.schemaReady())) {
+    return json({ data: { initialized: false, setup_available: true, schema_ready: false } })
+  }
+
+  const existing = await db.queryOne<{ id: number; password_hash: string }>('SELECT id, password_hash FROM users LIMIT 1')
+  // A legacy bcrypt row is a placeholder that setup is still allowed to claim.
+  const claimable = !existing || existing.password_hash.startsWith('$2a$')
+  return json({ data: { initialized: Boolean(existing), setup_available: claimable, schema_ready: true } })
+}
+
+async function handlePasswordChange(request: Request, env: Env): Promise<Response> {
+  const session = await checkAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, 401)
+
+  let body: { current_password?: string; new_password?: string }
+  try { body = await request.json() } catch { return json({ error: 'Invalid JSON body' }, 400) }
+
+  if (!body.current_password || !body.new_password) {
+    return json({ error: 'Current and new password are required' }, 400)
+  }
+  if (body.new_password.length < 8) {
+    return json({ error: 'New password must be at least 8 characters' }, 400)
+  }
+
+  const db = createDatabase(env.DB)
+  const user = await db.getUserByUsername(session.username)
+  if (!user || !(await verifyPassword(body.current_password, user.password_hash))) {
+    return json({ error: 'Current password is incorrect' }, 401)
+  }
+
+  await db.update('UPDATE users SET password_hash = ? WHERE id = ?', [await hashPassword(body.new_password), user.id])
+  return json({ success: true })
+}
+
+async function handleStats(request: Request, env: Env): Promise<Response> {
+  const session = await checkAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, 401)
+
+  const url = new URL(request.url)
+  const hours = Math.min(Math.max(parseInt(url.searchParams.get('hours') || '24', 10) || 24, 1), 720)
+  const bucket = url.searchParams.get('bucket') === 'day' ? 'day' : 'hour'
+
+  const db = createDatabase(env.DB)
+  const stats = await db.getDashboardStats(hours, bucket)
+
+  return json({ data: { hours, bucket, ...stats } })
 }
 
 async function handleApiKeys(request: Request, env: Env): Promise<Response> {
@@ -253,7 +327,8 @@ async function checkAuth(request: Request, env: Env): Promise<any> {
   }
 
   const token = authHeader.slice(7)
-  const session = await verifySessionToken(token, env.JWT_SECRET || 'change-me-in-dashboard')
+  const db = createDatabase(env.DB)
+  const session = await verifySessionToken(token, await resolveSessionSecret(db, env.JWT_SECRET))
   return session
 }
 

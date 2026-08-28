@@ -3,7 +3,7 @@ import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { authenticateApiKey } from '../auth';
 import { FailoverManager } from '../failover';
-import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping } from '../utils/proxy';
+import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials } from '../utils/proxy';
 import { getModelFromHeader } from '../utils/headers';
 import { extractTokenUsage, calculateCost } from '../billing';
 import { Account, Channel, Group, ModelMapping } from '../types';
@@ -75,9 +75,10 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   const { account, channel, group } = selection;
   
   // Build upstream request
-  const baseUrl = getUpstreamBaseUrl(account.base_url, 'anthropic');
+  const credentials = resolveUpstreamCredentials(account, channel);
+  const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, 'anthropic');
   const upstreamUrl = `${baseUrl}/v1/messages?beta=true`;
-  const headers = buildUpstreamHeaders(request.headers, 'anthropic', account.api_key, account.base_url, account.client_spoofing);
+  const headers = buildUpstreamHeaders(request.headers, 'anthropic', credentials.apiKey, credentials.baseUrl, account.client_spoofing);
   
   const startTime = Date.now();
   
@@ -186,9 +187,10 @@ async function handleClaudeFailover(
     attempted.add(account.id);
     
     try {
-      const baseUrl = getUpstreamBaseUrl(account.base_url, 'anthropic');
+      const credentials = resolveUpstreamCredentials(account, channel);
+      const baseUrl = getUpstreamBaseUrl(credentials.baseUrl, 'anthropic');
       const upstreamUrl = `${baseUrl}/v1/messages?beta=true`;
-      const headers = buildUpstreamHeaders(request.headers, 'anthropic', account.api_key, account.base_url, account.client_spoofing);
+      const headers = buildUpstreamHeaders(request.headers, 'anthropic', credentials.apiKey, credentials.baseUrl, account.client_spoofing);
       const proxyResponse = await proxyRequest({
         url: upstreamUrl,
         method: request.method,

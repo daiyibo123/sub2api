@@ -1,6 +1,7 @@
 // D1 Database abstraction layer
 import type { Env } from './index';
 import type { UsageRecord, RequestLog } from './types';
+import { SCHEMA_STATEMENTS } from './schema';
 
 export class Database {
   constructor(private db: D1Database) {}
@@ -51,10 +52,32 @@ export class Database {
     return this.queryOne<any>('SELECT * FROM groups WHERE id = ?', [id]);
   }
 
-  async createGroup(name: string, description?: string, priority = 0) {
+  /**
+   * groups.name is UNIQUE. Look the name up first so a collision returns a
+   * readable message instead of a raw D1 constraint error.
+   */
+  async getGroupByName(name: string) {
+    return this.queryOne<any>('SELECT * FROM groups WHERE name = ?', [name]);
+  }
+
+  async createGroup(name: string, description?: string, priority = 0, options: {
+    enabled?: number;
+    error_threshold?: number;
+    error_count_threshold?: number;
+    window_seconds?: number;
+  } = {}) {
     return this.insert(
-      'INSERT INTO groups (name, description, priority) VALUES (?, ?, ?)',
-      [name, description || '', priority]
+      `INSERT INTO groups (name, description, priority, enabled, error_threshold, error_count_threshold, window_seconds)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        name,
+        description || '',
+        priority,
+        options.enabled ?? 1,
+        options.error_threshold ?? 0.5,
+        options.error_count_threshold ?? 5,
+        options.window_seconds ?? 300
+      ]
     );
   }
 
@@ -88,10 +111,15 @@ export class Database {
     return this.queryOne<any>('SELECT * FROM channels WHERE id = ?', [id]);
   }
 
-  async createChannel(name: string, provider: string, baseUrl?: string, apiKey?: string, priority = 0) {
+  /** channels.name is UNIQUE; pre-check so collisions get a readable message. */
+  async getChannelByName(name: string) {
+    return this.queryOne<any>('SELECT * FROM channels WHERE name = ?', [name]);
+  }
+
+  async createChannel(name: string, provider: string, baseUrl?: string, apiKey?: string, priority = 0, enabled = 1) {
     return this.insert(
-      'INSERT INTO channels (name, provider, base_url, api_key, priority) VALUES (?, ?, ?, ?, ?)',
-      [name, provider, baseUrl || '', apiKey || '', priority]
+      'INSERT INTO channels (name, provider, base_url, api_key, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)',
+      [name, provider, baseUrl || '', apiKey || '', priority, enabled]
     );
   }
 
@@ -130,10 +158,10 @@ export class Database {
     return this.queryOne<any>('SELECT * FROM accounts WHERE id = ?', [id]);
   }
 
-  async createAccount(name: string, provider: string, apiKey: string, groupId: number, channelId: number, baseUrl?: string, priority = 0, clientSpoofing?: string) {
+  async createAccount(name: string, provider: string, apiKey: string, groupId: number, channelId: number, baseUrl?: string, priority = 0, clientSpoofing?: string, enabled = 1) {
     return this.insert(
-      'INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [name, provider, apiKey, baseUrl || '', groupId, channelId, priority, clientSpoofing || '']
+      'INSERT INTO accounts (name, provider, api_key, base_url, group_id, channel_id, priority, client_spoofing, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [name, provider, apiKey, baseUrl || '', groupId, channelId, priority, clientSpoofing || '', enabled]
     );
   }
 
@@ -166,8 +194,79 @@ export class Database {
     return this.query<any>('SELECT * FROM accounts WHERE group_id = ? AND enabled = 1 ORDER BY priority ASC, id ASC', [groupId]);
   }
 
+  /**
+   * An account with a blank api_key falls back to its channel's key, so a
+   * channel can hold one shared credential for several accounts.
+   */
   async listEnabledAccounts() {
-    return this.query<any>('SELECT * FROM accounts WHERE enabled = 1 ORDER BY priority ASC, id ASC');
+    return this.query<any>(`
+      SELECT a.*, COALESCE(NULLIF(a.api_key, ''), c.api_key, '') AS api_key
+      FROM accounts a
+      LEFT JOIN channels c ON a.channel_id = c.id
+      WHERE a.enabled = 1
+      ORDER BY a.priority ASC, a.id ASC
+    `);
+  }
+
+  /** Dependants that would break if a group were removed. */
+  async countAccountsInGroup(groupId: number): Promise<number> {
+    const row = await this.queryOne<{ total: number }>(
+      'SELECT COUNT(*) AS total FROM accounts WHERE group_id = ?',
+      [groupId]
+    );
+    return Number(row?.total || 0);
+  }
+
+  async countModelMappingsForGroup(groupId: number): Promise<number> {
+    const row = await this.queryOne<{ total: number }>(
+      'SELECT COUNT(*) AS total FROM model_mappings WHERE group_id = ?',
+      [groupId]
+    );
+    return Number(row?.total || 0);
+  }
+
+  /**
+   * Count accounts that would be orphaned by switching a channel's provider.
+   * Scheduling requires channel.provider === account.provider, so such accounts
+   * would silently stop receiving traffic.
+   */
+  async countAccountsForChannelWithOtherProvider(channelId: number, nextProvider: string): Promise<number> {
+    const row = await this.queryOne<{ total: number }>(
+      'SELECT COUNT(*) AS total FROM accounts WHERE channel_id = ? AND provider != ?',
+      [channelId, nextProvider]
+    );
+    return Number(row?.total || 0);
+  }
+
+  /**
+   * Name lookups back friendly duplicate errors. Both groups and channels have
+   * a UNIQUE(name) constraint, which would otherwise surface as a raw D1 500.
+   */
+  async findGroupByName(name: string) {
+    return this.queryOne<any>('SELECT * FROM groups WHERE name = ?', [name]);
+  }
+
+  async findChannelByName(name: string) {
+    return this.queryOne<any>('SELECT * FROM channels WHERE name = ?', [name]);
+  }
+
+  /** Accounts still pointing at a channel, used to block unsafe deletes. */
+  async countAccountsForChannel(channelId: number): Promise<number> {
+    const row = await this.queryOne<{ total: number }>(
+      'SELECT COUNT(*) AS total FROM accounts WHERE channel_id = ?',
+      [channelId]
+    );
+    return Number(row?.total || 0);
+  }
+
+  /** Resolve an account with the channel key fallback applied. */
+  async getAccountWithKey(id: number) {
+    return this.queryOne<any>(`
+      SELECT a.*, COALESCE(NULLIF(a.api_key, ''), c.api_key, '') AS api_key
+      FROM accounts a
+      LEFT JOIN channels c ON a.channel_id = c.id
+      WHERE a.id = ?
+    `, [id]);
   }
 
   // Model mapping operations
@@ -179,10 +278,22 @@ export class Database {
     return this.queryOne<any>('SELECT * FROM model_mappings WHERE id = ?', [id]);
   }
 
-  async createModelMapping(requestedModel: string, provider: string, upstreamModel: string, groupId: number, priority = 0) {
+  /**
+   * findModelMapping resolves a single rule per (client model, provider) pair,
+   * so a second identical pair would never be reachable. Surface it as a
+   * conflict instead of silently storing dead configuration.
+   */
+  async findModelMappingByModel(requestedModel: string, provider: string) {
+    return this.queryOne<any>(
+      'SELECT * FROM model_mappings WHERE requested_model = ? AND provider = ?',
+      [requestedModel, provider]
+    );
+  }
+
+  async createModelMapping(requestedModel: string, provider: string, upstreamModel: string, groupId: number, priority = 0, enabled = 1) {
     return this.insert(
-      'INSERT INTO model_mappings (requested_model, provider, upstream_model, group_id, priority) VALUES (?, ?, ?, ?, ?)',
-      [requestedModel, provider, upstreamModel, groupId, priority]
+      'INSERT INTO model_mappings (requested_model, provider, upstream_model, group_id, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)',
+      [requestedModel, provider, upstreamModel, groupId, priority, enabled]
     );
   }
 
@@ -316,6 +427,135 @@ export class Database {
       [channelId, cutoff]
     );
     return result || { total_requests: 0, error_count: 0 };
+  }
+
+  /**
+   * Dashboard aggregates computed in D1 rather than by paging every row into
+   * the browser, so the numbers stay correct beyond the usage page limit.
+   */
+  async getDashboardStats(windowHours = 24, bucket: 'hour' | 'day' = 'hour') {
+    const since = sqliteTimestamp(Date.now() - windowHours * 60 * 60 * 1000);
+    const bucketFormat = bucket === 'day' ? '%Y-%m-%d' : '%Y-%m-%d %H:00';
+    const todayStart = sqliteTimestamp(new Date().setHours(0, 0, 0, 0));
+
+    const [totals, today, resources] = await Promise.all([
+      this.queryOne<any>(`
+        SELECT
+          COUNT(*) AS total_requests,
+          SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END) AS success_requests,
+          COALESCE(SUM(total_tokens), 0) AS total_tokens,
+          COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+          COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+          COALESCE(SUM(cost), 0) AS total_cost,
+          COALESCE(AVG(NULLIF(latency_ms, 0)), 0) AS avg_latency
+        FROM usage_records
+      `),
+      this.queryOne<any>(`
+        SELECT
+          COUNT(*) AS today_requests,
+          COALESCE(SUM(total_tokens), 0) AS today_tokens,
+          COALESCE(SUM(cost), 0) AS today_cost
+        FROM usage_records WHERE created_at >= ?
+      `, [todayStart]),
+      this.queryOne<any>(`
+        SELECT
+          (SELECT COUNT(*) FROM accounts) AS total_accounts,
+          (SELECT COUNT(*) FROM accounts WHERE enabled = 1) AS active_accounts,
+          (SELECT COUNT(*) FROM api_keys) AS total_keys,
+          (SELECT COUNT(*) FROM api_keys WHERE enabled = 1) AS active_keys,
+          (SELECT COUNT(*) FROM channels) AS total_channels,
+          (SELECT COUNT(*) FROM channels WHERE enabled = 1) AS active_channels,
+          (SELECT COUNT(*) FROM groups) AS total_groups,
+          (SELECT COUNT(*) FROM groups WHERE enabled = 1) AS active_groups,
+          (SELECT COUNT(*) FROM model_mappings) AS total_models,
+          (SELECT COUNT(*) FROM model_mappings WHERE enabled = 1) AS active_models
+      `)
+    ]);
+
+    // Hourly buckets drive the trend chart; model rows drive the doughnut.
+    const [trend, byModel, byProvider] = await Promise.all([
+      this.query<any>(`
+        SELECT
+          strftime('${bucketFormat}', created_at) AS bucket,
+          COUNT(*) AS requests,
+          SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
+          COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+          COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+          COALESCE(SUM(cost), 0) AS cost
+        FROM usage_records WHERE created_at >= ?
+        GROUP BY bucket ORDER BY bucket ASC
+      `, [since]),
+      this.query<any>(`
+        SELECT model, COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens, COALESCE(SUM(cost), 0) AS cost
+        FROM usage_records GROUP BY model ORDER BY requests DESC LIMIT 12
+      `),
+      this.query<any>(`
+        SELECT provider, COUNT(*) AS requests, COALESCE(SUM(cost), 0) AS cost
+        FROM usage_records GROUP BY provider ORDER BY requests DESC
+      `)
+    ]);
+
+    return { totals: totals || {}, today: today || {}, resources: resources || {}, trend, byModel, byProvider };
+  }
+
+  /**
+   * Apply the schema when tables are missing. Pages deployments often have no
+   * access to `wrangler d1 execute`, so first run would otherwise fail with a
+   * raw "no such table" error. Every statement is idempotent.
+   */
+  async ensureSchema(): Promise<boolean> {
+    const wasReady = await this.schemaReady();
+    // Every statement is `IF NOT EXISTS`, so this runs unconditionally: a
+    // database created by an older release is missing later tables, and
+    // skipping when the original tables exist would leave those gaps forever.
+    for (const statement of SCHEMA_STATEMENTS) {
+      await this.db.prepare(statement).run();
+    }
+    return !wasReady;
+  }
+
+  /** Read a persisted setting, or null when it has never been written. */
+  async getSetting(key: string): Promise<string | null> {
+    try {
+      const row = await this.queryOne<{ value: string }>('SELECT value FROM settings WHERE key = ?', [key]);
+      return row?.value ?? null;
+    } catch {
+      // The settings table may not exist yet on a pre-migration database.
+      return null;
+    }
+  }
+
+  async setSetting(key: string, value: string): Promise<void> {
+    await this.update(
+      `INSERT INTO settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+      [key, value]
+    );
+  }
+
+  /**
+   * Store a value only if the key is unset, then return whatever is stored.
+   *
+   * Concurrent isolates can each generate a candidate session secret. Keeping
+   * the first writer's value means tokens issued by one isolate still verify in
+   * another, instead of logging users out at random.
+   */
+  async setSettingIfAbsent(key: string, value: string): Promise<string> {
+    await this.update('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', [key, value]);
+    const row = await this.queryOne<{ value: string }>('SELECT value FROM settings WHERE key = ?', [key]);
+    return row?.value ?? value;
+  }
+
+  /** Cheap probe used to decide whether migration is needed. */
+  async schemaReady(): Promise<boolean> {
+    try {
+      const row = await this.queryOne<{ total: number }>(
+        "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','channels','accounts','model_mappings','api_keys','usage_records','request_logs')"
+      );
+      return Number(row?.total || 0) >= 8;
+    } catch {
+      return false;
+    }
   }
 
   // Cleanup old logs

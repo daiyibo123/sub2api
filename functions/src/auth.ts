@@ -110,6 +110,25 @@ export async function verifySessionToken(token: string, secret: string): Promise
   }
 }
 
+/**
+ * Resolve the token signing secret.
+ *
+ * A hardcoded fallback would be published in this repository, letting anyone
+ * forge an admin token against a deployment that forgot to set JWT_SECRET. So
+ * prefer the configured secret and otherwise persist a generated random one in
+ * D1, which keeps sessions valid across isolates and redeploys.
+ */
+export async function resolveSessionSecret(db: Database, configured?: string): Promise<string> {
+  const explicit = String(configured || '').trim();
+  if (explicit) return explicit;
+
+  const stored = await db.getSetting('session_secret');
+  if (stored) return stored;
+
+  const generated = toHex(crypto.getRandomValues(new Uint8Array(32)));
+  return db.setSettingIfAbsent('session_secret', generated);
+}
+
 export async function hashApiKey(apiKey: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(apiKey));
   return toHex(digest);

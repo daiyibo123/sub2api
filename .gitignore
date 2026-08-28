@@ -119,6 +119,9 @@ backend/.installed
 tests
 !deploy/tests/
 !deploy/tests/**
+# This gateway keeps its own gateway tests at the repo root.
+!/tests/
+!/tests/**
 CLAUDE.md
 .claude
 scripts
@@ -158,3 +161,6 @@ output/
 .vite/
 # 本地闭源插件开发目录及构建产物不进入 Sub2API 仓库
 /plugins/
+
+# Python bytecode from tests/
+__pycache__/
