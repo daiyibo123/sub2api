@@ -32,7 +32,7 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
   }
   
   // POST /api/v1/accounts - create account
-  if (method === 'POST') {
+  if (method === 'POST' && !url.pathname.endsWith('/test')) {
     const body = await request.json<{ name: string; provider: string; api_key: string; group_id: number; channel_id: number; base_url?: string; priority?: number }>();
     
     if (!body.name || !body.provider || !body.api_key || !body.group_id || !body.channel_id) {

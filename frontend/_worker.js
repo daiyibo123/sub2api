@@ -1545,7 +1545,7 @@ async function handleAccountsRequest(request, env) {
       headers: { "Content-Type": "application/json" }
     });
   }
-  if (method === "POST") {
+  if (method === "POST" && !url.pathname.endsWith("/test")) {
     const body = await request.json();
     if (!body.name || !body.provider || !body.api_key || !body.group_id || !body.channel_id) {
       return new Response(JSON.stringify({ error: "Missing required fields" }), { status: 400, headers: { "Content-Type": "application/json" } });
