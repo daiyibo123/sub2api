@@ -3,7 +3,7 @@ import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { authenticateApiKey } from '../auth';
 import { FailoverManager } from '../failover';
-import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl } from '../utils/proxy';
+import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping } from '../utils/proxy';
 import { getModelFromHeader } from '../utils/headers';
 import { extractTokenUsage, calculateCost } from '../billing';
 import { Account, Channel, Group, ModelMapping } from '../types';
@@ -56,20 +56,18 @@ export async function handleGrokRequest(request: Request, env: Env, failover: Fa
   const mappings = mappingsRaw;
   
   // Apply model mapping
-  let upstreamModel = model;
-  for (const mapping of mappings) {
-    if (mapping.enabled && mapping.requested_model === model && mapping.provider === 'xai') {
-      upstreamModel = mapping.upstream_model;
-      break;
-    }
-  }
+  const mapping = findModelMapping(model, mappings, 'xai');
+  let upstreamModel = mapping?.requested_model.endsWith('*')
+    ? mapping.upstream_model + model.slice(mapping.requested_model.length - 1)
+    : (mapping?.upstream_model || model);
+  const preferredGroupId = mapping?.group_id || undefined;
   
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
   
   // Select account with failover
-  const selection = failover.selectAccount(accounts, channels, groups);
+  const selection = await failover.selectAccount(accounts, channels, groups, preferredGroupId);
   if (!selection) {
     return new Response(JSON.stringify({ error: 'No available accounts' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
   }
@@ -100,7 +98,8 @@ export async function handleGrokRequest(request: Request, env: Env, failover: Fa
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => '');
       failover.recordRequest(account.id, channel.id, group.id, true);
-      return handleGrokFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }).catch(() => {});
+      return handleGrokFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId);
     }
     if (stream && proxyResponse.body) {
       failover.recordRequest(account.id, channel.id, group.id, isError);
@@ -150,9 +149,10 @@ export async function handleGrokRequest(request: Request, env: Env, failover: Fa
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     failover.recordRequest(account.id, channel.id, group.id, true);
+    db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {});
     
     // Try failover
-    return handleGrokFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, errorMessage);
+    return handleGrokFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId);
   }
 }
 
@@ -169,7 +169,8 @@ async function handleGrokFailover(
   mappings: ModelMapping[],
   upstreamModel: string,
   stream: boolean,
-  errorMessage: string
+  errorMessage: string,
+  preferredGroupId?: number
 ): Promise<Response> {
   const db = createDatabase(env.DB);
   
@@ -177,7 +178,7 @@ async function handleGrokFailover(
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
     const nextAccounts = accounts.filter(a => a.enabled && !attempted.has(a.id));
-    const selection = failover.selectAccount(nextAccounts, channels, groups);
+    const selection = await failover.selectAccount(nextAccounts, channels, groups, preferredGroupId);
     
     if (!selection) break;
     
@@ -200,7 +201,6 @@ async function handleGrokFailover(
         })
       });
       
-      const responseText = await proxyResponse.text();
       const isError = proxyResponse.status >= 400;
       if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
         failover.recordRequest(account.id, channel.id, group.id, true);
@@ -217,6 +217,14 @@ async function handleGrokFailover(
         error_message: isError ? errorMessage : '',
         latency_ms: 0
       }).catch(() => {});
+
+      if (stream && !isError && proxyResponse.body) {
+        return new Response(proxyResponse.body, {
+          status: proxyResponse.status,
+          headers: { ...proxyResponse.headers, 'content-type': proxyResponse.headers['content-type'] || 'text/event-stream' }
+        });
+      }
+      const responseText = await proxyResponse.text();
       
       return new Response(responseText, {
         status: proxyResponse.status,
@@ -225,6 +233,7 @@ async function handleGrokFailover(
       
     } catch (retryError) {
       failover.recordRequest(account.id, channel.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : 'Upstream request failed', latency_ms: 0 }).catch(() => {});
       continue;
     }
   }

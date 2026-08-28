@@ -345,7 +345,7 @@ var Database = class {
     );
   }
   async getAccountErrorStats(accountId, windowSeconds) {
-    const cutoff = new Date(Date.now() - windowSeconds * 1e3).toISOString();
+    const cutoff = sqliteTimestamp(Date.now() - windowSeconds * 1e3);
     const result = await this.queryOne(
       `SELECT 
         COUNT(*) as total_requests,
@@ -357,7 +357,7 @@ var Database = class {
     return result || { total_requests: 0, error_count: 0 };
   }
   async getChannelErrorStats(channelId, windowSeconds) {
-    const cutoff = new Date(Date.now() - windowSeconds * 1e3).toISOString();
+    const cutoff = sqliteTimestamp(Date.now() - windowSeconds * 1e3);
     const result = await this.queryOne(
       `SELECT 
         COUNT(*) as total_requests,
@@ -370,11 +370,14 @@ var Database = class {
   }
   // Cleanup old logs
   async cleanupOldLogs(days = 7) {
-    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1e3).toISOString();
+    const cutoff = sqliteTimestamp(Date.now() - days * 24 * 60 * 60 * 1e3);
     await this.exec(`DELETE FROM request_logs WHERE created_at < '${cutoff}'`);
     await this.exec(`DELETE FROM usage_records WHERE created_at < '${cutoff}'`);
   }
 };
+function sqliteTimestamp(timestamp) {
+  return new Date(timestamp).toISOString().slice(0, 19).replace("T", " ");
+}
 function createDatabase(db) {
   return new Database(db);
 }
@@ -482,12 +485,18 @@ var FailoverManager = class {
   windowMs;
   errorRateThreshold;
   errorCountThreshold;
+  db;
+  lastUsed = /* @__PURE__ */ new Map();
   constructor(env) {
-    this.windowMs = parseInt(env.WINDOW_SECONDS || "300") * 1e3;
-    this.errorRateThreshold = parseFloat(env.ERROR_RATE_THRESHOLD || "0.5");
-    this.errorCountThreshold = parseInt(env.ERROR_COUNT_THRESHOLD || "5");
+    const windowSeconds = Number(env.WINDOW_SECONDS);
+    const errorRateThreshold = Number(env.ERROR_RATE_THRESHOLD);
+    const errorCountThreshold = Number(env.ERROR_COUNT_THRESHOLD);
+    this.windowMs = (Number.isFinite(windowSeconds) && windowSeconds > 0 ? windowSeconds : 300) * 1e3;
+    this.errorRateThreshold = Number.isFinite(errorRateThreshold) ? Math.min(Math.max(errorRateThreshold, 0), 1) : 0.5;
+    this.errorCountThreshold = Number.isFinite(errorCountThreshold) && errorCountThreshold > 0 ? Math.floor(errorCountThreshold) : 5;
   }
-  setDb(_db) {
+  setDb(db) {
+    this.db = db;
   }
   // Record request result for error tracking
   recordRequest(accountId, channelId, groupId, isError) {
@@ -513,7 +522,7 @@ var FailoverManager = class {
     window.errors.push(isError ? 1 : 0);
   }
   // Get error stats for an account
-  getErrorStats(accountId) {
+  getMemoryErrorStats(accountId, group) {
     const window = this.errorWindows.get(accountId);
     if (!window) {
       return {
@@ -530,6 +539,8 @@ var FailoverManager = class {
     const totalRequests = window.timestamps.length;
     const errorCount = window.errors.reduce((sum, err) => sum + err, 0);
     const errorRate = totalRequests > 0 ? errorCount / totalRequests : 0;
+    const errorRateThreshold = group?.error_threshold ?? this.errorRateThreshold;
+    const errorCountThreshold = group?.error_count_threshold ?? this.errorCountThreshold;
     return {
       accountId,
       channelId: window.channelId,
@@ -538,39 +549,79 @@ var FailoverManager = class {
       totalRequests,
       errorCount,
       errorRate,
-      isUnhealthy: errorRate > this.errorRateThreshold || errorCount >= this.errorCountThreshold
+      isUnhealthy: errorRate > errorRateThreshold || errorCount >= errorCountThreshold
     };
   }
+  async getErrorStats(accountId, group) {
+    const windowSeconds = Math.max(1, Number(group?.window_seconds) || this.windowMs / 1e3);
+    if (this.db) {
+      try {
+        const persisted = await this.db.getAccountErrorStats(accountId, windowSeconds);
+        const totalRequests = Number(persisted.total_requests || 0);
+        const errorCount = Number(persisted.error_count || 0);
+        const errorRate = totalRequests > 0 ? errorCount / totalRequests : 0;
+        return {
+          accountId,
+          channelId: 0,
+          groupId: group?.id ?? 0,
+          windowStart: Date.now() - windowSeconds * 1e3,
+          totalRequests,
+          errorCount,
+          errorRate,
+          isUnhealthy: errorRate > (group?.error_threshold ?? this.errorRateThreshold) || errorCount >= (group?.error_count_threshold ?? this.errorCountThreshold)
+        };
+      } catch {
+      }
+    }
+    return this.getMemoryErrorStats(accountId, group);
+  }
   // Select best account from available accounts
-  selectAccount(accounts, channels, groups) {
+  async selectAccount(accounts, channels, groups, preferredGroupId) {
     if (accounts.length === 0) return null;
     const usableAccounts = accounts.filter((acc) => {
       const channel2 = channels.get(acc.channel_id);
       const group2 = groups.get(acc.group_id);
-      return acc.enabled === 1 && Boolean(channel2 && group2 && channel2.enabled === 1 && group2.enabled === 1);
+      return acc.enabled === 1 && Boolean(channel2 && group2 && channel2.enabled === 1 && group2.enabled === 1) && channel2?.provider === acc.provider;
     });
     if (usableAccounts.length === 0) return null;
-    let healthyAccounts = usableAccounts.filter((acc) => {
-      const stats = this.getErrorStats(acc.id);
+    const preferred = preferredGroupId ? usableAccounts.filter((acc) => acc.group_id === preferredGroupId) : [];
+    const candidateAccounts = preferred.length > 0 ? preferred : usableAccounts;
+    const statsByAccount = new Map(
+      await Promise.all(candidateAccounts.map(async (acc) => [
+        acc.id,
+        await this.getErrorStats(acc.id, groups.get(acc.group_id))
+      ]))
+    );
+    let healthyAccounts = candidateAccounts.filter((acc) => {
+      const stats = statsByAccount.get(acc.id);
       return !stats.isUnhealthy;
     });
     if (healthyAccounts.length === 0) {
-      healthyAccounts = [...usableAccounts].sort((a, b) => {
-        const statsA = this.getErrorStats(a.id);
-        const statsB = this.getErrorStats(b.id);
+      healthyAccounts = [...candidateAccounts].sort((a, b) => {
+        const statsA = statsByAccount.get(a.id);
+        const statsB = statsByAccount.get(b.id);
         return statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount;
       });
     }
-    healthyAccounts.sort((a, b) => a.priority - b.priority);
+    healthyAccounts.sort((a, b) => {
+      const groupA = groups.get(a.group_id);
+      const groupB = groups.get(b.group_id);
+      const channelA = channels.get(a.channel_id);
+      const channelB = channels.get(b.channel_id);
+      const statsA = statsByAccount.get(a.id);
+      const statsB = statsByAccount.get(b.id);
+      return groupA.priority - groupB.priority || channelA.priority - channelB.priority || a.priority - b.priority || statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount || (this.lastUsed.get(a.id) ?? 0) - (this.lastUsed.get(b.id) ?? 0) || a.id - b.id;
+    });
     const selected = healthyAccounts[0];
     const channel = channels.get(selected.channel_id);
     const group = groups.get(selected.group_id);
     if (!channel || !group) return null;
+    this.lastUsed.set(selected.id, Date.now());
     return {
       account: selected,
       channel,
       group,
-      stats: this.getErrorStats(selected.id)
+      stats: statsByAccount.get(selected.id) ?? null
     };
   }
   // Check if error should trigger failover
@@ -722,21 +773,14 @@ function getUpstreamBaseUrl(baseUrl, provider) {
       return "https://api.openai.com";
   }
 }
-function mapModel(requestedModel, mappings) {
-  for (const mapping of mappings) {
-    if (mapping.enabled && mapping.requested_model === requestedModel) {
-      return mapping.upstream_model;
-    }
-  }
-  for (const mapping of mappings) {
-    if (mapping.enabled && mapping.requested_model.endsWith("*")) {
-      const prefix = mapping.requested_model.slice(0, -1);
-      if (requestedModel.startsWith(prefix)) {
-        return mapping.upstream_model + requestedModel.slice(prefix.length);
-      }
-    }
-  }
-  return requestedModel;
+function findModelMapping(requestedModel, mappings, provider) {
+  const enabled = mappings.filter((mapping) => mapping.enabled && (!provider || mapping.provider === provider)).sort((a, b) => a.priority - b.priority || a.id - b.id);
+  const exact = enabled.find((mapping) => mapping.requested_model === requestedModel);
+  if (exact) return exact;
+  return enabled.find((mapping) => {
+    if (!mapping.requested_model.endsWith("*")) return false;
+    return requestedModel.startsWith(mapping.requested_model.slice(0, -1));
+  }) || null;
 }
 
 // functions/src/billing.ts
@@ -833,10 +877,6 @@ async function handleGatewayRequest(request, env, failover) {
     provider = "openai";
   }
   let accounts = await db.listEnabledAccounts();
-  accounts = accounts.filter((a) => a.provider === provider && a.enabled);
-  if (accounts.length === 0) {
-    return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
-  }
   const [channelsRaw, groupsRaw, mappingsRaw] = await Promise.all([
     db.listChannels(),
     db.listGroups(),
@@ -845,8 +885,16 @@ async function handleGatewayRequest(request, env, failover) {
   const channels = new Map(channelsRaw.map((c) => [c.id, c]));
   const groups = new Map(groupsRaw.map((g) => [g.id, g]));
   const mappings = mappingsRaw;
-  let upstreamModel = mapModel(model, mappings);
-  const selection = failover.selectAccount(accounts, channels, groups);
+  const mapping = findModelMapping(model, mappings);
+  if (mapping?.provider) provider = mapping.provider;
+  accounts = accounts.filter((a) => a.provider === provider && a.enabled);
+  if (accounts.length === 0) {
+    return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
+  }
+  const providerMapping = mapping && mapping.provider === provider ? mapping : findModelMapping(model, mappings, provider);
+  let upstreamModel = providerMapping?.requested_model.endsWith("*") ? providerMapping.upstream_model + model.slice(providerMapping.requested_model.length - 1) : providerMapping?.upstream_model || model;
+  const preferredGroupId = providerMapping?.group_id || void 0;
+  const selection = await failover.selectAccount(accounts, channels, groups, preferredGroupId);
   if (!selection) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
@@ -891,7 +939,9 @@ async function handleGatewayRequest(request, env, failover) {
     if (isError && failover.shouldFailover({ status: responseStatus }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, channel.id, group.id, true);
-      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }).catch(() => {
+      });
+      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`, preferredGroupId);
     }
     if (stream && proxyResponse.body) {
       failover.recordRequest(account.id, channel.id, group.id, isError);
@@ -941,16 +991,18 @@ async function handleGatewayRequest(request, env, failover) {
     errorMessage = error instanceof Error ? error.message : "Unknown error";
     responseStatus = 502;
     failover.recordRequest(account.id, channel.id, group.id, true);
-    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, errorMessage);
+    db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {
+    });
+    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId);
   }
 }
-async function handleFailover(body, request, env, failover, keyRecord, accounts, channels, groups, mappings, provider, upstreamModel, stream, errorMessage) {
+async function handleFailover(body, request, env, failover, keyRecord, accounts, channels, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId) {
   const db = createDatabase(env.DB);
   const attempted = /* @__PURE__ */ new Set();
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
     const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
-    const selection = failover.selectAccount(nextAccounts, channels, groups);
+    const selection = await failover.selectAccount(nextAccounts, channels, groups, preferredGroupId);
     if (!selection) {
       break;
     }
@@ -979,7 +1031,6 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
           }
         })
       });
-      const responseText = await proxyResponse.text();
       const isError = proxyResponse.status >= 400;
       if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
         failover.recordRequest(account.id, channel.id, group.id, true);
@@ -996,12 +1047,21 @@ async function handleFailover(body, request, env, failover, keyRecord, accounts,
         latency_ms: 0
       }).catch(() => {
       });
+      if (stream && !isError && proxyResponse.body) {
+        return new Response(proxyResponse.body, {
+          status: proxyResponse.status,
+          headers: { ...proxyResponse.headers, "content-type": proxyResponse.headers["content-type"] || "text/event-stream" }
+        });
+      }
+      const responseText = await proxyResponse.text();
       return new Response(responseText, {
         status: proxyResponse.status,
         headers: { ...proxyResponse.headers, "content-type": "application/json" }
       });
     } catch (retryError) {
       failover.recordRequest(account.id, channel.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }).catch(() => {
+      });
       continue;
     }
   }
@@ -1070,17 +1130,20 @@ async function handleOpenAIRequest(request, env, failover) {
   const channels = new Map(channelsRaw.map((c) => [c.id, c]));
   const groups = new Map(groupsRaw.map((g) => [g.id, g]));
   const mappings = mappingsRaw;
-  let upstreamModel = model;
-  for (const mapping of mappings) {
-    if (mapping.enabled && mapping.requested_model === model && (mapping.provider === "openai" || mapping.provider === "xai")) {
-      upstreamModel = mapping.upstream_model;
-      break;
-    }
+  const mapping = findModelMapping(model, mappings, "openai") || findModelMapping(model, mappings, "xai");
+  const requestedProvider = mapping?.provider || (model.toLowerCase().startsWith("grok-") ? "xai" : void 0);
+  if (requestedProvider) {
+    accounts = accounts.filter((account2) => account2.provider === requestedProvider);
   }
+  if (accounts.length === 0) {
+    return new Response(JSON.stringify({ error: "No available accounts for requested model" }), { status: 503, headers: { "Content-Type": "application/json" } });
+  }
+  let upstreamModel = mapping?.requested_model.endsWith("*") ? mapping.upstream_model + model.slice(mapping.requested_model.length - 1) : mapping?.upstream_model || model;
+  const preferredGroupId = mapping?.group_id || void 0;
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
-  const selection = failover.selectAccount(accounts, channels, groups);
+  const selection = await failover.selectAccount(accounts, channels, groups, preferredGroupId);
   if (!selection) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
@@ -1106,7 +1169,9 @@ async function handleOpenAIRequest(request, env, failover) {
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, channel.id, group.id, true);
-      return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }).catch(() => {
+      });
+      return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId);
     }
     if (stream && proxyResponse.body) {
       failover.recordRequest(account.id, channel.id, group.id, isError);
@@ -1149,10 +1214,12 @@ async function handleOpenAIRequest(request, env, failover) {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     failover.recordRequest(account.id, channel.id, group.id, true);
-    return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, errorMessage);
+    db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {
+    });
+    return handleFailover2(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId);
   }
 }
-async function handleFailover2(body, request, env, failover, keyRecord, accounts, channels, groups, mappings, provider, upstreamModel, stream, errorMessage) {
+async function handleFailover2(body, request, env, failover, keyRecord, accounts, channels, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId) {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   const isResponses = url.pathname.includes("/responses");
@@ -1162,7 +1229,7 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
     const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
-    const selection = failover.selectAccount(nextAccounts, channels, groups);
+    const selection = await failover.selectAccount(nextAccounts, channels, groups, preferredGroupId);
     if (!selection) break;
     const { account, channel, group } = selection;
     attempted.add(account.id);
@@ -1182,7 +1249,6 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
           }
         })
       });
-      const responseText = await proxyResponse.text();
       const isError = proxyResponse.status >= 400;
       if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
         failover.recordRequest(account.id, channel.id, group.id, true);
@@ -1199,12 +1265,21 @@ async function handleFailover2(body, request, env, failover, keyRecord, accounts
         latency_ms: 0
       }).catch(() => {
       });
+      if (stream && !isError && proxyResponse.body) {
+        return new Response(proxyResponse.body, {
+          status: proxyResponse.status,
+          headers: { ...proxyResponse.headers, "content-type": proxyResponse.headers["content-type"] || "text/event-stream" }
+        });
+      }
+      const responseText = await proxyResponse.text();
       return new Response(responseText, {
         status: proxyResponse.status,
         headers: { ...proxyResponse.headers, "content-type": "application/json" }
       });
     } catch (retryError) {
       failover.recordRequest(account.id, channel.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }).catch(() => {
+      });
       continue;
     }
   }
@@ -1246,17 +1321,13 @@ async function handleClaudeRequest(request, env, failover) {
   const channels = new Map(channelsRaw.map((c) => [c.id, c]));
   const groups = new Map(groupsRaw.map((g) => [g.id, g]));
   const mappings = mappingsRaw;
-  let upstreamModel = model;
-  for (const mapping of mappings) {
-    if (mapping.enabled && mapping.requested_model === model && mapping.provider === "anthropic") {
-      upstreamModel = mapping.upstream_model;
-      break;
-    }
-  }
+  const mapping = findModelMapping(model, mappings, "anthropic");
+  let upstreamModel = mapping?.requested_model.endsWith("*") ? mapping.upstream_model + model.slice(mapping.requested_model.length - 1) : mapping?.upstream_model || model;
+  const preferredGroupId = mapping?.group_id || void 0;
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
-  const selection = failover.selectAccount(accounts, channels, groups);
+  const selection = await failover.selectAccount(accounts, channels, groups, preferredGroupId);
   if (!selection) {
     return new Response(JSON.stringify({ error: "No available accounts" }), { status: 503, headers: { "Content-Type": "application/json" } });
   }
@@ -1281,7 +1352,9 @@ async function handleClaudeRequest(request, env, failover) {
     if (isError && failover.shouldFailover({ status: proxyResponse.status }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => "");
       failover.recordRequest(account.id, channel.id, group.id, true);
-      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }).catch(() => {
+      });
+      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId);
     }
     if (stream && proxyResponse.body) {
       failover.recordRequest(account.id, channel.id, group.id, isError);
@@ -1324,16 +1397,18 @@ async function handleClaudeRequest(request, env, failover) {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     failover.recordRequest(account.id, channel.id, group.id, true);
-    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, errorMessage);
+    db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {
+    });
+    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter((candidate) => candidate.id !== account.id), channels, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId);
   }
 }
-async function handleClaudeFailover(body, request, env, failover, keyRecord, accounts, channels, groups, mappings, upstreamModel, stream, errorMessage) {
+async function handleClaudeFailover(body, request, env, failover, keyRecord, accounts, channels, groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId) {
   const db = createDatabase(env.DB);
   const attempted = /* @__PURE__ */ new Set();
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
     const nextAccounts = accounts.filter((a) => a.enabled && !attempted.has(a.id));
-    const selection = failover.selectAccount(nextAccounts, channels, groups);
+    const selection = await failover.selectAccount(nextAccounts, channels, groups, preferredGroupId);
     if (!selection) break;
     const { account, channel, group } = selection;
     attempted.add(account.id);
@@ -1352,7 +1427,6 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
           }
         })
       });
-      const responseText = await proxyResponse.text();
       const isError = proxyResponse.status >= 400;
       if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
         failover.recordRequest(account.id, channel.id, group.id, true);
@@ -1369,12 +1443,21 @@ async function handleClaudeFailover(body, request, env, failover, keyRecord, acc
         latency_ms: 0
       }).catch(() => {
       });
+      if (stream && !isError && proxyResponse.body) {
+        return new Response(proxyResponse.body, {
+          status: proxyResponse.status,
+          headers: { ...proxyResponse.headers, "content-type": proxyResponse.headers["content-type"] || "text/event-stream" }
+        });
+      }
+      const responseText = await proxyResponse.text();
       return new Response(responseText, {
         status: proxyResponse.status,
         headers: { ...proxyResponse.headers, "content-type": "application/json" }
       });
     } catch (retryError) {
       failover.recordRequest(account.id, channel.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : "Upstream request failed", latency_ms: 0 }).catch(() => {
+      });
       continue;
     }
   }
@@ -1718,6 +1801,7 @@ async function handleModelsRequest(request, env) {
 }
 
 // functions/_worker.ts
+var sharedFailover = null;
 var worker_default = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -1761,7 +1845,7 @@ var worker_default = {
     if (path.startsWith("/api/v1/models")) {
       return handleModelsRequest(request, env);
     }
-    const failover = new FailoverManager(env);
+    const failover = sharedFailover ?? (sharedFailover = new FailoverManager(env));
     failover.setDb(createDatabase(env.DB));
     if (path === "/v1/models" && request.method === "GET") {
       return handleProviderModels(request, env);

@@ -293,7 +293,7 @@ export class Database {
   }
 
   async getAccountErrorStats(accountId: number, windowSeconds: number) {
-    const cutoff = new Date(Date.now() - windowSeconds * 1000).toISOString();
+    const cutoff = sqliteTimestamp(Date.now() - windowSeconds * 1000);
     const result = await this.queryOne<any>(
       `SELECT 
         COUNT(*) as total_requests,
@@ -306,7 +306,7 @@ export class Database {
   }
 
   async getChannelErrorStats(channelId: number, windowSeconds: number) {
-    const cutoff = new Date(Date.now() - windowSeconds * 1000).toISOString();
+    const cutoff = sqliteTimestamp(Date.now() - windowSeconds * 1000);
     const result = await this.queryOne<any>(
       `SELECT 
         COUNT(*) as total_requests,
@@ -320,10 +320,14 @@ export class Database {
 
   // Cleanup old logs
   async cleanupOldLogs(days = 7) {
-    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const cutoff = sqliteTimestamp(Date.now() - days * 24 * 60 * 60 * 1000);
     await this.exec(`DELETE FROM request_logs WHERE created_at < '${cutoff}'`);
     await this.exec(`DELETE FROM usage_records WHERE created_at < '${cutoff}'`);
   }
+}
+
+function sqliteTimestamp(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ');
 }
 
 export function createDatabase(db: D1Database): Database {

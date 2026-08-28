@@ -14,6 +14,10 @@ import { handleChannelsRequest } from './src/config/channels'
 import { handleAccountsRequest } from './src/config/accounts'
 import { handleModelsRequest } from './src/config/models'
 
+// Keep an isolate-local scheduler between requests. Persistent request logs in
+// D1 are also consulted by FailoverManager, so this cache is only a fast path.
+let sharedFailover: FailoverManager | null = null
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
@@ -74,7 +78,7 @@ export default {
     }
 
     // Gateway endpoints
-    const failover = new FailoverManager(env)
+    const failover = sharedFailover ?? (sharedFailover = new FailoverManager(env))
     failover.setDb(createDatabase(env.DB))
 
     // OpenAI clients commonly probe this endpoint before sending a request.

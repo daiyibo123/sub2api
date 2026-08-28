@@ -1,5 +1,5 @@
 // Proxy utilities for forwarding requests to upstream providers
-import { ProxyRequest, ProxyResponse } from '../types';
+import { ProxyRequest, ProxyResponse, ModelMapping } from '../types';
 
 export async function proxyRequest(request: ProxyRequest): Promise<ProxyResponse> {
   const controller = new AbortController();
@@ -165,22 +165,30 @@ export function getUpstreamBaseUrl(baseUrl?: string, provider?: string): string 
 }
 
 export function mapModel(requestedModel: string, mappings: any[]): string {
-  // Find exact match first
-  for (const mapping of mappings) {
-    if (mapping.enabled && mapping.requested_model === requestedModel) {
-      return mapping.upstream_model;
-    }
+  const mapping = findModelMapping(requestedModel, mappings);
+  if (!mapping) return requestedModel;
+  if (mapping.requested_model.endsWith('*')) {
+    const prefix = mapping.requested_model.slice(0, -1);
+    return mapping.upstream_model + requestedModel.slice(prefix.length);
   }
-  
-  // Find prefix match
-  for (const mapping of mappings) {
-    if (mapping.enabled && mapping.requested_model.endsWith('*')) {
-      const prefix = mapping.requested_model.slice(0, -1);
-      if (requestedModel.startsWith(prefix)) {
-        return mapping.upstream_model + requestedModel.slice(prefix.length);
-      }
-    }
-  }
-  
-  return requestedModel;
+  return mapping.upstream_model;
+}
+
+/** Resolve the selected mapping so routing can also honor its target group. */
+export function findModelMapping(
+  requestedModel: string,
+  mappings: ModelMapping[],
+  provider?: string
+): ModelMapping | null {
+  const enabled = mappings
+    .filter(mapping => mapping.enabled && (!provider || mapping.provider === provider))
+    .sort((a, b) => (a.priority - b.priority) || (a.id - b.id));
+
+  const exact = enabled.find(mapping => mapping.requested_model === requestedModel);
+  if (exact) return exact;
+
+  return enabled.find(mapping => {
+    if (!mapping.requested_model.endsWith('*')) return false;
+    return requestedModel.startsWith(mapping.requested_model.slice(0, -1));
+  }) || null;
 }

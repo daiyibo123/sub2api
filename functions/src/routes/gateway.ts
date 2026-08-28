@@ -3,7 +3,7 @@ import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { authenticateApiKey, hashApiKey } from '../auth';
 import { FailoverManager } from '../failover';
-import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, mapModel } from '../utils/proxy';
+import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping } from '../utils/proxy';
 import { extractTokenUsage, calculateCost } from '../billing';
 import { Account, Channel, Group, ModelMapping } from '../types';
 
@@ -47,13 +47,8 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     provider = 'openai';
   }
   
-  // Get all enabled accounts for this provider
+  // Load all enabled accounts first; model mappings may refine the provider.
   let accounts = await db.listEnabledAccounts();
-  accounts = accounts.filter(a => a.provider === provider && a.enabled);
-  
-  if (accounts.length === 0) {
-    return new Response(JSON.stringify({ error: 'No available accounts' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
-  }
   
   // Load supporting data
   const [channelsRaw, groupsRaw, mappingsRaw] = await Promise.all([
@@ -67,10 +62,20 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   const mappings = mappingsRaw;
   
   // Apply model mapping
-  let upstreamModel = mapModel(model, mappings);
+  const mapping = findModelMapping(model, mappings);
+  if (mapping?.provider) provider = mapping.provider;
+  accounts = accounts.filter(a => a.provider === provider && a.enabled);
+  if (accounts.length === 0) {
+    return new Response(JSON.stringify({ error: 'No available accounts' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+  }
+  const providerMapping = mapping && mapping.provider === provider ? mapping : findModelMapping(model, mappings, provider);
+  let upstreamModel = providerMapping?.requested_model.endsWith('*')
+    ? providerMapping.upstream_model + model.slice(providerMapping.requested_model.length - 1)
+    : (providerMapping?.upstream_model || model);
+  const preferredGroupId = providerMapping?.group_id || undefined;
   
   // Select account with failover
-  const selection = failover.selectAccount(accounts, channels, groups);
+  const selection = await failover.selectAccount(accounts, channels, groups, preferredGroupId);
   if (!selection) {
     return new Response(JSON.stringify({ error: 'No available accounts' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
   }
@@ -135,7 +140,8 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     if (isError && failover.shouldFailover({ status: responseStatus }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => '');
       failover.recordRequest(account.id, channel.id, group.id, true);
-      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }).catch(() => {});
+      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`, preferredGroupId);
     }
     
     if (stream && proxyResponse.body) {
@@ -194,9 +200,10 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     
     // Record failover
     failover.recordRequest(account.id, channel.id, group.id, true);
+    db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {});
     
     // Try to failover to next account
-    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, errorMessage);
+    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), channels, groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId);
   }
 }
 
@@ -214,7 +221,8 @@ async function handleFailover(
   provider: string,
   upstreamModel: string,
   stream: boolean,
-  errorMessage: string
+  errorMessage: string,
+  preferredGroupId?: number
 ): Promise<Response> {
   const db = createDatabase(env.DB);
   
@@ -224,7 +232,7 @@ async function handleFailover(
   for (let i = 0; i < maxRetries; i++) {
     // Get next healthy account
     const nextAccounts = accounts.filter(a => a.enabled && !attempted.has(a.id));
-    const selection = failover.selectAccount(nextAccounts, channels, groups);
+    const selection = await failover.selectAccount(nextAccounts, channels, groups, preferredGroupId);
     
     if (!selection) {
       break;
@@ -260,8 +268,6 @@ async function handleFailover(
         })
       });
       
-      const responseText = await proxyResponse.text();
-      
       const isError = proxyResponse.status >= 400;
       if (isError && failover.shouldFailover({ status: proxyResponse.status }) && i < maxRetries - 1) {
         failover.recordRequest(account.id, channel.id, group.id, true);
@@ -277,6 +283,14 @@ async function handleFailover(
         error_message: isError ? 'Upstream error' : '',
         latency_ms: 0
       }).catch(() => {});
+
+      if (stream && !isError && proxyResponse.body) {
+        return new Response(proxyResponse.body, {
+          status: proxyResponse.status,
+          headers: { ...proxyResponse.headers, 'content-type': proxyResponse.headers['content-type'] || 'text/event-stream' }
+        });
+      }
+      const responseText = await proxyResponse.text();
       
       return new Response(responseText, {
         status: proxyResponse.status,
@@ -285,6 +299,7 @@ async function handleFailover(
       
     } catch (retryError) {
       failover.recordRequest(account.id, channel.id, group.id, true);
+      db.createRequestLog({ account_id: account.id, channel_id: channel.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : 'Upstream request failed', latency_ms: 0 }).catch(() => {});
       continue;
     }
   }
