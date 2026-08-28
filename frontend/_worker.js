@@ -1872,6 +1872,25 @@ async function handleApiKeys(request, env) {
       }
     }, 201);
   }
+  if (request.method === "PUT") {
+    const id = parseInt(url.pathname.split("/").pop() || "0");
+    if (!id) return json({ error: "Invalid ID" }, 400);
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: "Invalid JSON body" }, 400);
+    }
+    const updates = {};
+    if (body.name !== void 0) updates.name = String(body.name).trim();
+    if (body.enabled !== void 0) updates.enabled = body.enabled === true || body.enabled === 1 ? 1 : 0;
+    if (body.balance !== void 0 && Number.isFinite(Number(body.balance))) updates.balance = Number(body.balance);
+    if (body.quota_limit !== void 0 && Number.isFinite(Number(body.quota_limit))) updates.quota_limit = Math.max(0, Number(body.quota_limit));
+    await db.updateApiKey(id, updates);
+    const key = await db.queryOne("SELECT id, name, enabled, balance, quota_limit, created_at FROM api_keys WHERE id = ?", [id]);
+    if (!key) return json({ error: "API Key not found" }, 404);
+    return json({ data: key });
+  }
   if (request.method === "DELETE") {
     const id = parseInt(url.pathname.split("/").pop() || "0");
     if (!id) return json({ error: "Invalid ID" }, 400);
