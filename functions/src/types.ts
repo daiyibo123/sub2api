@@ -62,6 +62,9 @@ export interface ApiKey {
 export interface UsageRecord {
   id: number;
   api_key_id?: number;
+  /** Which group and account served the call, so usage can be filtered by them. */
+  group_id?: number | null;
+  account_id?: number | null;
   model: string;
   provider: string;
   prompt_tokens: number;

@@ -183,6 +183,19 @@ check('streaming record has latency', bool(streamed.get('latency_ms')), streamed
 check('streaming record counted tokens',
       (streamed.get('total_tokens') or 0) > 0, streamed.get('total_tokens'))
 
+# Attribution: a record that cannot name its group or account cannot be
+# filtered by one, which is the whole point of the console toolbars.
+check('streaming record names its group',
+      streamed.get('group_id') == primary_id, streamed.get('group_id'))
+check('streaming record names its account',
+      bool(streamed.get('account_id')), streamed.get('account_id'))
+check('streaming record joins the group name',
+      streamed.get('group_name') == 'feat-primary', streamed.get('group_name'))
+check('streaming record joins the account name',
+      bool(streamed.get('account_name')), streamed.get('account_name'))
+check('streaming record joins the key name',
+      streamed.get('key_name') == 'feat-key', streamed.get('key_name'))
+
 # Non-streaming should also carry ttft (measured as full response time).
 control(PORT_FAST, reset=True, status=200, stream=False)
 call('/v1/chat/completions', 'POST',
@@ -191,6 +204,10 @@ call('/v1/chat/completions', 'POST',
 time.sleep(0.8)
 _, usage2 = call('/usage?limit=5', token=token)
 check('non-streaming record exists', bool(usage2.get('data')), usage2.get('data'))
+plain = (usage2.get('data') or [{}])[0]
+check('non-streaming record is also attributed',
+      plain.get('group_id') == primary_id and bool(plain.get('account_id')),
+      (plain.get('group_id'), plain.get('account_id')))
 
 # ------------------------------------------------------------- health probing
 control(PORT_FAST, reset=True, status=200)

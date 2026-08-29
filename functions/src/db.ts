@@ -1,7 +1,7 @@
 // D1 Database abstraction layer
 import type { Env } from './index';
 import type { UsageRecord, RequestLog } from './types';
-import { SCHEMA_STATEMENTS, ADDITIVE_COLUMNS } from './schema';
+import { SCHEMA_STATEMENTS, ADDITIVE_COLUMNS, SCHEMA_VERSION } from './schema';
 
 export class Database {
   constructor(private db: D1Database) {}
@@ -320,9 +320,9 @@ export class Database {
   // Usage records
   async createUsageRecord(record: Partial<UsageRecord>) {
     return this.insert(
-      `INSERT INTO usage_records 
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, status, error_message, latency_ms, ttft_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO usage_records
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, status, error_message, latency_ms, ttft_ms, group_id, account_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -334,14 +334,28 @@ export class Database {
         record.status ?? 200,
         record.error_message || '',
         record.latency_ms ?? 0,
-        record.ttft_ms ?? null
+        record.ttft_ms ?? null,
+        record.group_id ?? null,
+        record.account_id ?? null
       ]
     );
   }
 
+  /**
+   * Recent usage rows with their group and key names resolved.
+   *
+   * The names are joined here rather than looked up in the browser so the
+   * records page can filter by group without loading every group first, and so
+   * a row still reads correctly after its group or key has been deleted.
+   */
   async listUsageRecords(limit = 100, offset = 0) {
     return this.query<any>(
-      'SELECT * FROM usage_records ORDER BY created_at DESC LIMIT ? OFFSET ?',
+      `SELECT u.*, g.name AS group_name, a.name AS account_name, k.name AS key_name
+       FROM usage_records u
+       LEFT JOIN groups g ON u.group_id = g.id
+       LEFT JOIN accounts a ON u.account_id = a.id
+       LEFT JOIN api_keys k ON u.api_key_id = k.id
+       ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
       [limit, offset]
     );
   }
@@ -451,6 +465,11 @@ export class Database {
    * raw "no such table" error. Every statement is idempotent.
    */
   async ensureSchema(): Promise<boolean> {
+    // Fast path. Applying the schema is ~30 D1 round trips and Cloudflare caps a
+    // request at 50 subrequests, so a hot path must not pay that every time.
+    // One cheap read tells us the current version is already applied.
+    if (await this.getSetting('schema_version') === SCHEMA_VERSION) return false;
+
     const wasReady = await this.schemaReady();
     // Every statement is `IF NOT EXISTS`, so this runs unconditionally: a
     // database created by an older release is missing later tables, and
@@ -461,6 +480,9 @@ export class Database {
     await this.applyAdditiveColumns();
     // Columns must exist before the backfill reads or writes them.
     await this.migrateChannelsIntoAccounts();
+    // Recorded last: a crash midway leaves the version unset so the next
+    // request retries rather than starting on a half-migrated database.
+    await this.setSetting('schema_version', SCHEMA_VERSION);
     return !wasReady;
   }
 
@@ -583,11 +605,23 @@ export class Database {
   }
 
   async setSetting(key: string, value: string): Promise<void> {
-    await this.update(
-      `INSERT INTO settings (key, value) VALUES (?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
-      [key, value]
-    );
+    try {
+      await this.update(
+        `INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+        [key, value]
+      );
+    } catch {
+      // A database created before `settings.updated_at` existed rejects the
+      // statement above at prepare time, which would make every settings write
+      // fail — including the flags that mark a migration finished. The
+      // timestamp is only diagnostic, so fall back to writing the value alone.
+      await this.update(
+        `INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        [key, value]
+      );
+    }
   }
 
   /**

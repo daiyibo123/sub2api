@@ -21,7 +21,16 @@ const state = {
   // skeleton and avoid a visible flash on every navigation.
   painted: new Set(),
   stats: null,
-  filters: { keys: '', usage: '' },
+  // Per-page filters. Every list is filtered client-side: the whole page of
+  // rows is already in memory, so re-querying the API for a keystroke would add
+  // latency without adding information.
+  filters: {
+    keys: { q: '', group: '' },
+    usage: { q: '', provider: '', group: '' },
+    groups: { q: '' },
+    accounts: { q: '', provider: '', group: '' },
+    models: { q: '', provider: '', group: '' }
+  },
   statsRange: { hours: 24, bucket: 'hour' },
   loading: false
 }
@@ -357,6 +366,7 @@ async function loadPage(page, silent = false) {
     RENDERERS[page]?.()
     state.painted.add(page)
     updateNavCounts()
+    syncGroupFilters()
   } catch (error) {
     // Keep already-rendered rows on screen; a failed refresh should not wipe
     // data the operator is reading.
@@ -385,6 +395,7 @@ async function loadDashboard(silent = false) {
     // empty, so navigate() must render them from this cache on first visit.
     state.painted.add('dashboard')
     updateNavCounts()
+    syncGroupFilters()
   } catch (error) {
     setHealth(false)
     if (!silent) showToast(error.message, 'error')
@@ -611,11 +622,67 @@ function table(headers, rows, options = {}) {
   return `<table class="data-table${options.compact ? ' compact' : ''}"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
 }
 
+/**
+ * Apply a page's search box and dropdowns to its rows.
+ *
+ * Search is a fuzzy substring match over the fields a person would actually
+ * type, so `text` is supplied per page rather than stringifying whole records —
+ * matching on raw JSON would let an id or a timestamp satisfy a name search.
+ * Provider and group are exact matches, and an empty value means "all".
+ */
+function applyFilters(rows, filter, { text, provider, group }) {
+  const query = String(filter.q || '').trim().toLowerCase()
+  const wantProvider = String(filter.provider || '')
+  const wantGroup = String(filter.group || '')
+
+  return rows.filter(row => {
+    if (query && !text(row).toLowerCase().includes(query)) return false
+    if (wantProvider && String(provider ? provider(row) : '') !== wantProvider) return false
+    if (wantGroup && String(group ? group(row) : '') !== wantGroup) return false
+    return true
+  })
+}
+
+/** "12 / 30 个账号" when filtered, plain total when not. */
+function filterSummary(shown, total, unit) {
+  if (!total) return ''
+  return shown === total ? `${total} ${unit}` : `${shown} / ${total} ${unit}`
+}
+
+/** Keep every group dropdown in sync with the loaded groups. */
+function syncGroupFilters() {
+  const options = ['<option value="">全部分组</option>']
+    .concat(state.data.groups.map(group =>
+      `<option value="${group.id}">${esc(group.name)}</option>`))
+    .join('')
+
+  for (const [id, key] of [
+    ['keys-group', 'keys'], ['usage-group', 'usage'],
+    ['accounts-group', 'accounts'], ['models-group', 'models']
+  ]) {
+    const select = $(id)
+    if (!select) continue
+    // Preserve the operator's selection across a refresh; rebuilding the list
+    // would otherwise silently reset the filter to "all".
+    const current = state.filters[key].group
+    select.innerHTML = options
+    if (current && select.querySelector(`option[value="${current}"]`)) {
+      select.value = current
+    } else if (current) {
+      // The selected group disappeared, so fall back to showing everything.
+      state.filters[key].group = ''
+      select.value = ''
+    }
+  }
+}
+
 function renderKeys() {
-  const query = state.filters.keys.trim().toLowerCase()
   const all = state.data.keys
-  const items = all.filter(item => `${item.name || ''} ${isOn(item.enabled) ? '启用' : '停用'}`.toLowerCase().includes(query))
-  $('keys-count').textContent = all.length ? `${items.length} / ${all.length} 个密钥` : ''
+  const items = applyFilters(all, state.filters.keys, {
+    text: item => `${item.name || ''} ${item.group_name || ''} ${isOn(item.enabled) ? '启用' : '停用'}`,
+    group: item => item.group_id || ''
+  })
+  $('keys-count').textContent = filterSummary(items.length, all.length, '个密钥')
 
   $('keys-list').innerHTML = items.length
     ? table(
@@ -646,17 +713,26 @@ function renderKeys() {
 }
 
 function renderUsage() {
-  const query = state.filters.usage.trim().toLowerCase()
   const all = state.data.usage
-  const items = all.filter(item => `${item.model || ''} ${item.provider || ''} ${item.status || ''}`.toLowerCase().includes(query))
-  $('usage-count').textContent = all.length ? `${items.length} 条记录` : ''
+  const items = applyFilters(all, state.filters.usage, {
+    text: item => `${item.model || ''} ${item.provider || ''} ${item.status || ''} ${item.group_name || ''} ${item.account_name || ''} ${item.key_name || ''}`,
+    provider: item => item.provider || '',
+    group: item => item.group_id || ''
+  })
+  $('usage-count').textContent = filterSummary(items.length, all.length, '条记录')
 
   $('usage-list').innerHTML = items.length
     ? table(
-        ['模型', '服务商', '输入', '输出', '合计', '费用', '状态', '首字', '耗时', '时间'],
+        ['模型', '服务商', '分组 / 账号', '密钥', '输入', '输出', '合计', '费用', '状态', '首字', '耗时', '时间'],
         items.map(item => [
           `<span class="cell-main">${esc(item.model || '-')}</span>${item.error_message ? `<span class="cell-sub err" title="${esc(item.error_message)}">${esc(item.error_message)}</span>` : ''}`,
           providerBadge(item.provider),
+          item.group_name || item.account_name
+            ? `<span class="badge badge-group">${esc(item.group_name || '未知分组')}</span><span class="cell-sub">${esc(item.account_name || '账号已删除')}</span>`
+            : '<span class="cell-dim">-</span>',
+          item.key_name
+            ? `<span class="cell-dim">${esc(item.key_name)}</span>`
+            : '<span class="cell-dim">-</span>',
           fmtTokens(item.prompt_tokens),
           fmtTokens(item.completion_tokens),
           `<span class="cell-main">${fmtTokens(item.total_tokens)}</span>`,
@@ -671,7 +747,11 @@ function renderUsage() {
 }
 
 function renderGroups() {
-  const items = state.data.groups
+  const all = state.data.groups
+  const items = applyFilters(all, state.filters.groups, {
+    text: item => `${item.name || ''} ${item.description || ''}`
+  })
+  $('groups-count').textContent = filterSummary(items.length, all.length, '个分组')
   $('groups-list').innerHTML = items.length
     ? table(
         ['分组', '状态', '优先级', '错误率阈值', '错误次数', '统计窗口', '账号数', '操作'],
@@ -692,12 +772,18 @@ function renderGroups() {
           ]
         })
       )
-    : emptyState('i-layers', '暂无分组', '先创建一个分组，再把上游账号加进去。')
+    : emptyState('i-layers', all.length ? '没有匹配的分组' : '暂无分组', all.length ? '换个关键词再试。' : '先创建一个分组，再把上游账号加进去。')
 }
 
 
 function renderAccounts() {
-  const items = state.data.accounts
+  const all = state.data.accounts
+  const items = applyFilters(all, state.filters.accounts, {
+    text: item => `${item.name || ''} ${item.provider || ''} ${providerLabel(item.provider)} ${item.group_name || ''} ${item.base_url || ''}`,
+    provider: item => item.provider || '',
+    group: item => item.group_id || ''
+  })
+  $('accounts-count').textContent = filterSummary(items.length, all.length, '个账号')
   $('accounts-list').innerHTML = items.length
     ? table(
         ['账号', '服务商', '分组', '地址', '倍率', '测活', '状态', '错误率', '优先级', '操作'],
@@ -722,11 +808,17 @@ function renderAccounts() {
           ])
         ])
       )
-    : emptyState('i-users', '暂无上游账号', '先创建一个分组，再添加上游服务商账号。')
+    : emptyState('i-users', all.length ? '没有匹配的账号' : '暂无上游账号', all.length ? '调整上面的筛选条件再试。' : '先创建一个分组，再添加上游服务商账号。')
 }
 
 function renderModels() {
-  const items = state.data.models
+  const all = state.data.models
+  const items = applyFilters(all, state.filters.models, {
+    text: item => `${item.requested_model || ''} ${item.upstream_model || ''} ${item.provider || ''} ${providerLabel(item.provider)}`,
+    provider: item => item.provider || '',
+    group: item => item.group_id || ''
+  })
+  $('models-count').textContent = filterSummary(items.length, all.length, '个映射')
   $('models-list').innerHTML = items.length
     ? table(
         ['客户端模型', '上游模型', '服务商', '目标分组', '状态', '优先级', '操作'],
@@ -746,7 +838,7 @@ function renderModels() {
           ]
         })
       )
-    : emptyState('i-route', '暂无模型映射', '没有映射时，网关按模型名称自动选择服务商。')
+    : emptyState('i-route', all.length ? '没有匹配的映射' : '暂无模型映射', all.length ? '调整上面的筛选条件再试。' : '没有映射时，网关按模型名称自动选择服务商。')
 }
 
 function renderSettings() {
@@ -1334,8 +1426,34 @@ $('btn-test-accounts').addEventListener('click', async event => {
 })
 $('btn-create-model').addEventListener('click', () => openModelModal())
 
-$('keys-search').addEventListener('input', event => { state.filters.keys = event.target.value; renderKeys() })
-$('usage-search').addEventListener('input', event => { state.filters.usage = event.target.value; renderUsage() })
+/**
+ * Wire every toolbar control to its page filter.
+ *
+ * Filtering is client-side over the already-loaded rows, so typing re-renders
+ * without a network round trip. Each page owns its own filter object, which is
+ * why the control id encodes both the page and the field it drives.
+ */
+for (const [id, page, field, render] of [
+  ['keys-search', 'keys', 'q', renderKeys],
+  ['keys-group', 'keys', 'group', renderKeys],
+  ['usage-search', 'usage', 'q', renderUsage],
+  ['usage-provider', 'usage', 'provider', renderUsage],
+  ['usage-group', 'usage', 'group', renderUsage],
+  ['groups-search', 'groups', 'q', renderGroups],
+  ['accounts-search', 'accounts', 'q', renderAccounts],
+  ['accounts-provider', 'accounts', 'provider', renderAccounts],
+  ['accounts-group', 'accounts', 'group', renderAccounts],
+  ['models-search', 'models', 'q', renderModels],
+  ['models-provider', 'models', 'provider', renderModels],
+  ['models-group', 'models', 'group', renderModels]
+]) {
+  const control = $(id)
+  if (!control) continue
+  control.addEventListener(control.tagName === 'SELECT' ? 'change' : 'input', event => {
+    state.filters[page][field] = event.target.value
+    render()
+  })
+}
 
 $('stats-range').addEventListener('change', event => {
   state.statsRange.hours = num(event.target.value, 24)

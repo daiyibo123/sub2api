@@ -646,6 +646,23 @@ html.dark .res-hint { color: var(--amber); }
 .toolbar-count { color: var(--text-2); font-size: 12.5px; }
 .filter-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 16px 20px; }
 .filter-spacer { flex: 1; }
+
+/* Toolbar filter dropdowns. Narrower and quieter than a form select: these
+   refine a list rather than collect input, so they must not compete with the
+   table for attention. */
+.filter-select {
+  width: auto;
+  min-width: 132px;
+  padding: 8px 30px 8px 11px;
+  font-size: 12.5px;
+  background-position: right 9px center;
+}
+.filter-select:not([value=""]) { color: var(--text-1); }
+@media (max-width: 640px) {
+  .toolbar { gap: 9px; }
+  .filter-select { flex: 1 1 auto; min-width: 0; }
+  .filter-spacer { display: none; }
+}
 .filter-bar .field-label { margin: 0; color: var(--text-2); font-size: 12px; }
 
 .search-box {

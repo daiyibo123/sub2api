@@ -158,7 +158,7 @@ export async function handleOpenAIRequest(request: Request, env: Env, failover: 
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
     
     // Record request log
     defer(ctx, db.createRequestLog({

@@ -123,6 +123,104 @@ for (const extra of ['is-busy', 'hidden', 'active', 'visible', 'dark', 'on', 'op
 const unstyled = [...emitted].filter(token => !defined.has(token) && !/^(ico|i-)/.test(token))
 check('every emitted class has styling', unstyled.length === 0, unstyled.join(' '))
 
+/** Text of a function body, located by a start marker and a closing line. */
+function blockAfter(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker)
+  if (start < 0) return ''
+  const end = source.indexOf(endMarker, start)
+  return end < 0 ? source.slice(start) : source.slice(start, end + endMarker.length)
+}
+
+// ---- 8. waitUntil must never be registered from a post-response callback --
+// Calling ctx.waitUntil() after the fetch handler returned throws, which the
+// runtime surfaces as a 1101 "Worker threw exception". The streaming recorder
+// hit exactly that, so the registration must be straight-line code.
+{
+  const record = readFileSync('functions/src/utils/record.ts', 'utf8')
+  const callbackBody = blockAfter(record, 'measureStreamTiming(', ');')
+  check('stream recorder does not defer from inside the stream callback',
+    !callbackBody.includes('defer(') && !callbackBody.includes('waitUntil'),
+    callbackBody.slice(0, 120))
+  check('stream recorder registers waitUntil synchronously',
+    record.includes('waitUntil?.(persist)') || record.includes('waitUntil(persist)'))
+}
+
+// ---- 9. schema work must be gated behind a cheap version check -----------
+// Applying the schema is ~30 D1 round trips and Cloudflare caps a request at 50
+// subrequests, so an unconditional ensureSchema on a hot path throws 1101.
+{
+  const db = readFileSync('functions/src/db.ts', 'utf8')
+  const body = blockAfter(db, 'async ensureSchema(', 'return !wasReady;')
+  check('ensureSchema short-circuits on a version flag',
+    body.includes("getSetting('schema_version')"), body.slice(0, 200))
+  check('ensureSchema records the version last',
+    body.lastIndexOf("setSetting('schema_version'") > body.indexOf('SCHEMA_STATEMENTS'),
+    'version must be written after the work')
+}
+
+
+// ---- 10. every settings column a write touches must be declared ----------
+// `setSetting` wrote `updated_at` before the column existed. SQLite validates a
+// statement at prepare time, so the whole INSERT failed -- and with it every
+// flag that marks a migration finished, making the channel fold-in retry on
+// every login forever instead of completing once.
+{
+  const schema = readFileSync('functions/src/schema.ts', 'utf8')
+  const db = readFileSync('functions/src/db.ts', 'utf8')
+
+  const createAt = schema.indexOf('CREATE TABLE IF NOT EXISTS settings')
+  const settingsBlock = schema.slice(createAt, schema.indexOf('`', createAt))
+
+  const declared = new Set()
+  for (const line of settingsBlock.split(/\r?\n/).slice(1)) {
+    const name = line.trim().split(/\s+/)[0].replace(/[(),]/g, '')
+    if (name && name !== ')') declared.add(name)
+  }
+  for (const m of schema.matchAll(/table:\s*'settings',\s*column:\s*'(\w+)'/g)) {
+    declared.add(m[1])
+  }
+
+  // Columns named on the left of an assignment in a settings write.
+  const referenced = new Set()
+  for (const m of db.matchAll(/settings[^;]{0,240}/g)) {
+    for (const col of m[0].matchAll(/SET\s+(\w+)\s*=/g)) referenced.add(col[1])
+    for (const col of m[0].matchAll(/,\s*(\w+)\s*=\s*datetime/g)) referenced.add(col[1])
+  }
+
+  const missing = [...referenced].filter(col => !declared.has(col))
+  check('every settings column a write touches is declared', missing.length === 0,
+    `missing=${missing.join(' ')} declared=${[...declared].join(' ')}`)
+
+  // The fallback exists precisely because older databases predate the column.
+  check('setSetting degrades when updated_at is absent',
+    /DO UPDATE SET value = excluded\.value`/.test(db),
+    'a timestamp-free fallback INSERT must remain')
+}
+
+// ---- 11. usage records must carry attribution ------------------------------
+// Without group_id / account_id the console cannot say which upstream served a
+// request, so the usage page degrades to an unfilterable flat list.
+{
+  const schema = readFileSync('functions/src/schema.ts', 'utf8')
+  for (const col of ['group_id', 'account_id', 'ttft_ms']) {
+    // A plain substring: the declaration format is fixed, and regex escapes
+    // inside a template literal silently collapse (\s becomes s).
+    check(`usage_records declares ${col}`,
+      schema.includes(`table: 'usage_records', column: '${col}'`))
+  }
+  const routes = ['openai', 'claude', 'grok', 'gateway']
+  for (const route of routes) {
+    const source = readFileSync(`functions/src/routes/${route}.ts`, 'utf8')
+    const call = source.slice(source.indexOf('createUsageRecord'))
+    check(`${route} attributes its usage record`,
+      /group_id:/.test(call.slice(0, 400)) && /account_id:/.test(call.slice(0, 400)),
+      call.slice(0, 90))
+  }
+  const record = readFileSync('functions/src/utils/record.ts', 'utf8')
+  check('streaming recorder attributes its usage record',
+    /group_id:\s*context\.groupId/.test(record) && /account_id:\s*context\.accountId/.test(record))
+}
+
 console.log()
 console.log(`PASSED ${pass} / ${pass + failures.length}`)
 for (const failure of failures) console.log(' -', failure)

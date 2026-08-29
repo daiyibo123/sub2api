@@ -8,6 +8,17 @@
  *
  * Keep in sync with functions/schema.sql.
  */
+/**
+ * Bumped whenever SCHEMA_STATEMENTS or ADDITIVE_COLUMNS change.
+ *
+ * Applying the whole schema costs roughly 30 D1 round trips (creates, PRAGMA
+ * reads, ALTERs, backfill). Cloudflare caps a request at 50 subrequests and D1
+ * queries count toward it, so doing that on every login threw "Worker threw
+ * exception". The version is recorded in `settings` once the work succeeds, and
+ * later requests spend a single cheap read confirming there is nothing to do.
+ */
+export const SCHEMA_VERSION = '4';
+
 export const SCHEMA_STATEMENTS: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,7 +119,8 @@ export const SCHEMA_STATEMENTS: string[] = [
   `CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT
   )`,
   `CREATE INDEX IF NOT EXISTS idx_req_logs_account_created ON request_logs(account_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_req_logs_channel_created ON request_logs(channel_id, created_at)`,
@@ -129,6 +141,11 @@ export const SCHEMA_STATEMENTS: string[] = [
 export const ADDITIVE_COLUMNS: Array<{ table: string; column: string; definition: string }> = [
   // Time to first byte. Latency alone hides whether a slow response was slow to
   // start or merely long, which is the number that matters for streaming.
+  // setSetting stamps this on conflict. SQLite validates the whole statement at
+  // prepare time, so a missing column makes every settings write fail rather
+  // than just the update path.
+  { table: 'settings', column: 'updated_at', definition: 'TEXT' },
+
   { table: 'usage_records', column: 'ttft_ms', definition: 'INTEGER' },
   { table: 'request_logs', column: 'ttft_ms', definition: 'INTEGER' },
 
@@ -143,6 +160,12 @@ export const ADDITIVE_COLUMNS: Array<{ table: string; column: string; definition
   { table: 'accounts', column: 'last_check_ok', definition: 'INTEGER' },
   { table: 'accounts', column: 'last_check_latency_ms', definition: 'INTEGER' },
   { table: 'accounts', column: 'last_check_message', definition: 'TEXT' },
+
+  // Attribution for a usage row. Without these the records page can only group
+  // by model or provider, so an operator cannot tell which upstream account or
+  // scheduling group served a request.
+  { table: 'usage_records', column: 'group_id', definition: 'INTEGER' },
+  { table: 'usage_records', column: 'account_id', definition: 'INTEGER' },
 
   // A client key may be pinned to one group. NULL keeps the previous behaviour
   // of allowing every group, so existing keys are unaffected.

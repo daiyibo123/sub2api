@@ -3,7 +3,7 @@ import type { Database } from '../db';
 import type { FailoverManager } from '../failover';
 import { calculateCost } from '../billing';
 import { measureStreamTiming, StreamOutcome } from './proxy';
-import { defer, Deferrable } from './background';
+import { Deferrable } from './background';
 
 export interface RecordContext {
   db: Database;
@@ -25,7 +25,12 @@ export interface RecordContext {
  * Streaming used to write only a request log, never a usage record, so every
  * streamed call — the default for chat clients — was missing from the usage page,
  * the dashboard totals and quota accounting. The body is forwarded unbuffered;
- * the record is written from the stream's completion callback.
+ * the record is written once the upstream closes.
+ *
+ * The `waitUntil` registration has to happen here, synchronously, before the
+ * Response is handed back. Calling it from the stream's completion callback
+ * throws, because by then the fetch handler has already returned and the
+ * runtime refuses to extend a request that is over.
  */
 export function streamWithRecording(
   body: ReadableStream<Uint8Array>,
@@ -35,7 +40,13 @@ export function streamWithRecording(
 ): Response {
   const isError = status >= 400;
 
-  const measured = measureStreamTiming(body, context.startedAt, (outcome: StreamOutcome) => {
+  // Resolved by the stream's flush/cancel handler below.
+  let settle: (outcome: StreamOutcome) => void;
+  const finished = new Promise<StreamOutcome>(resolve => { settle = resolve; });
+
+  const measured = measureStreamTiming(body, context.startedAt, outcome => settle(outcome));
+
+  const persist = finished.then(async outcome => {
     const cost = isError ? 0 : calculateCost(
       context.provider,
       context.model,
@@ -44,11 +55,13 @@ export function streamWithRecording(
     ) * context.rateMultiplier;
 
     if (cost > 0) {
-      defer(context.ctx, context.db.incrementApiKeyUsage(context.keyRecordId, cost));
+      await context.db.incrementApiKeyUsage(context.keyRecordId, cost).catch(() => {});
     }
 
-    defer(context.ctx, context.db.createUsageRecord({
+    await context.db.createUsageRecord({
       api_key_id: context.keyRecordId,
+      group_id: context.groupId,
+      account_id: context.accountId,
       model: context.model,
       provider: context.provider,
       prompt_tokens: outcome.promptTokens,
@@ -59,9 +72,9 @@ export function streamWithRecording(
       error_message: isError ? 'Upstream error' : '',
       latency_ms: outcome.totalMs,
       ttft_ms: outcome.ttftMs ?? undefined
-    }));
+    }).catch(() => {});
 
-    defer(context.ctx, context.db.createRequestLog({
+    await context.db.createRequestLog({
       account_id: context.accountId,
       group_id: context.groupId,
       model: context.model,
@@ -69,8 +82,14 @@ export function streamWithRecording(
       error_message: isError ? 'Upstream error' : '',
       latency_ms: outcome.totalMs,
       ttft_ms: outcome.ttftMs ?? undefined
-    }));
+    }).catch(() => {});
+  }).catch(() => {
+    // Telemetry must never surface as a failure to the caller.
   });
+
+  // Registered while the handler is still running, so the isolate stays alive
+  // until the stream drains and the records land.
+  context.ctx?.waitUntil?.(persist);
 
   context.failover.recordRequest(context.accountId, context.groupId, isError);
 

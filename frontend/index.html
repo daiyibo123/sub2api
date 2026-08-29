@@ -305,8 +305,12 @@
           <div class="toolbar">
             <div class="search-box">
               <svg class="ico ico-sm" aria-hidden="true"><use href="#i-search"/></svg>
-              <input id="keys-search" type="search" placeholder="搜索名称或状态" aria-label="搜索密钥">
+              <input id="keys-search" type="search" placeholder="搜索密钥名称" aria-label="搜索">
             </div>
+            <select class="field-select filter-select" id="keys-group" aria-label="按分组筛选">
+              <option value="">全部分组</option>
+            </select>
+            <div class="filter-spacer"></div>
             <span id="keys-count" class="toolbar-count"></span>
           </div>
           <article class="card"><div id="keys-list" class="table-wrap"></div></article>
@@ -325,8 +329,18 @@
           <div class="toolbar">
             <div class="search-box">
               <svg class="ico ico-sm" aria-hidden="true"><use href="#i-search"/></svg>
-              <input id="usage-search" type="search" placeholder="搜索模型、服务商或状态" aria-label="搜索记录">
+              <input id="usage-search" type="search" placeholder="搜索模型或状态" aria-label="搜索">
             </div>
+            <select class="field-select filter-select" id="usage-provider" aria-label="按服务商筛选">
+              <option value="">全部服务商</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="xai">xAI</option>
+            </select>
+            <select class="field-select filter-select" id="usage-group" aria-label="按分组筛选">
+              <option value="">全部分组</option>
+            </select>
+            <div class="filter-spacer"></div>
             <span id="usage-count" class="toolbar-count"></span>
           </div>
           <article class="card"><div id="usage-list" class="table-wrap"></div></article>
@@ -346,6 +360,23 @@
             <svg class="ico ico-sm" aria-hidden="true"><use href="#i-info"/></svg>
             <span>支持前缀通配，例如 <code>claude-*</code> 会匹配所有以 claude- 开头的模型名。没有匹配映射时，网关按模型名自动选择服务商。</span>
           </div>
+          <div class="toolbar">
+            <div class="search-box">
+              <svg class="ico ico-sm" aria-hidden="true"><use href="#i-search"/></svg>
+              <input id="models-search" type="search" placeholder="搜索模型名" aria-label="搜索">
+            </div>
+            <select class="field-select filter-select" id="models-provider" aria-label="按服务商筛选">
+              <option value="">全部服务商</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="xai">xAI</option>
+            </select>
+            <select class="field-select filter-select" id="models-group" aria-label="按分组筛选">
+              <option value="">全部分组</option>
+            </select>
+            <div class="filter-spacer"></div>
+            <span id="models-count" class="toolbar-count"></span>
+          </div>
           <article class="card"><div id="models-list" class="table-wrap"></div></article>
         </section>
 
@@ -358,6 +389,14 @@
                 <svg class="ico ico-sm" aria-hidden="true"><use href="#i-plus"/></svg>新建分组
               </button>
             </div>
+          </div>
+          <div class="toolbar">
+            <div class="search-box">
+              <svg class="ico ico-sm" aria-hidden="true"><use href="#i-search"/></svg>
+              <input id="groups-search" type="search" placeholder="搜索分组名" aria-label="搜索">
+            </div>
+            <div class="filter-spacer"></div>
+            <span id="groups-count" class="toolbar-count"></span>
           </div>
           <article class="card"><div id="groups-list" class="table-wrap"></div></article>
         </section>
@@ -379,6 +418,23 @@
           <div class="notice">
             <svg class="ico ico-sm" aria-hidden="true"><use href="#i-shield"/></svg>
             <span>上游密钥只用于服务端请求，保存后在列表和接口中始终脱敏显示。每个账号自带密钥和请求地址，地址留空时使用服务商默认地址。</span>
+          </div>
+          <div class="toolbar">
+            <div class="search-box">
+              <svg class="ico ico-sm" aria-hidden="true"><use href="#i-search"/></svg>
+              <input id="accounts-search" type="search" placeholder="搜索账号名或地址" aria-label="搜索">
+            </div>
+            <select class="field-select filter-select" id="accounts-provider" aria-label="按服务商筛选">
+              <option value="">全部服务商</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="xai">xAI</option>
+            </select>
+            <select class="field-select filter-select" id="accounts-group" aria-label="按分组筛选">
+              <option value="">全部分组</option>
+            </select>
+            <div class="filter-spacer"></div>
+            <span id="accounts-count" class="toolbar-count"></span>
           </div>
           <article class="card"><div id="accounts-list" class="table-wrap"></div></article>
         </section>

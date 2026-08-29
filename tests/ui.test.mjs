@@ -15,11 +15,26 @@ function check(name, ok, detail = '') {
 
 // ---- stub backend -----------------------------------------------------------
 const db = {
-  groups: [{ id: 1, name: 'default', description: '默认分组', enabled: 1, priority: 0, error_threshold: 0.5, error_count_threshold: 5, window_seconds: 300 }],
-  accounts: [{ id: 1, name: 'acct-1', provider: 'openai', group_id: 1, group_name: 'default', enabled: 1, priority: 0, error_rate: 0, rate_multiplier: 1, has_api_key: true, api_key: '***', base_url: '' }],
-  models: [{ id: 1, requested_model: 'gpt-4o', provider: 'openai', upstream_model: 'gpt-4o-mini', group_id: 1, enabled: 1, priority: 0 }],
-  keys: [{ id: 1, name: 'prod', enabled: 1, balance: 1.5, quota_limit: 0, created_at: '2026-01-01 00:00:00' }],
-  usage: [{ id: 1, model: 'gpt-4o', provider: 'openai', total_tokens: 120, prompt_tokens: 100, completion_tokens: 20, cost: 0.002, status: 200, latency_ms: 850, created_at: '2026-01-01 00:00:00' }]
+  groups: [
+    { id: 1, name: 'default', description: '默认分组', enabled: 1, priority: 0, error_threshold: 0.5, error_count_threshold: 5, window_seconds: 300 },
+    { id: 2, name: 'claude-pool', description: 'Claude 专用', enabled: 1, priority: 5, error_threshold: 0.5, error_count_threshold: 5, window_seconds: 300 }
+  ],
+  accounts: [
+    { id: 1, name: 'acct-openai', provider: 'openai', group_id: 1, group_name: 'default', enabled: 1, priority: 0, error_rate: 0, rate_multiplier: 1, has_api_key: true, api_key: '***', base_url: '' },
+    { id: 2, name: 'acct-claude', provider: 'anthropic', group_id: 2, group_name: 'claude-pool', enabled: 1, priority: 0, error_rate: 0, rate_multiplier: 0.5, has_api_key: true, api_key: '***', base_url: '' }
+  ],
+  models: [
+    { id: 1, requested_model: 'gpt-4o', provider: 'openai', upstream_model: 'gpt-4o-mini', group_id: 1, enabled: 1, priority: 0 },
+    { id: 2, requested_model: 'claude-*', provider: 'anthropic', upstream_model: 'claude-3-5-sonnet-', group_id: 2, enabled: 1, priority: 0 }
+  ],
+  keys: [
+    { id: 1, name: 'prod', enabled: 1, balance: 1.5, quota_limit: 0, group_id: 1, group_name: 'default', created_at: '2026-01-01 00:00:00' },
+    { id: 2, name: 'staging', enabled: 1, balance: 0, quota_limit: 5, group_id: 2, group_name: 'claude-pool', created_at: '2026-01-02 00:00:00' }
+  ],
+  usage: [
+    { id: 1, model: 'gpt-4o', provider: 'openai', total_tokens: 120, prompt_tokens: 100, completion_tokens: 20, cost: 0.002, status: 200, latency_ms: 850, ttft_ms: 320, group_id: 1, group_name: 'default', account_id: 1, account_name: 'acct-openai', key_name: 'prod', created_at: '2026-01-01 00:00:00' },
+    { id: 2, model: 'claude-3-5-sonnet', provider: 'anthropic', total_tokens: 80, prompt_tokens: 60, completion_tokens: 20, cost: 0.004, status: 200, latency_ms: 1200, ttft_ms: 2900, group_id: 2, group_name: 'claude-pool', account_id: 2, account_name: 'acct-claude', key_name: 'staging', created_at: '2026-01-02 00:00:00' }
+  ]
 }
 const posted = []
 
@@ -226,6 +241,113 @@ if (editButton) {
     check('edit dialog survives field click', Boolean(doc.querySelector('.modal-card')))
   }
 }
+
+// ---- toolbar filters -------------------------------------------------------
+// Every list page must be narrowable by provider and group; showing one flat
+// list makes it impossible to tell which upstream a row belongs to.
+function rowsIn(listId) {
+  return doc.querySelectorAll(`#${listId} tbody tr`).length
+}
+
+function setSelect(id, value) {
+  const select = doc.getElementById(id)
+  select.value = value
+  select.dispatchEvent(new window.Event('change', { bubbles: true }))
+}
+
+function setSearch(id, value) {
+  const input = doc.getElementById(id)
+  input.value = value
+  input.dispatchEvent(new window.Event('input', { bubbles: true }))
+}
+
+for (const [page, listId] of [['usage', 'usage-list'], ['accounts', 'accounts-list'], ['models', 'models-list'], ['keys', 'keys-list']]) {
+  press(doc.querySelector(`.nav-item[data-page="${page}"]`))
+  await tick(10)
+  check(`${page}: toolbar exists`, Boolean(doc.querySelector(`#page-${page} .toolbar`)))
+  // Earlier tests create extra rows, so compare against the stub rather than a
+  // literal: a hardcoded count breaks whenever a test above adds a record.
+  check(`${page}: rows rendered before filtering`, rowsIn(listId) === db[page].length,
+    `${rowsIn(listId)} of ${db[page].length}`)
+}
+
+// Group dropdowns must be populated from loaded groups, not left empty.
+for (const id of ['usage-group', 'accounts-group', 'models-group', 'keys-group']) {
+  const select = doc.getElementById(id)
+  // One option per group plus the leading "all groups" entry.
+  check(`${id} lists every group`, select && select.options.length === db.groups.length + 1,
+    `${select?.options.length} for ${db.groups.length} groups`)
+}
+
+// Provider filter on usage.
+press(doc.querySelector('.nav-item[data-page="usage"]'))
+await tick(8)
+setSelect('usage-provider', 'anthropic')
+await tick(2)
+check('usage provider filter narrows rows', rowsIn('usage-list') === 1, String(rowsIn('usage-list')))
+check('usage count reflects the filter', /1 \/ 2/.test(doc.getElementById('usage-count').textContent),
+  doc.getElementById('usage-count').textContent)
+setSelect('usage-provider', '')
+await tick(2)
+check('clearing the provider filter restores rows', rowsIn('usage-list') === 2, String(rowsIn('usage-list')))
+
+// Group filter on usage, which needs the attribution columns to exist.
+setSelect('usage-group', '2')
+await tick(2)
+check('usage group filter narrows rows', rowsIn('usage-list') === 1, String(rowsIn('usage-list')))
+check('usage table shows the group name', /claude-pool/.test(doc.getElementById('usage-list').textContent))
+setSelect('usage-group', '')
+await tick(2)
+
+// Fuzzy search must match on more than the model name.
+setSearch('usage-search', 'acct-claude')
+await tick(2)
+check('usage search matches the account name', rowsIn('usage-list') === 1, String(rowsIn('usage-list')))
+setSearch('usage-search', 'zzz-no-match')
+await tick(2)
+check('a filter with no matches says so, not "no data"',
+  /没有匹配/.test(doc.getElementById('usage-list').textContent),
+  doc.getElementById('usage-list').textContent.slice(0, 60))
+setSearch('usage-search', '')
+await tick(2)
+
+// Accounts page: provider and group both narrow.
+press(doc.querySelector('.nav-item[data-page="accounts"]'))
+await tick(8)
+setSelect('accounts-provider', 'openai')
+await tick(2)
+check('accounts provider filter narrows rows', rowsIn('accounts-list') === 1, String(rowsIn('accounts-list')))
+setSelect('accounts-provider', '')
+setSelect('accounts-group', '2')
+await tick(2)
+check('accounts group filter narrows rows', rowsIn('accounts-list') === 1, String(rowsIn('accounts-list')))
+setSelect('accounts-group', '')
+await tick(2)
+
+// Models and keys.
+press(doc.querySelector('.nav-item[data-page="models"]'))
+await tick(8)
+setSelect('models-provider', 'anthropic')
+await tick(2)
+check('models provider filter narrows rows', rowsIn('models-list') === 1, String(rowsIn('models-list')))
+setSelect('models-provider', '')
+await tick(2)
+
+press(doc.querySelector('.nav-item[data-page="keys"]'))
+await tick(8)
+setSelect('keys-group', '1')
+await tick(2)
+check('keys group filter narrows rows', rowsIn('keys-list') === 1, String(rowsIn('keys-list')))
+setSelect('keys-group', '')
+await tick(2)
+
+press(doc.querySelector('.nav-item[data-page="groups"]'))
+await tick(8)
+setSearch('groups-search', 'claude')
+await tick(2)
+check('groups search narrows rows', rowsIn('groups-list') === 1, String(rowsIn('groups-list')))
+setSearch('groups-search', '')
+await tick(2)
 
 // ---- theme toggle -----------------------------------------------------------
 const rootBefore = doc.documentElement.classList.contains('dark')

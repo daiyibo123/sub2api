@@ -1,4 +1,5 @@
 // functions/src/schema.ts
+var SCHEMA_VERSION = "4";
 var SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +100,8 @@ var SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT
   )`,
   `CREATE INDEX IF NOT EXISTS idx_req_logs_account_created ON request_logs(account_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_req_logs_channel_created ON request_logs(channel_id, created_at)`,
@@ -111,6 +113,10 @@ var SCHEMA_STATEMENTS = [
 var ADDITIVE_COLUMNS = [
   // Time to first byte. Latency alone hides whether a slow response was slow to
   // start or merely long, which is the number that matters for streaming.
+  // setSetting stamps this on conflict. SQLite validates the whole statement at
+  // prepare time, so a missing column makes every settings write fail rather
+  // than just the update path.
+  { table: "settings", column: "updated_at", definition: "TEXT" },
   { table: "usage_records", column: "ttft_ms", definition: "INTEGER" },
   { table: "request_logs", column: "ttft_ms", definition: "INTEGER" },
   // Upstream billing weight. Scheduling prefers cheaper accounts, so a 0.5x
@@ -123,6 +129,11 @@ var ADDITIVE_COLUMNS = [
   { table: "accounts", column: "last_check_ok", definition: "INTEGER" },
   { table: "accounts", column: "last_check_latency_ms", definition: "INTEGER" },
   { table: "accounts", column: "last_check_message", definition: "TEXT" },
+  // Attribution for a usage row. Without these the records page can only group
+  // by model or provider, so an operator cannot tell which upstream account or
+  // scheduling group served a request.
+  { table: "usage_records", column: "group_id", definition: "INTEGER" },
+  { table: "usage_records", column: "account_id", definition: "INTEGER" },
   // A client key may be pinned to one group. NULL keeps the previous behaviour
   // of allowing every group, so existing keys are unaffected.
   { table: "api_keys", column: "group_id", definition: "INTEGER" }
@@ -475,9 +486,9 @@ var Database = class {
   // Usage records
   async createUsageRecord(record) {
     return this.insert(
-      `INSERT INTO usage_records 
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, status, error_message, latency_ms, ttft_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO usage_records
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, status, error_message, latency_ms, ttft_ms, group_id, account_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -489,13 +500,27 @@ var Database = class {
         record.status ?? 200,
         record.error_message || "",
         record.latency_ms ?? 0,
-        record.ttft_ms ?? null
+        record.ttft_ms ?? null,
+        record.group_id ?? null,
+        record.account_id ?? null
       ]
     );
   }
+  /**
+   * Recent usage rows with their group and key names resolved.
+   *
+   * The names are joined here rather than looked up in the browser so the
+   * records page can filter by group without loading every group first, and so
+   * a row still reads correctly after its group or key has been deleted.
+   */
   async listUsageRecords(limit = 100, offset = 0) {
     return this.query(
-      "SELECT * FROM usage_records ORDER BY created_at DESC LIMIT ? OFFSET ?",
+      `SELECT u.*, g.name AS group_name, a.name AS account_name, k.name AS key_name
+       FROM usage_records u
+       LEFT JOIN groups g ON u.group_id = g.id
+       LEFT JOIN accounts a ON u.account_id = a.id
+       LEFT JOIN api_keys k ON u.api_key_id = k.id
+       ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
       [limit, offset]
     );
   }
@@ -596,12 +621,14 @@ var Database = class {
    * raw "no such table" error. Every statement is idempotent.
    */
   async ensureSchema() {
+    if (await this.getSetting("schema_version") === SCHEMA_VERSION) return false;
     const wasReady = await this.schemaReady();
     for (const statement of SCHEMA_STATEMENTS) {
       await this.db.prepare(statement).run();
     }
     await this.applyAdditiveColumns();
     await this.migrateChannelsIntoAccounts();
+    await this.setSetting("schema_version", SCHEMA_VERSION);
     return !wasReady;
   }
   /**
@@ -702,11 +729,19 @@ var Database = class {
     }
   }
   async setSetting(key, value) {
-    await this.update(
-      `INSERT INTO settings (key, value) VALUES (?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
-      [key, value]
-    );
+    try {
+      await this.update(
+        `INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+        [key, value]
+      );
+    } catch {
+      await this.update(
+        `INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        [key, value]
+      );
+    }
   }
   /**
    * Store a value only if the key is unset, then return whatever is stored.
@@ -1273,19 +1308,15 @@ function calculateCost(provider, model, promptTokens, completionTokens) {
   return Math.round((promptCost + completionCost) * 1e6) / 1e6;
 }
 
-// functions/src/utils/background.ts
-function defer(ctx, work) {
-  const guarded = work.catch(() => {
-  });
-  if (ctx?.waitUntil) {
-    ctx.waitUntil(guarded);
-  }
-}
-
 // functions/src/utils/record.ts
 function streamWithRecording(body, status, headers, context) {
   const isError = status >= 400;
-  const measured = measureStreamTiming(body, context.startedAt, (outcome) => {
+  let settle;
+  const finished = new Promise((resolve) => {
+    settle = resolve;
+  });
+  const measured = measureStreamTiming(body, context.startedAt, (outcome) => settle(outcome));
+  const persist2 = finished.then(async (outcome) => {
     const cost = isError ? 0 : calculateCost(
       context.provider,
       context.model,
@@ -1293,10 +1324,13 @@ function streamWithRecording(body, status, headers, context) {
       outcome.completionTokens
     ) * context.rateMultiplier;
     if (cost > 0) {
-      defer(context.ctx, context.db.incrementApiKeyUsage(context.keyRecordId, cost));
+      await context.db.incrementApiKeyUsage(context.keyRecordId, cost).catch(() => {
+      });
     }
-    defer(context.ctx, context.db.createUsageRecord({
+    await context.db.createUsageRecord({
       api_key_id: context.keyRecordId,
+      group_id: context.groupId,
+      account_id: context.accountId,
       model: context.model,
       provider: context.provider,
       prompt_tokens: outcome.promptTokens,
@@ -1307,8 +1341,9 @@ function streamWithRecording(body, status, headers, context) {
       error_message: isError ? "Upstream error" : "",
       latency_ms: outcome.totalMs,
       ttft_ms: outcome.ttftMs ?? void 0
-    }));
-    defer(context.ctx, context.db.createRequestLog({
+    }).catch(() => {
+    });
+    await context.db.createRequestLog({
       account_id: context.accountId,
       group_id: context.groupId,
       model: context.model,
@@ -1316,13 +1351,25 @@ function streamWithRecording(body, status, headers, context) {
       error_message: isError ? "Upstream error" : "",
       latency_ms: outcome.totalMs,
       ttft_ms: outcome.ttftMs ?? void 0
-    }));
+    }).catch(() => {
+    });
+  }).catch(() => {
   });
+  context.ctx?.waitUntil?.(persist2);
   context.failover.recordRequest(context.accountId, context.groupId, isError);
   return new Response(measured, {
     status,
     headers: { ...headers, "content-type": headers["content-type"] || "text/event-stream" }
   });
+}
+
+// functions/src/utils/background.ts
+function defer(ctx, work) {
+  const guarded = work.catch(() => {
+  });
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(guarded);
+  }
 }
 
 // functions/src/routes/gateway.ts
@@ -1461,7 +1508,7 @@ async function handleGatewayRequest(request, env, failover, ctx) {
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: responseStatus, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: responseStatus, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
@@ -1703,7 +1750,7 @@ async function handleOpenAIRequest(request, env, failover, ctx) {
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
@@ -1903,7 +1950,7 @@ async function handleClaudeRequest(request, env, failover, ctx) {
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, model: upstreamModel, provider: "anthropic", prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: "anthropic", prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || "Error" : "", latency_ms: Date.now() - startTime }));
     defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
