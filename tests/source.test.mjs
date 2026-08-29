@@ -221,6 +221,40 @@ function blockAfter(source, startMarker, endMarker) {
     /group_id:\s*context\.groupId/.test(record) && /account_id:\s*context\.accountId/.test(record))
 }
 
+// ---- the fetch handler must never let an exception reach the edge ----------
+//
+// An uncaught throw is what Cloudflare renders as the opaque "Error 1101 Worker
+// threw exception" page: the whole site white-screens and the real message is
+// only visible in Workers Logs. The router had no guard at all, so one transient
+// D1 error on any single route took down the request.
+{
+  const worker = readFileSync('functions/_worker.ts', 'utf8')
+  const handler = worker.slice(worker.indexOf('async fetch('), worker.indexOf('async function route('))
+  check('fetch handler wraps routing in try/catch',
+    /try\s*\{/.test(handler) && /catch\s*\(/.test(handler),
+    handler.slice(0, 120))
+  check('fetch handler awaits the router inside the guard',
+    /return await route\(/.test(handler))
+  check('routing lives in a separate function so the guard covers all of it',
+    /async function route\(request: Request, env: Env, ctx: ExecutionContext\)/.test(worker))
+
+  // A `waitUntil` promise that never settles holds the request open until the
+  // edge kills it, so the stream bookkeeping needs an upper bound.
+  const record = readFileSync('functions/src/utils/record.ts', 'utf8')
+  check('streaming bookkeeping bounds its wait',
+    /Promise\.race\(/.test(record) && /STREAM_RECORD_TIMEOUT_MS/.test(record))
+  check('the bounded promise is the one handed to waitUntil',
+    /const persist = settled\.then\(/.test(record))
+
+  // schemaReady() must not report an unreachable database as an empty one.
+  const db = readFileSync('functions/src/db.ts', 'utf8')
+  const probe = db.slice(db.indexOf('async schemaReady('))
+  const probeBody = probe.slice(0, probe.indexOf('\n  }'))
+  check('schemaReady does not swallow database errors',
+    !/catch/.test(probeBody),
+    probeBody.slice(0, 120))
+}
+
 console.log()
 console.log(`PASSED ${pass} / ${pass + failures.length}`)
 for (const failure of failures) console.log(' -', failure)

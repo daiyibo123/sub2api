@@ -479,10 +479,13 @@ export class Database {
     }
     await this.applyAdditiveColumns();
     // Columns must exist before the backfill reads or writes them.
-    await this.migrateChannelsIntoAccounts();
-    // Recorded last: a crash midway leaves the version unset so the next
-    // request retries rather than starting on a half-migrated database.
-    await this.setSetting('schema_version', SCHEMA_VERSION);
+    const folded = await this.migrateChannelsIntoAccounts();
+    // Recorded last, and only on full success: a crash midway — or a backfill
+    // that failed and wants to retry — leaves the version unset so the next
+    // request tries again instead of taking the fast path forever.
+    if (folded) {
+      await this.setSetting('schema_version', SCHEMA_VERSION);
+    }
     return !wasReady;
   }
 
@@ -503,15 +506,15 @@ export class Database {
    * Guarded by a settings flag so it runs once, and wrapped so a database that
    * never had a channels table (a fresh deployment) is unaffected.
    */
-  private async migrateChannelsIntoAccounts(): Promise<void> {
-    if (await this.getSetting('channels_folded_into_accounts')) return;
+  private async migrateChannelsIntoAccounts(): Promise<boolean> {
+    if (await this.getSetting('channels_folded_into_accounts')) return true;
 
     const hasChannels = await this.queryOne<{ total: number }>(
       "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'channels'"
     ).catch(() => null);
     if (!Number(hasChannels?.total || 0)) {
       await this.setSetting('channels_folded_into_accounts', new Date().toISOString());
-      return;
+      return true;
     }
 
     try {
@@ -556,9 +559,13 @@ export class Database {
       `);
 
       await this.setSetting('channels_folded_into_accounts', new Date().toISOString());
+      return true;
     } catch {
       // Leave the flag unset so the next request retries rather than starting
-      // the gateway on half-migrated credentials.
+      // the gateway on half-migrated credentials. Reported to the caller so the
+      // schema version is not stamped either: stamping it would take the fast
+      // path on the next request and the retry would never happen.
+      return false;
     }
   }
 
@@ -637,16 +644,19 @@ export class Database {
     return row?.value ?? value;
   }
 
-  /** Cheap probe used to decide whether migration is needed. */
+  /**
+   * Cheap probe used to decide whether migration is needed.
+   *
+   * A failure propagates instead of reporting `false`. Treating an unreachable
+   * database as "no tables yet" made the login screen offer to initialise a
+   * deployment that was already set up, so callers must distinguish an empty
+   * database from one it could not read.
+   */
   async schemaReady(): Promise<boolean> {
-    try {
-      const row = await this.queryOne<{ total: number }>(
-        "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','accounts','model_mappings','api_keys','usage_records','request_logs')"
-      );
-      return Number(row?.total || 0) >= 7;
-    } catch {
-      return false;
-    }
+    const row = await this.queryOne<{ total: number }>(
+      "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','accounts','model_mappings','api_keys','usage_records','request_logs')"
+    );
+    return Number(row?.total || 0) >= 7;
   }
 
   // Cleanup old logs

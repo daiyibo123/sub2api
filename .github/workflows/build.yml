@@ -16,3 +16,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
+      # Guards failure modes that only surface in production: an exception
+      # escaping the fetch handler (Cloudflare Error 1101) and dropped D1 writes.
+      - run: npm run test:source
+      - run: npm run test:resilience
+      - run: npm run test:ui

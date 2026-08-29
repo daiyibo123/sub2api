@@ -7,7 +7,14 @@ would silently break real traffic, so this builds an old-shape database by hand
 and asserts the migration preserves every one of them.
 
 Usage:
+  # 1. seed, with the dev server STOPPED
   python tests/migration.test.py <path-to-d1-sqlite-file>
+  # 2. start the dev server, then
+  MIGRATION_PHASE=verify python tests/migration.test.py <same-path>
+
+The path is the hash-named file under
+.wrangler/state/v3/d1/miniflare-D1DatabaseObject/, not metadata.sqlite — that
+one is miniflare's own bookkeeping and seeding it tests nothing.
 
 The caller is responsible for stopping the dev server first: miniflare holds the
 file open and its shutdown checkpoint would overwrite external writes.
@@ -145,8 +152,13 @@ def seed_old_shape(db_path):
       value TEXT NOT NULL,
       created_at TEXT DEFAULT (datetime('now')));
 
-    DELETE FROM accounts; DELETE FROM channels; DELETE FROM groups;
-    DELETE FROM settings WHERE key = 'channels_folded_into_accounts';
+    -- users too: a previous suite may have left an administrator with different
+    -- credentials, and setup refuses to claim an existing one.
+    DELETE FROM accounts; DELETE FROM channels; DELETE FROM groups; DELETE FROM users;
+    -- Both flags must go. Leaving schema_version behind makes ensureSchema take
+    -- its fast path and skip the fold entirely, so the seeded database would
+    -- never actually be migrated and the suite would test nothing.
+    DELETE FROM settings WHERE key IN ('channels_folded_into_accounts', 'schema_version');
 
     INSERT INTO groups (id, name, priority) VALUES (1, 'legacy-group', 0);
 

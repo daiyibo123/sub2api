@@ -19,106 +19,138 @@ let sharedFailover: FailoverManager | null = null
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url)
-    const path = url.pathname.replace(/\/+$/, '') || '/'
-
-    if (!env.DB) return json({ error: 'D1 binding DB is not configured' }, 500)
-
-    // CORS preflight
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key, Anthropic-Version, Anthropic-Beta',
+    // An exception escaping this handler is what the Cloudflare edge renders as
+    // the opaque "Error 1101 Worker threw exception" HTML page: the whole site
+    // white-screens and the real message is only visible in Workers Logs. A
+    // transient D1 failure on any single route must not do that, so every throw
+    // is converted into a normal response that also carries the reason.
+    try {
+      return await route(request, env, ctx)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const wantsHtml = (request.headers.get('accept') || '').includes('text/html')
+      if (wantsHtml) {
+        // A browser navigation gets the shell back so the SPA still loads and can
+        // report the failure itself, rather than a raw JSON blob.
+        const assets = env.ASSETS
+        if (assets) {
+          const shellUrl = new URL(request.url)
+          shellUrl.pathname = '/'
+          const shell = await assets.fetch(new Request(shellUrl.toString(), { headers: request.headers }))
+            .catch(() => null)
+          if (shell && shell.status < 400) {
+            return new Response(shell.body, {
+              status: shell.status,
+              headers: { ...Object.fromEntries(shell.headers), 'x-sub2api-error': encodeURIComponent(message).slice(0, 200) }
+            })
+          }
         }
-      })
+      }
+      return json({ error: 'Internal error', message }, 500)
     }
-
-    // Health check
-    if (path === '/health' || path === '/api/health') {
-      return json({ status: 'ok', timestamp: new Date().toISOString() })
-    }
-
-    // Login
-    if (path === '/api/v1/auth/login' && request.method === 'POST') {
-      return handleLogin(request, env)
-    }
-
-    // Setup. GET reports whether an administrator already exists so the login
-    // screen can offer initialization only on a fresh deployment.
-    if (path === '/api/v1/auth/setup') {
-      if (request.method === 'POST') return handleSetup(request, env)
-      if (request.method === 'GET') return handleSetupStatus(env)
-      return json({ error: 'Method not allowed' }, 405)
-    }
-
-    // Change the signed-in administrator password.
-    if (path === '/api/v1/auth/password' && request.method === 'POST') {
-      return handlePasswordChange(request, env)
-    }
-
-    // Aggregated dashboard metrics
-    if (path === '/api/v1/stats' && request.method === 'GET') {
-      return handleStats(request, env)
-    }
-
-    // API Key management
-    if (path.startsWith('/api/v1/keys')) {
-      return handleApiKeys(request, env)
-    }
-
-    // Usage
-    if (path === '/api/v1/usage' && request.method === 'GET') {
-      return handleUsage(request, env)
-    }
-
-    // Config endpoints
-    if (path.startsWith('/api/v1/groups')) {
-      return handleGroupsRequest(request, env, ctx)
-    }
-    if (path.startsWith('/api/v1/accounts')) {
-      return handleAccountsRequest(request, env)
-    }
-    if (path.startsWith('/api/v1/models')) {
-      return handleModelsRequest(request, env)
-    }
-
-    // Gateway endpoints
-    const failover = sharedFailover ?? (sharedFailover = new FailoverManager(env))
-    failover.setDb(createDatabase(env.DB))
-
-    // OpenAI clients commonly probe this endpoint before sending a request.
-    if (path === '/v1/models' && request.method === 'GET') {
-      return handleProviderModels(request, env)
-    }
-
-    if (path.startsWith('/v1/chat/completions')) {
-      return handleOpenAIRequest(request, env, failover, ctx)
-    }
-    if (path.startsWith('/v1/responses')) {
-      return handleOpenAIRequest(request, env, failover, ctx)
-    }
-    if (path.startsWith('/v1/messages')) {
-      return handleClaudeRequest(request, env, failover, ctx)
-    }
-    if (path.startsWith('/v1/')) {
-      return handleGatewayRequest(request, env, failover, ctx)
-    }
-
-    // In Pages advanced mode static files are exposed through ASSETS.
-    if (env.ASSETS) {
-      const assetResponse = await env.ASSETS.fetch(request)
-      if (assetResponse.status !== 404 || path.includes('.')) return assetResponse
-
-      // Pages canonicalizes /index.html to /. Use the root asset for SPA routes
-      // instead of requesting /index.html and creating a redirect loop.
-      const fallbackUrl = new URL(request.url)
-      fallbackUrl.pathname = '/'
-      return env.ASSETS.fetch(new Request(fallbackUrl.toString(), request))
-    }
-    return json({ error: 'Not found' }, 404)
   }
+}
+
+async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const url = new URL(request.url)
+  const path = url.pathname.replace(/\/+$/, '') || '/'
+
+  if (!env.DB) return json({ error: 'D1 binding DB is not configured' }, 500)
+
+  // CORS preflight
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key, Anthropic-Version, Anthropic-Beta',
+      }
+    })
+  }
+
+  // Health check
+  if (path === '/health' || path === '/api/health') {
+    return json({ status: 'ok', timestamp: new Date().toISOString() })
+  }
+
+  // Login
+  if (path === '/api/v1/auth/login' && request.method === 'POST') {
+    return handleLogin(request, env)
+  }
+
+  // Setup. GET reports whether an administrator already exists so the login
+  // screen can offer initialization only on a fresh deployment.
+  if (path === '/api/v1/auth/setup') {
+    if (request.method === 'POST') return handleSetup(request, env)
+    if (request.method === 'GET') return handleSetupStatus(env)
+    return json({ error: 'Method not allowed' }, 405)
+  }
+
+  // Change the signed-in administrator password.
+  if (path === '/api/v1/auth/password' && request.method === 'POST') {
+    return handlePasswordChange(request, env)
+  }
+
+  // Aggregated dashboard metrics
+  if (path === '/api/v1/stats' && request.method === 'GET') {
+    return handleStats(request, env)
+  }
+
+  // API Key management
+  if (path.startsWith('/api/v1/keys')) {
+    return handleApiKeys(request, env)
+  }
+
+  // Usage
+  if (path === '/api/v1/usage' && request.method === 'GET') {
+    return handleUsage(request, env)
+  }
+
+  // Config endpoints
+  if (path.startsWith('/api/v1/groups')) {
+    return handleGroupsRequest(request, env, ctx)
+  }
+  if (path.startsWith('/api/v1/accounts')) {
+    return handleAccountsRequest(request, env)
+  }
+  if (path.startsWith('/api/v1/models')) {
+    return handleModelsRequest(request, env)
+  }
+
+  // Gateway endpoints
+  const failover = sharedFailover ?? (sharedFailover = new FailoverManager(env))
+  failover.setDb(createDatabase(env.DB))
+
+  // OpenAI clients commonly probe this endpoint before sending a request.
+  if (path === '/v1/models' && request.method === 'GET') {
+    return handleProviderModels(request, env)
+  }
+
+  if (path.startsWith('/v1/chat/completions')) {
+    return handleOpenAIRequest(request, env, failover, ctx)
+  }
+  if (path.startsWith('/v1/responses')) {
+    return handleOpenAIRequest(request, env, failover, ctx)
+  }
+  if (path.startsWith('/v1/messages')) {
+    return handleClaudeRequest(request, env, failover, ctx)
+  }
+  if (path.startsWith('/v1/')) {
+    return handleGatewayRequest(request, env, failover, ctx)
+  }
+
+  // In Pages advanced mode static files are exposed through ASSETS.
+  if (env.ASSETS) {
+    const assetResponse = await env.ASSETS.fetch(request)
+    if (assetResponse.status !== 404 || path.includes('.')) return assetResponse
+
+    // Pages canonicalizes /index.html to /. Use the root asset for SPA routes
+    // instead of requesting /index.html and creating a redirect loop.
+    const fallbackUrl = new URL(request.url)
+    fallbackUrl.pathname = '/'
+    return env.ASSETS.fetch(new Request(fallbackUrl.toString(), request))
+  }
+  return json({ error: 'Not found' }, 404)
 }
 
 function json(data: any, status = 200) {
@@ -198,7 +230,15 @@ async function handleSetupStatus(env: Env): Promise<Response> {
 
   // Before the tables exist, setup is what creates them, so report it as
   // available rather than surfacing a database error on the login screen.
-  if (!(await db.schemaReady())) {
+  let ready: boolean
+  try {
+    ready = await db.schemaReady()
+  } catch (error) {
+    // Unreachable is not the same as empty. Reporting setup as available here
+    // would invite an operator to re-initialise a configured deployment.
+    return json({ error: '数据库暂时无法访问，请稍后重试', message: error instanceof Error ? error.message : '未知错误' }, 503)
+  }
+  if (!ready) {
     return json({ data: { initialized: false, setup_available: true, schema_ready: false } })
   }
 

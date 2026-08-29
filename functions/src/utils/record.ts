@@ -5,6 +5,9 @@ import { calculateCost } from '../billing';
 import { measureStreamTiming, StreamOutcome } from './proxy';
 import { Deferrable } from './background';
 
+/** Upper bound on how long the post-response bookkeeping may wait for a stream. */
+const STREAM_RECORD_TIMEOUT_MS = 15 * 60 * 1000;
+
 export interface RecordContext {
   db: Database;
   failover: FailoverManager;
@@ -46,7 +49,25 @@ export function streamWithRecording(
 
   const measured = measureStreamTiming(body, context.startedAt, outcome => settle(outcome));
 
-  const persist = finished.then(async outcome => {
+  // A stream that is never drained — an abandoned connection, or a runtime that
+  // does not deliver the transformer's cancel callback — would leave `finished`
+  // pending forever, and a `waitUntil` promise that never settles holds the
+  // request open until the edge kills it. Cap the wait so the isolate is always
+  // released; a partial record is better than a dropped request. The timer is
+  // cleared on the normal path so a finished request leaves nothing pending.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<StreamOutcome>(resolve => {
+    timer = setTimeout(
+      () => resolve({ promptTokens: 0, completionTokens: 0, totalTokens: 0, ttftMs: null, totalMs: Date.now() - context.startedAt }),
+      STREAM_RECORD_TIMEOUT_MS
+    );
+  });
+  const settled = Promise.race([finished, timeout]).then(outcome => {
+    if (timer !== undefined) clearTimeout(timer);
+    return outcome;
+  });
+
+  const persist = settled.then(async outcome => {
     const cost = isError ? 0 : calculateCost(
       context.provider,
       context.model,

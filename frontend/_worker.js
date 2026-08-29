@@ -627,8 +627,10 @@ var Database = class {
       await this.db.prepare(statement).run();
     }
     await this.applyAdditiveColumns();
-    await this.migrateChannelsIntoAccounts();
-    await this.setSetting("schema_version", SCHEMA_VERSION);
+    const folded = await this.migrateChannelsIntoAccounts();
+    if (folded) {
+      await this.setSetting("schema_version", SCHEMA_VERSION);
+    }
     return !wasReady;
   }
   /**
@@ -649,13 +651,13 @@ var Database = class {
    * never had a channels table (a fresh deployment) is unaffected.
    */
   async migrateChannelsIntoAccounts() {
-    if (await this.getSetting("channels_folded_into_accounts")) return;
+    if (await this.getSetting("channels_folded_into_accounts")) return true;
     const hasChannels = await this.queryOne(
       "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'channels'"
     ).catch(() => null);
     if (!Number(hasChannels?.total || 0)) {
       await this.setSetting("channels_folded_into_accounts", (/* @__PURE__ */ new Date()).toISOString());
-      return;
+      return true;
     }
     try {
       await this.update(`
@@ -690,7 +692,9 @@ var Database = class {
                       WHERE c.id = accounts.channel_id AND c.enabled = 0)
       `);
       await this.setSetting("channels_folded_into_accounts", (/* @__PURE__ */ new Date()).toISOString());
+      return true;
     } catch {
+      return false;
     }
   }
   /**
@@ -755,16 +759,19 @@ var Database = class {
     const row = await this.queryOne("SELECT value FROM settings WHERE key = ?", [key]);
     return row?.value ?? value;
   }
-  /** Cheap probe used to decide whether migration is needed. */
+  /**
+   * Cheap probe used to decide whether migration is needed.
+   *
+   * A failure propagates instead of reporting `false`. Treating an unreachable
+   * database as "no tables yet" made the login screen offer to initialise a
+   * deployment that was already set up, so callers must distinguish an empty
+   * database from one it could not read.
+   */
   async schemaReady() {
-    try {
-      const row = await this.queryOne(
-        "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','accounts','model_mappings','api_keys','usage_records','request_logs')"
-      );
-      return Number(row?.total || 0) >= 7;
-    } catch {
-      return false;
-    }
+    const row = await this.queryOne(
+      "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name IN ('users','groups','accounts','model_mappings','api_keys','usage_records','request_logs')"
+    );
+    return Number(row?.total || 0) >= 7;
   }
   // Cleanup old logs
   async cleanupOldLogs(days = 7) {
@@ -1309,6 +1316,7 @@ function calculateCost(provider, model, promptTokens, completionTokens) {
 }
 
 // functions/src/utils/record.ts
+var STREAM_RECORD_TIMEOUT_MS = 15 * 60 * 1e3;
 function streamWithRecording(body, status, headers, context) {
   const isError = status >= 400;
   let settle;
@@ -1316,7 +1324,18 @@ function streamWithRecording(body, status, headers, context) {
     settle = resolve;
   });
   const measured = measureStreamTiming(body, context.startedAt, (outcome) => settle(outcome));
-  const persist2 = finished.then(async (outcome) => {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(
+      () => resolve({ promptTokens: 0, completionTokens: 0, totalTokens: 0, ttftMs: null, totalMs: Date.now() - context.startedAt }),
+      STREAM_RECORD_TIMEOUT_MS
+    );
+  });
+  const settled = Promise.race([finished, timeout]).then((outcome) => {
+    if (timer !== void 0) clearTimeout(timer);
+    return outcome;
+  });
+  const persist2 = settled.then(async (outcome) => {
     const cost = isError ? 0 : calculateCost(
       context.provider,
       context.model,
@@ -2568,77 +2587,100 @@ function jsonError3(message, status) {
 var sharedFailover = null;
 var worker_default = {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname.replace(/\/+$/, "") || "/";
-    if (!env.DB) return json({ error: "D1 binding DB is not configured" }, 500);
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Anthropic-Version, Anthropic-Beta"
+    try {
+      return await route(request, env, ctx);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const wantsHtml = (request.headers.get("accept") || "").includes("text/html");
+      if (wantsHtml) {
+        const assets = env.ASSETS;
+        if (assets) {
+          const shellUrl = new URL(request.url);
+          shellUrl.pathname = "/";
+          const shell = await assets.fetch(new Request(shellUrl.toString(), { headers: request.headers })).catch(() => null);
+          if (shell && shell.status < 400) {
+            return new Response(shell.body, {
+              status: shell.status,
+              headers: { ...Object.fromEntries(shell.headers), "x-sub2api-error": encodeURIComponent(message).slice(0, 200) }
+            });
+          }
         }
-      });
+      }
+      return json({ error: "Internal error", message }, 500);
     }
-    if (path === "/health" || path === "/api/health") {
-      return json({ status: "ok", timestamp: (/* @__PURE__ */ new Date()).toISOString() });
-    }
-    if (path === "/api/v1/auth/login" && request.method === "POST") {
-      return handleLogin(request, env);
-    }
-    if (path === "/api/v1/auth/setup") {
-      if (request.method === "POST") return handleSetup(request, env);
-      if (request.method === "GET") return handleSetupStatus(env);
-      return json({ error: "Method not allowed" }, 405);
-    }
-    if (path === "/api/v1/auth/password" && request.method === "POST") {
-      return handlePasswordChange(request, env);
-    }
-    if (path === "/api/v1/stats" && request.method === "GET") {
-      return handleStats(request, env);
-    }
-    if (path.startsWith("/api/v1/keys")) {
-      return handleApiKeys(request, env);
-    }
-    if (path === "/api/v1/usage" && request.method === "GET") {
-      return handleUsage(request, env);
-    }
-    if (path.startsWith("/api/v1/groups")) {
-      return handleGroupsRequest(request, env, ctx);
-    }
-    if (path.startsWith("/api/v1/accounts")) {
-      return handleAccountsRequest(request, env);
-    }
-    if (path.startsWith("/api/v1/models")) {
-      return handleModelsRequest(request, env);
-    }
-    const failover = sharedFailover ?? (sharedFailover = new FailoverManager(env));
-    failover.setDb(createDatabase(env.DB));
-    if (path === "/v1/models" && request.method === "GET") {
-      return handleProviderModels(request, env);
-    }
-    if (path.startsWith("/v1/chat/completions")) {
-      return handleOpenAIRequest(request, env, failover, ctx);
-    }
-    if (path.startsWith("/v1/responses")) {
-      return handleOpenAIRequest(request, env, failover, ctx);
-    }
-    if (path.startsWith("/v1/messages")) {
-      return handleClaudeRequest(request, env, failover, ctx);
-    }
-    if (path.startsWith("/v1/")) {
-      return handleGatewayRequest(request, env, failover, ctx);
-    }
-    if (env.ASSETS) {
-      const assetResponse = await env.ASSETS.fetch(request);
-      if (assetResponse.status !== 404 || path.includes(".")) return assetResponse;
-      const fallbackUrl = new URL(request.url);
-      fallbackUrl.pathname = "/";
-      return env.ASSETS.fetch(new Request(fallbackUrl.toString(), request));
-    }
-    return json({ error: "Not found" }, 404);
   }
 };
+async function route(request, env, ctx) {
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+  if (!env.DB) return json({ error: "D1 binding DB is not configured" }, 500);
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Anthropic-Version, Anthropic-Beta"
+      }
+    });
+  }
+  if (path === "/health" || path === "/api/health") {
+    return json({ status: "ok", timestamp: (/* @__PURE__ */ new Date()).toISOString() });
+  }
+  if (path === "/api/v1/auth/login" && request.method === "POST") {
+    return handleLogin(request, env);
+  }
+  if (path === "/api/v1/auth/setup") {
+    if (request.method === "POST") return handleSetup(request, env);
+    if (request.method === "GET") return handleSetupStatus(env);
+    return json({ error: "Method not allowed" }, 405);
+  }
+  if (path === "/api/v1/auth/password" && request.method === "POST") {
+    return handlePasswordChange(request, env);
+  }
+  if (path === "/api/v1/stats" && request.method === "GET") {
+    return handleStats(request, env);
+  }
+  if (path.startsWith("/api/v1/keys")) {
+    return handleApiKeys(request, env);
+  }
+  if (path === "/api/v1/usage" && request.method === "GET") {
+    return handleUsage(request, env);
+  }
+  if (path.startsWith("/api/v1/groups")) {
+    return handleGroupsRequest(request, env, ctx);
+  }
+  if (path.startsWith("/api/v1/accounts")) {
+    return handleAccountsRequest(request, env);
+  }
+  if (path.startsWith("/api/v1/models")) {
+    return handleModelsRequest(request, env);
+  }
+  const failover = sharedFailover ?? (sharedFailover = new FailoverManager(env));
+  failover.setDb(createDatabase(env.DB));
+  if (path === "/v1/models" && request.method === "GET") {
+    return handleProviderModels(request, env);
+  }
+  if (path.startsWith("/v1/chat/completions")) {
+    return handleOpenAIRequest(request, env, failover, ctx);
+  }
+  if (path.startsWith("/v1/responses")) {
+    return handleOpenAIRequest(request, env, failover, ctx);
+  }
+  if (path.startsWith("/v1/messages")) {
+    return handleClaudeRequest(request, env, failover, ctx);
+  }
+  if (path.startsWith("/v1/")) {
+    return handleGatewayRequest(request, env, failover, ctx);
+  }
+  if (env.ASSETS) {
+    const assetResponse = await env.ASSETS.fetch(request);
+    if (assetResponse.status !== 404 || path.includes(".")) return assetResponse;
+    const fallbackUrl = new URL(request.url);
+    fallbackUrl.pathname = "/";
+    return env.ASSETS.fetch(new Request(fallbackUrl.toString(), request));
+  }
+  return json({ error: "Not found" }, 404);
+}
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -2701,7 +2743,13 @@ async function handleSetup(request, env) {
 }
 async function handleSetupStatus(env) {
   const db = createDatabase(env.DB);
-  if (!await db.schemaReady()) {
+  let ready;
+  try {
+    ready = await db.schemaReady();
+  } catch (error) {
+    return json({ error: "\u6570\u636E\u5E93\u6682\u65F6\u65E0\u6CD5\u8BBF\u95EE\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5", message: error instanceof Error ? error.message : "\u672A\u77E5\u9519\u8BEF" }, 503);
+  }
+  if (!ready) {
     return json({ data: { initialized: false, setup_available: true, schema_ready: false } });
   }
   const existing = await db.queryOne("SELECT id, password_hash FROM users LIMIT 1");
