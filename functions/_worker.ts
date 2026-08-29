@@ -94,16 +94,16 @@ export default {
     }
 
     if (path.startsWith('/v1/chat/completions')) {
-      return handleOpenAIRequest(request, env, failover)
+      return handleOpenAIRequest(request, env, failover, ctx)
     }
     if (path.startsWith('/v1/responses')) {
-      return handleOpenAIRequest(request, env, failover)
+      return handleOpenAIRequest(request, env, failover, ctx)
     }
     if (path.startsWith('/v1/messages')) {
-      return handleClaudeRequest(request, env, failover)
+      return handleClaudeRequest(request, env, failover, ctx)
     }
     if (path.startsWith('/v1/')) {
-      return handleGatewayRequest(request, env, failover)
+      return handleGatewayRequest(request, env, failover, ctx)
     }
 
     // In Pages advanced mode static files are exposed through ASSETS.

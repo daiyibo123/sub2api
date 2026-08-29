@@ -177,7 +177,25 @@ html.dark .btn-secondary:hover:not(:disabled) { background: rgba(20, 184, 166, .
   transition: background .2s, color .2s;
 }
 .icon-btn:hover { color: var(--text-1); background: var(--surface-2); }
-.icon-btn.spinning .ico { animation: spin .7s linear; }
+
+/*
+ * A quiet button for secondary actions that sit beside a primary one. Refresh
+ * competes with "create" for attention when both are filled, so it keeps a
+ * border and no fill until hovered.
+ */
+.btn-quiet {
+  color: var(--text-2);
+  background: var(--surface);
+  border-color: var(--line);
+}
+.btn-quiet:hover:not(:disabled) { color: var(--p600); background: var(--p50); border-color: var(--p200); }
+html.dark .btn-quiet { background: transparent; border-color: var(--line); }
+html.dark .btn-quiet:hover:not(:disabled) { color: var(--p300); background: rgba(20, 184, 166, .12); border-color: rgba(20, 184, 166, .3); }
+
+/* Spin for as long as the request runs, rather than for a fixed duration that
+ * ends before a slow fetch does. */
+.refresh-btn.is-busy { pointer-events: none; opacity: .75; }
+.refresh-btn.is-busy .ico { animation: spin .7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .text-btn {
@@ -239,7 +257,8 @@ html.dark .mini-btn:hover { color: var(--p300); background: rgba(20, 184, 166, .
 
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .form-grid .full, .form-field.full { grid-column: 1 / -1; }
-.form-field { min-width: 0; }
+/* Both wrappers are grid items; min-width:0 stops long values forcing overflow. */
+.form-field, .field { min-width: 0; }
 .form-message { min-height: 20px; margin: 10px 0 0; color: var(--red); font-size: 13px; }
 .form-message.ok { color: var(--emerald); }
 

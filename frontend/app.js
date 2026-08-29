@@ -17,6 +17,9 @@ const state = {
   user: readStorage('auth_user', null),
   page: 'dashboard',
   data: { keys: [], usage: [], groups: [], accounts: [], models: [] },
+  // Pages whose table currently holds real rows, so a refresh can skip the
+  // skeleton and avoid a visible flash on every navigation.
+  painted: new Set(),
   stats: null,
   filters: { keys: '', usage: '' },
   statsRange: { hours: 24, bucket: 'hour' },
@@ -212,6 +215,8 @@ function logout(notify = true) {
   state.user = null
   state.stats = null
   state.data = { keys: [], usage: [], groups: [], accounts: [], models: [] }
+  // Cached rows belong to the session that fetched them.
+  state.painted.clear()
   localStorage.removeItem('auth_token')
   localStorage.removeItem('auth_user')
   closeModal()
@@ -251,7 +256,36 @@ function navigate(page) {
   $('topbar-title').textContent = pageMeta[page].title
   $('topbar-subtitle').textContent = pageMeta[page].subtitle
   closeSidebar()
-  loadPage(page)
+
+  // Paint whatever is already cached before awaiting the network. The section
+  // markup ships empty, so without this the panel appears blank until the fetch
+  // resolves even when the data was loaded minutes ago.
+  paintCached(page)
+  loadPage(page, state.painted.has(page))
+}
+
+/**
+ * Render a page from cached state without touching the network.
+ *
+ * Returns true when something was drawn, so the caller can decide between a
+ * skeleton (nothing to show yet) and a quiet background refresh.
+ */
+function paintCached(page) {
+  if (page === 'dashboard') {
+    if (!state.stats) return false
+    renderDashboard()
+    state.painted.add(page)
+    return true
+  }
+  if (page === 'settings') {
+    renderSettings()
+    state.painted.add(page)
+    return true
+  }
+  if (!RENDERERS[page] || !state.data[page]?.length) return false
+  RENDERERS[page]()
+  state.painted.add(page)
+  return true
 }
 
 function openSidebar() {
@@ -308,8 +342,11 @@ async function loadPage(page, silent = false) {
   // loaded whenever those pages are open.
   const needsRefs = page === 'accounts' || page === 'models' || page === 'keys'
 
+  // A skeleton is only an improvement over a blank panel. Once real rows are
+  // already visible, replacing them with placeholders is the flicker itself.
+  const hasVisibleRows = state.painted.has(page)
   try {
-    if (target && !silent && !state.data[page].length) target.innerHTML = skeletonTable()
+    if (target && !hasVisibleRows) target.innerHTML = skeletonTable()
     const requests = [api(endpoint)]
     if (needsRefs) requests.push(api('/groups'))
     const [payload, groups] = await Promise.all(requests)
@@ -318,9 +355,12 @@ async function loadPage(page, silent = false) {
     if (needsRefs) state.data.groups = records(groups)
     setHealth(true)
     RENDERERS[page]?.()
+    state.painted.add(page)
     updateNavCounts()
   } catch (error) {
-    if (target) target.innerHTML = emptyState('i-alert', '加载失败', error.message)
+    // Keep already-rendered rows on screen; a failed refresh should not wipe
+    // data the operator is reading.
+    if (target && !hasVisibleRows) target.innerHTML = emptyState('i-alert', '加载失败', error.message)
     if (!silent) showToast(error.message, 'error')
   }
 }
@@ -340,6 +380,10 @@ async function loadDashboard(silent = false) {
     state.data.models = records(models)
     setHealth(true)
     renderDashboard()
+    // The dashboard loads every entity, but only paints its own widgets. Mark
+    // just the dashboard as painted: the other sections' list nodes are still
+    // empty, so navigate() must render them from this cache on first visit.
+    state.painted.add('dashboard')
     updateNavCounts()
   } catch (error) {
     setHealth(false)
@@ -1238,14 +1282,31 @@ $('sidebar-scrim').addEventListener('click', closeSidebar)
 $('nav-logout').addEventListener('click', () => logout(true))
 $('user-menu').addEventListener('click', () => navigate('settings'))
 
-$('topbar-refresh').addEventListener('click', async () => {
-  const button = $('topbar-refresh')
-  button.classList.add('spinning')
-  await loadPage(state.page)
-  setTimeout(() => button.classList.remove('spinning'), 400)
-})
-$('dashboard-refresh').addEventListener('click', () => loadDashboard())
-$('btn-refresh-usage').addEventListener('click', () => loadPage('usage'))
+/**
+ * Spin a refresh control for exactly as long as its request runs.
+ *
+ * A fixed timer either stops while a slow fetch is still pending or keeps
+ * spinning after a fast one finished, so the animation is tied to the promise.
+ * The button is disabled meanwhile so repeated clicks cannot stack requests.
+ */
+async function withRefreshSpin(button, work) {
+  if (!button || button.classList.contains('is-busy')) return
+  button.classList.add('is-busy')
+  try {
+    await work()
+  } finally {
+    button.classList.remove('is-busy')
+  }
+}
+
+// An explicit click reports failures: silent mode exists for background polls,
+// and a refresh that quietly does nothing looks like a broken button.
+$('topbar-refresh').addEventListener('click', event =>
+  withRefreshSpin(event.currentTarget, () => loadPage(state.page)))
+$('dashboard-refresh').addEventListener('click', event =>
+  withRefreshSpin(event.currentTarget, () => loadDashboard()))
+$('btn-refresh-usage').addEventListener('click', event =>
+  withRefreshSpin(event.currentTarget, () => loadPage('usage')))
 
 $('btn-create-key').addEventListener('click', () => openKeyModal())
 $('btn-create-group').addEventListener('click', () => openGroupModal())

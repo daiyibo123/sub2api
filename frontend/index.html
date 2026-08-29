@@ -182,7 +182,7 @@
         </div>
         <div class="topbar-actions">
           <span id="health-pill" class="health-pill"><span class="dot"></span><span id="health-text">连接正常</span></span>
-          <button id="topbar-refresh" class="icon-btn" type="button" aria-label="刷新数据" title="刷新数据">
+          <button id="topbar-refresh" class="icon-btn refresh-btn" type="button" aria-label="刷新数据" title="刷新数据">
             <svg class="ico" aria-hidden="true"><use href="#i-refresh"/></svg>
           </button>
           <button id="user-menu" class="user-chip" type="button">
@@ -207,8 +207,8 @@
               <p>系统概览与统计数据</p>
             </div>
             <div class="page-heading-actions">
-              <button id="dashboard-refresh" class="btn btn-secondary" type="button">
-                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-refresh"/></svg>刷新
+              <button id="dashboard-refresh" class="btn btn-quiet refresh-btn" type="button" title="重新拉取统计数据">
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-refresh"/></svg><span>刷新</span>
               </button>
             </div>
           </div>
@@ -317,8 +317,8 @@
           <div class="page-heading">
             <div><h1><span class="page-icon tint-sky"><svg class="ico ico-sm" aria-hidden="true"><use href="#i-activity"/></svg></span>使用记录</h1><p>请求状态、模型、耗时与 Token 使用情况</p></div>
             <div class="page-heading-actions">
-              <button id="btn-refresh-usage" class="btn btn-secondary" type="button">
-                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-refresh"/></svg>刷新
+              <button id="btn-refresh-usage" class="btn btn-quiet refresh-btn" type="button" title="重新拉取调用记录">
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-refresh"/></svg><span>刷新</span>
               </button>
             </div>
           </div>

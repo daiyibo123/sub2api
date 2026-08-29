@@ -3,6 +3,7 @@ import type { Database } from '../db';
 import type { FailoverManager } from '../failover';
 import { calculateCost } from '../billing';
 import { measureStreamTiming, StreamOutcome } from './proxy';
+import { defer, Deferrable } from './background';
 
 export interface RecordContext {
   db: Database;
@@ -14,6 +15,8 @@ export interface RecordContext {
   model: string;
   rateMultiplier: number;
   startedAt: number;
+  /** Keeps the post-stream writes alive after the Response is returned. */
+  ctx?: Deferrable;
 }
 
 /**
@@ -41,10 +44,10 @@ export function streamWithRecording(
     ) * context.rateMultiplier;
 
     if (cost > 0) {
-      context.db.incrementApiKeyUsage(context.keyRecordId, cost).catch(() => {});
+      defer(context.ctx, context.db.incrementApiKeyUsage(context.keyRecordId, cost));
     }
 
-    context.db.createUsageRecord({
+    defer(context.ctx, context.db.createUsageRecord({
       api_key_id: context.keyRecordId,
       model: context.model,
       provider: context.provider,
@@ -56,9 +59,9 @@ export function streamWithRecording(
       error_message: isError ? 'Upstream error' : '',
       latency_ms: outcome.totalMs,
       ttft_ms: outcome.ttftMs ?? undefined
-    }).catch(() => {});
+    }));
 
-    context.db.createRequestLog({
+    defer(context.ctx, context.db.createRequestLog({
       account_id: context.accountId,
       group_id: context.groupId,
       model: context.model,
@@ -66,7 +69,7 @@ export function streamWithRecording(
       error_message: isError ? 'Upstream error' : '',
       latency_ms: outcome.totalMs,
       ttft_ms: outcome.ttftMs ?? undefined
-    }).catch(() => {});
+    }));
   });
 
   context.failover.recordRequest(context.accountId, context.groupId, isError);

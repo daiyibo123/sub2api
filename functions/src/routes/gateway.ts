@@ -5,10 +5,11 @@ import { authenticateApiKey, hashApiKey } from '../auth';
 import { FailoverManager } from '../failover';
 import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials , accountRateMultiplier } from '../utils/proxy';
 import { streamWithRecording } from '../utils/record';
+import { defer, Deferrable } from '../utils/background';
 import { extractTokenUsage, calculateCost } from '../billing';
 import { Account, Group, ModelMapping } from '../types';
 
-export async function handleGatewayRequest(request: Request, env: Env, failover: FailoverManager): Promise<Response> {
+export async function handleGatewayRequest(request: Request, env: Env, failover: FailoverManager, ctx?: Deferrable): Promise<Response> {
   const db = createDatabase(env.DB);
   const url = new URL(request.url);
   
@@ -153,8 +154,8 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     if (isError && failover.shouldFailover({ status: responseStatus }) && accounts.length > 1) {
       await proxyResponse.text().catch(() => '');
       failover.recordRequest(account.id, group.id, true);
-      db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }).catch(() => {});
-      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`, preferredGroupId, startTime);
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }));
+      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx);
     }
     
     if (stream && proxyResponse.body) {
@@ -165,7 +166,8 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
         accountId: account.id, groupId: group.id,
         provider: provider, model: upstreamModel,
         rateMultiplier: accountRateMultiplier(account),
-        startedAt: startTime
+        startedAt: startTime,
+        ctx
       });
     }
     
@@ -186,18 +188,18 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     
     // Record usage and request log
     if (cost > 0) {
-      db.incrementApiKeyUsage(keyRecord.id, cost).catch(() => {});
+      defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    db.createUsageRecord({ api_key_id: keyRecord.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: responseStatus, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }).catch(() => {});
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: responseStatus, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
     
-    db.createRequestLog({
+    defer(ctx, db.createRequestLog({
       account_id: account.id,
       group_id: group.id,
       model: upstreamModel,
       status: responseStatus,
       error_message: isError ? errorMessage : '',
       latency_ms: Date.now() - startTime
-    }).catch(() => {});
+    }));
     
     // Record for failover
     failover.recordRequest(account.id, group.id, isError);
@@ -218,10 +220,10 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     
     // Record failover
     failover.recordRequest(account.id, group.id, true);
-    db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }).catch(() => {});
+    defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
     
     // Try to failover to next account
-    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, startTime);
+    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx);
   }
 }
 
@@ -240,7 +242,8 @@ async function handleFailover(
   stream: boolean,
   errorMessage: string,
   preferredGroupId?: number,
-  originStart: number = Date.now()
+  originStart: number = Date.now(),
+  ctx?: Deferrable
 ): Promise<Response> {
   const db = createDatabase(env.DB);
   
@@ -300,19 +303,20 @@ async function handleFailover(
           accountId: account.id, groupId: group.id,
           provider: provider, model: upstreamModel,
           rateMultiplier: accountRateMultiplier(account),
-          startedAt: originStart
+          startedAt: originStart,
+          ctx
         });
       }
 
       failover.recordRequest(account.id, group.id, isError);
-      db.createRequestLog({
+      defer(ctx, db.createRequestLog({
         account_id: account.id,
         group_id: group.id,
         model: upstreamModel,
         status: proxyResponse.status,
         error_message: isError ? 'Upstream error' : '',
         latency_ms: 0
-      }).catch(() => {});
+      }));
       const responseText = await proxyResponse.text();
       
       return new Response(responseText, {
@@ -322,7 +326,7 @@ async function handleFailover(
       
     } catch (retryError) {
       failover.recordRequest(account.id, group.id, true);
-      db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : 'Upstream request failed', latency_ms: 0 }).catch(() => {});
+      defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: retryError instanceof Error ? retryError.message : 'Upstream request failed', latency_ms: 0 }));
       continue;
     }
   }
