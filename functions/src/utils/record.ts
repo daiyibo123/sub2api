@@ -1,7 +1,7 @@
 // Shared request/usage bookkeeping for the gateway routes.
 import type { Database } from '../db';
 import type { FailoverManager } from '../failover';
-import { calculateCost } from '../billing';
+import { calculateCostBreakdown } from '../billing';
 import { measureStreamTiming, StreamOutcome } from './proxy';
 import { Deferrable } from './background';
 
@@ -68,12 +68,14 @@ export function streamWithRecording(
   });
 
   const persist = settled.then(async outcome => {
-    const cost = isError ? 0 : calculateCost(
+    const breakdown = isError ? { baseCost: 0, cost: 0, multiplier: context.rateMultiplier, estimated: false } : calculateCostBreakdown(
       context.provider,
       context.model,
       outcome.promptTokens,
-      outcome.completionTokens
-    ) * context.rateMultiplier;
+      outcome.completionTokens,
+      context.rateMultiplier
+    );
+    const cost = breakdown.cost;
 
     if (cost > 0) {
       await context.db.incrementApiKeyUsage(context.keyRecordId, cost).catch(() => {});
@@ -89,6 +91,10 @@ export function streamWithRecording(
       completion_tokens: outcome.completionTokens,
       total_tokens: outcome.totalTokens,
       cost,
+      base_cost: breakdown.baseCost,
+      rate_multiplier: breakdown.multiplier,
+      cost_estimated: breakdown.estimated ? 1 : 0,
+      cache_status: 'bypass',
       status,
       error_message: isError ? 'Upstream error' : '',
       latency_ms: outcome.totalMs,

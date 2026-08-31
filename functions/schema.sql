@@ -71,10 +71,13 @@ CREATE TABLE IF NOT EXISTS model_mappings (
 CREATE TABLE IF NOT EXISTS api_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   key_hash TEXT NOT NULL UNIQUE,
+  key_ciphertext TEXT,
   name TEXT,
   enabled INTEGER DEFAULT 1,
   balance REAL DEFAULT 0,
   quota_limit REAL DEFAULT 0,
+  group_id INTEGER,
+  fallback_group_id INTEGER,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -88,6 +91,10 @@ CREATE TABLE IF NOT EXISTS usage_records (
   completion_tokens INTEGER DEFAULT 0,
   total_tokens INTEGER DEFAULT 0,
   cost REAL DEFAULT 0,
+  base_cost REAL DEFAULT 0,
+  rate_multiplier REAL DEFAULT 1,
+  cost_estimated INTEGER DEFAULT 0,
+  cache_status TEXT,
   status INTEGER DEFAULT 200,
   error_message TEXT,
   latency_ms INTEGER,

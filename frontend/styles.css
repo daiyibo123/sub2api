@@ -223,6 +223,7 @@ html.dark .btn-quiet:hover:not(:disabled) { color: var(--p300); background: rgba
 .mini-btn:hover { color: var(--p600); background: var(--p50); }
 html.dark .mini-btn:hover { color: var(--p300); background: rgba(20, 184, 166, .14); }
 .mini-btn.danger:hover { color: var(--red); background: rgba(239, 68, 68, .1); }
+.mini-btn.is-disabled { opacity: .5; }
 .mini-btn:disabled { opacity: .5; cursor: not-allowed; }
 
 .row-actions { display: flex; align-items: center; gap: 2px; justify-content: flex-end; }
@@ -383,7 +384,7 @@ html.dark .notice-warn { color: var(--amber); }
 .brand-text strong { display: block; font-size: 17px; font-weight: 700; letter-spacing: -.02em; white-space: nowrap; }
 .brand-text span { display: block; margin-top: 1px; color: var(--text-3); font-size: 11px; white-space: nowrap; }
 
-.sidebar-nav { flex: 1; overflow-y: auto; padding: 14px 12px; }
+.sidebar-nav { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 12px; }
 .nav-section { margin: 16px 0 8px; padding: 0 12px; color: var(--text-3); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
 .nav-section:first-child { margin-top: 0; }
 .nav-rule { display: none; height: 1px; margin: 14px 12px 10px; background: var(--line); }
@@ -443,17 +444,19 @@ html.dark .nav-item.active .nav-badge { background: rgba(20, 184, 166, .25); col
 
 /* collapsed rail */
 .sidebar-collapsed .sidebar { width: var(--sidebar-w-collapsed); }
-.sidebar-collapsed .sidebar-head { padding: 0 18px; }
+.sidebar-collapsed .sidebar-head { justify-content: center; padding: 0 8px; }
 .sidebar-collapsed .brand-text { max-width: 0; opacity: 0; }
-.sidebar-collapsed .nav-item { justify-content: center; padding-left: 10px; padding-right: 10px; }
+.sidebar-collapsed .sidebar-nav { overflow-y: hidden; padding: 14px 8px; }
+.sidebar-collapsed .nav-item { width: 56px; height: 44px; justify-content: center; gap: 0; margin: 2px auto; padding: 10px; }
+.sidebar-collapsed .nav-item > .ico { width: 20px; height: 20px; }
 .sidebar-collapsed .nav-item > span:not(.nav-icon) { display: none; }
 .sidebar-collapsed .nav-section { max-width: 0; overflow: hidden; opacity: 0; margin-bottom: 0; }
-.sidebar-collapsed .nav-rule { display: block; }
+.sidebar-collapsed .nav-rule { display: block; margin-left: 12px; margin-right: 12px; }
 .sidebar-collapsed .user-chip { justify-content: center; padding-left: 0; padding-right: 0; }
 .sidebar-collapsed .user-chip-meta, .sidebar-collapsed .user-chip .icon-btn { display: none; }
 .sidebar-collapsed .app-main { margin-left: var(--sidebar-w-collapsed); }
 
-.app-main { margin-left: var(--sidebar-w); min-height: 100vh; transition: margin .3s ease; }
+.app-main { margin-left: var(--sidebar-w); min-width: 0; min-height: 100vh; transition: margin .3s ease; }
 
 .topbar {
   position: sticky;
@@ -487,7 +490,7 @@ html.dark .nav-item.active .nav-badge { background: rgba(20, 184, 166, .25); col
 html.dark .health-pill { background: rgba(20, 184, 166, .12); color: var(--p300); }
 .health-pill.bad { background: rgba(239, 68, 68, .1); color: var(--red); }
 
-.main-content { max-width: 1560px; margin: 0 auto; padding: 20px; display: grid; gap: 20px; }
+.main-content { width: 100%; max-width: 1560px; min-width: 0; margin: 0 auto; padding: 20px; display: grid; gap: 20px; }
 @media (min-width: 768px) { .main-content { padding: 24px; } }
 @media (min-width: 1024px) { .main-content { padding: 32px; } }
 
@@ -572,8 +575,8 @@ html.dark .quick-action:hover { border-color: rgba(20, 184, 166, .3); background
 
 /* Resource summary cards on the dashboard. Stacked rather than one flat row so
    the count reads as the headline and the enabled ratio stays legible. */
-.res-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 0 20px 20px; }
-@media (min-width: 1280px) { .res-cards { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+.res-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; padding: 0 20px 20px; }
+@media (max-width: 520px) { .res-cards { grid-template-columns: 1fr; } }
 .res-card {
   min-width: 0;
   display: flex;
@@ -747,6 +750,10 @@ th:last-child, td:last-child { text-align: right; }
    identity chip rather than a health signal. */
 .badge-group { color: var(--indigo); background: rgba(99, 102, 241, .12); }
 html.dark .badge-group { color: #a5b4fc; }
+/* The fallback pool is a secondary route, so it reads quieter than the primary
+   group chip while still being recognisably the same kind of thing. */
+.badge-group.fallback { color: var(--text-2); background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--line); }
+html.dark .badge-group.fallback { color: var(--text-2); }
 html.dark .badge-warn { color: var(--amber); }
 
 .badge-provider { border-radius: var(--radius-sm); text-transform: none; }
@@ -795,6 +802,7 @@ html.dark .prov-anthropic { color: #fdba74; }
   animation: modal-in .22s ease-out;
 }
 .modal-card.wide { width: min(100%, 760px); }
+.modal-card.modal-sm { width: min(100%, 460px); }
 @keyframes modal-in { from { opacity: 0; transform: scale(.96); } }
 
 .modal-head {
@@ -825,6 +833,30 @@ html.dark .prov-anthropic { color: #fdba74; }
 .modal-error { min-height: 18px; margin: 14px 0 0; color: var(--red); font-size: 13px; }
 .confirm-text { margin: 0; font-size: 13.5px; line-height: 1.6; }
 .confirm-text strong { font-weight: 600; }
+
+/* Health-check dialog: model picker plus the verdict for the probed model. */
+.test-panel { display: grid; gap: 14px; }
+.test-model-row { display: flex; align-items: center; gap: 8px; }
+.test-model-row .field-select { flex: 1; min-width: 0; }
+.test-model-row .btn { flex: 0 0 auto; }
+.test-result {
+  min-height: 40px;
+  padding: 11px 13px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-ctl);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.test-result.is-pending { border-color: var(--p200); background: var(--p50); color: var(--p600); }
+.test-result.is-ok { border-color: rgba(16, 185, 129, .35); background: rgba(16, 185, 129, .1); color: var(--emerald); }
+.test-result.is-err { border-color: rgba(239, 68, 68, .35); background: rgba(239, 68, 68, .08); color: var(--red); }
+html.dark .test-result.is-pending { border-color: rgba(20, 184, 166, .3); background: rgba(20, 184, 166, .12); color: var(--p300); }
+@media (max-width: 520px) {
+  .test-model-row { flex-direction: column; align-items: stretch; }
+}
 
 .secret-box {
   display: flex;

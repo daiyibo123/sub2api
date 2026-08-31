@@ -4,6 +4,7 @@ export interface Env {
   CONFIG_KV?: KVNamespace;
   ASSETS?: { fetch(request: Request): Promise<Response> };
   JWT_SECRET?: string;
+  API_KEY_ENCRYPTION_KEY?: string;
   ERROR_RATE_THRESHOLD?: string;
   ERROR_COUNT_THRESHOLD?: string;
   WINDOW_SECONDS?: string;

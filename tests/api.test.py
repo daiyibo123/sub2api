@@ -149,6 +149,19 @@ st, js = call("GET", "/api/v1/keys", token=token)
 check("key list never returns secret",
       all("key" not in k and "key_hash" not in k for k in js.get("data", [])), js.get("data"))
 
+st, js = call("POST", "/api/v1/keys/%s/reveal" % kid, token=token)
+revealed = js.get("data", {}).get("key", "")
+check("new key can be revealed for copying", st == 200 and revealed == secret, (st, js))
+
+st, js = call("GET", "/api/v1/keys/%s/reveal" % kid, token=token)
+check("key reveal rejects GET", st == 405, (st, js))
+st, js = call("POST", "/api/v1/keys/not-an-id/reveal", token=token)
+check("key reveal rejects malformed IDs", st in (404, 405), (st, js))
+
+st, js = call("GET", "/api/v1/keys", token=token)
+check("key list never returns secret or ciphertext",
+      all("key" not in k and "key_hash" not in k and "key_ciphertext" not in k for k in js.get("data", [])), js.get("data"))
+
 st, js = call("PUT", "/api/v1/keys/%s" % kid, {"enabled": 0}, token)
 check("toggle key", st == 200 and js.get("data", {}).get("enabled") == 0, (st, js))
 

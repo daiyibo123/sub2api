@@ -43,9 +43,14 @@ export function extractTokenUsage(body: any, headers: Headers | Record<string, s
   return { promptTokens, completionTokens, totalTokens };
 }
 
-// Calculate cost based on model and provider
-export function calculateCost(provider: string, model: string, promptTokens: number, completionTokens: number): number {
-  // Default pricing (per 1K tokens, in USD)
+export interface CostBreakdown {
+  baseCost: number;
+  cost: number;
+  multiplier: number;
+  estimated: boolean;
+}
+
+export function calculateCostBreakdown(provider: string, model: string, promptTokens: number, completionTokens: number, multiplier = 1): CostBreakdown {
   const pricing: Record<string, Record<string, { prompt: number; completion: number }>> = {
     openai: {
       'gpt-4o': { prompt: 2.5, completion: 10 },
@@ -68,12 +73,20 @@ export function calculateCost(provider: string, model: string, promptTokens: num
       'grok-vision-beta': { prompt: 2, completion: 10 },
     }
   };
-  
-  const providerPricing = pricing[provider] || pricing['openai'];
-  const modelPricing = providerPricing[model] || { prompt: 1, completion: 2 }; // Default pricing
-  
-  const promptCost = (promptTokens / 1000) * modelPricing.prompt;
-  const completionCost = (completionTokens / 1000) * modelPricing.completion;
-  
-  return Math.round((promptCost + completionCost) * 1000000) / 1000000; // Round to 6 decimals
+  const modelPricing = pricing[provider]?.[model];
+  const rates = modelPricing || { prompt: 1, completion: 2 };
+  const raw = (promptTokens / 1000) * rates.prompt + (completionTokens / 1000) * rates.completion;
+  const baseCost = Math.round(raw * 1000000) / 1000000;
+  const safeMultiplier = Number.isFinite(Number(multiplier)) && Number(multiplier) >= 0 ? Number(multiplier) : 1;
+  return {
+    baseCost,
+    cost: Math.round(baseCost * safeMultiplier * 1000000) / 1000000,
+    multiplier: safeMultiplier,
+    estimated: !modelPricing
+  };
+}
+
+// Calculate cost based on model and provider
+export function calculateCost(provider: string, model: string, promptTokens: number, completionTokens: number): number {
+  return calculateCostBreakdown(provider, model, promptTokens, completionTokens).baseCost;
 }

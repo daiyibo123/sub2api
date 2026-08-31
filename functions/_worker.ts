@@ -12,10 +12,22 @@ import { handleGrokRequest } from './src/routes/grok'
 import { handleGroupsRequest } from './src/config/groups'
 import { handleAccountsRequest } from './src/config/accounts'
 import { handleModelsRequest } from './src/config/models'
+import { encryptApiKey, decryptApiKey, resolveApiKeyEncryptionSecret } from './src/key-crypto'
+import { routingCacheMetrics, invalidateRoutingSnapshot } from './src/utils/routing-cache'
 
 // Keep an isolate-local scheduler between requests. Persistent request logs in
 // D1 are also consulted by FailoverManager, so this cache is only a fast path.
 let sharedFailover: FailoverManager | null = null
+
+/**
+ * Drop this isolate's cached routing snapshot.
+ *
+ * The snapshot is keyed by the shared scheduler, so there is nothing to clear
+ * before the first gateway request has created one.
+ */
+function invalidateRouting(): void {
+  if (sharedFailover) invalidateRoutingSnapshot(sharedFailover)
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -106,14 +118,19 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return handleUsage(request, env)
   }
 
-  // Config endpoints
+  // Config endpoints. A write changes which accounts the gateway may pick, so
+  // the isolate's routing snapshot is dropped immediately instead of serving
+  // stale routing for the rest of its TTL.
   if (path.startsWith('/api/v1/groups')) {
+    if (request.method !== 'GET') invalidateRouting()
     return handleGroupsRequest(request, env, ctx)
   }
   if (path.startsWith('/api/v1/accounts')) {
+    if (request.method !== 'GET') invalidateRouting()
     return handleAccountsRequest(request, env)
   }
   if (path.startsWith('/api/v1/models')) {
+    if (request.method !== 'GET') invalidateRouting()
     return handleModelsRequest(request, env)
   }
 
@@ -282,8 +299,7 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
 
   const db = createDatabase(env.DB)
   const stats = await db.getDashboardStats(hours, bucket)
-
-  return json({ data: { hours, bucket, ...stats } })
+  return json({ data: { hours, bucket, cache: routingCacheMetrics(), ...stats } })
 }
 
 async function handleApiKeys(request: Request, env: Env): Promise<Response> {
@@ -293,7 +309,48 @@ async function handleApiKeys(request: Request, env: Env): Promise<Response> {
   }
 
   const db = createDatabase(env.DB)
+  await db.ensureSchema()
   const url = new URL(request.url)
+  const keyPath = url.pathname.replace(/\/+$/, '')
+  const revealMatch = /^\/api\/v1\/keys\/(\d+)\/reveal$/.exec(keyPath)
+  const itemMatch = /^\/api\/v1\/keys\/(\d+)$/.exec(keyPath)
+
+  if (keyPath !== '/api/v1/keys' && !revealMatch && !itemMatch) {
+    return json({ error: 'Invalid API Key path' }, 404)
+  }
+
+  // Reveal is deliberately a strict POST endpoint. It is separate from the
+  // list response so plaintext keys never enter the normal page payload.
+  if (revealMatch) {
+    if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405)
+    if (session.isAdmin !== true) return json({ error: '需要管理员权限' }, 403)
+
+    const id = Number(revealMatch[1])
+    const key = await db.getApiKeyCiphertext(id)
+    if (!key) return json({ error: 'API Key not found' }, 404)
+    if (!key.key_ciphertext) {
+      return json({ error: '该密钥创建于旧版本，无法恢复，请重新创建' }, 409)
+    }
+
+    try {
+      const secret = await decryptApiKey(
+        key.key_ciphertext,
+        await resolveApiKeyEncryptionSecret(db, env.API_KEY_ENCRYPTION_KEY)
+      )
+      return new Response(JSON.stringify({ data: { id, key: secret } }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+          'Pragma': 'no-cache',
+          'Access-Control-Allow-Origin': '*'
+        }
+      })
+    } catch {
+      // Do not leak cipher details or the configured encryption secret.
+      return json({ error: '密钥解密失败，请重新创建' }, 500)
+    }
+  }
 
   if (request.method === 'GET') {
     const keys = await db.listApiKeys()
@@ -301,7 +358,7 @@ async function handleApiKeys(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === 'POST') {
-    let body: { name?: string; quota_limit?: number; group_id?: number | null }
+    let body: { name?: string; quota_limit?: number; group_id?: number | null; fallback_group_id?: number | null }
     try { body = await request.json() } catch { return json({ error: 'Invalid JSON body' }, 400) }
 
     const name = String(body.name || '').trim()
@@ -312,13 +369,22 @@ async function handleApiKeys(request: Request, env: Env): Promise<Response> {
     let groupId: number | null = null
     if (body.group_id !== undefined && body.group_id !== null && String(body.group_id) !== '') {
       groupId = Number(body.group_id)
-      if (!groupId || !(await db.getGroup(groupId))) return json({ error: '所选分组不存在' }, 400)
+      if (!groupId || !(await db.getGroup(groupId))) return json({ error: '所选主分组不存在' }, 400)
+    }
+
+    let fallbackGroupId: number | null = null
+    if (body.fallback_group_id !== undefined && body.fallback_group_id !== null && String(body.fallback_group_id) !== '') {
+      fallbackGroupId = Number(body.fallback_group_id)
+      if (!fallbackGroupId || !(await db.getGroup(fallbackGroupId))) return json({ error: '所选兜底分组不存在' }, 400)
+      if (fallbackGroupId === groupId) return json({ error: '主分组和兜底分组不能相同' }, 400)
     }
 
     const apiKey = `sk-${Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b => b.toString(16).padStart(2, '0')).join('')}`
     const keyHash = await hashApiKey(apiKey)
+    const keySecret = await resolveApiKeyEncryptionSecret(db, env.API_KEY_ENCRYPTION_KEY)
+    const keyCiphertext = await encryptApiKey(apiKey, keySecret)
 
-    const result = await db.createApiKey(keyHash, name, body.quota_limit || 0, groupId)
+    const result = await db.createApiKey(keyHash, keyCiphertext, name, body.quota_limit || 0, groupId, fallbackGroupId)
 
     return json({
       data: {
@@ -328,7 +394,8 @@ async function handleApiKeys(request: Request, env: Env): Promise<Response> {
         enabled: true,
         balance: 0,
         quota_limit: body.quota_limit || 0,
-        group_id: groupId
+        group_id: groupId,
+        fallback_group_id: fallbackGroupId
       }
     }, 201)
   }
@@ -337,8 +404,11 @@ async function handleApiKeys(request: Request, env: Env): Promise<Response> {
     const id = parseInt(url.pathname.split('/').pop() || '0')
     if (!id) return json({ error: 'Invalid ID' }, 400)
 
-    let body: { name?: string; enabled?: number | boolean; balance?: number; quota_limit?: number; group_id?: number | null }
+    let body: { name?: string; enabled?: number | boolean; balance?: number; quota_limit?: number; group_id?: number | null; fallback_group_id?: number | null }
     try { body = await request.json() } catch { return json({ error: 'Invalid JSON body' }, 400) }
+
+    const existing = await db.queryOne<any>('SELECT * FROM api_keys WHERE id = ?', [id])
+    if (!existing) return json({ error: 'API Key not found' }, 404)
 
     const updates: Record<string, unknown> = {}
     if (body.name !== undefined) {
@@ -350,19 +420,34 @@ async function handleApiKeys(request: Request, env: Env): Promise<Response> {
     if (body.balance !== undefined && Number.isFinite(Number(body.balance))) updates.balance = Number(body.balance)
     if (body.quota_limit !== undefined && Number.isFinite(Number(body.quota_limit))) updates.quota_limit = Math.max(0, Number(body.quota_limit))
     if (body.group_id !== undefined) {
-      // An explicit empty value clears the pin and restores access to all groups.
+      // An explicit empty value clears the primary pin and restores access to all groups.
       if (body.group_id === null || String(body.group_id) === '') {
         updates.group_id = null
       } else {
         const groupId = Number(body.group_id)
-        if (!groupId || !(await db.getGroup(groupId))) return json({ error: '所选分组不存在' }, 400)
+        if (!groupId || !(await db.getGroup(groupId))) return json({ error: '所选主分组不存在' }, 400)
         updates.group_id = groupId
+        if (body.fallback_group_id !== undefined && body.fallback_group_id !== null && Number(body.fallback_group_id) === groupId) {
+          return json({ error: '主分组和兜底分组不能相同' }, 400)
+        }
+      }
+    }
+    if (body.fallback_group_id !== undefined) {
+      if (body.fallback_group_id === null || String(body.fallback_group_id) === '') {
+        updates.fallback_group_id = null
+      } else {
+        const fallbackGroupId = Number(body.fallback_group_id)
+        if (!fallbackGroupId || !(await db.getGroup(fallbackGroupId))) return json({ error: '所选兜底分组不存在' }, 400)
+        const effectivePrimary = body.group_id !== undefined ? Number(body.group_id) || 0 : Number(existing.group_id) || 0
+        if (fallbackGroupId === effectivePrimary) return json({ error: '主分组和兜底分组不能相同' }, 400)
+        updates.fallback_group_id = fallbackGroupId
       }
     }
     await db.updateApiKey(id, updates)
-    const key = await db.queryOne(`SELECT k.id, k.name, k.enabled, k.balance, k.quota_limit, k.group_id, k.created_at,
-             g.name AS group_name
-      FROM api_keys k LEFT JOIN groups g ON k.group_id = g.id WHERE k.id = ?`, [id])
+    const key = await db.queryOne(`SELECT k.id, k.name, k.enabled, k.balance, k.quota_limit, k.group_id, k.fallback_group_id, k.created_at,
+             CASE WHEN k.key_ciphertext IS NOT NULL AND TRIM(k.key_ciphertext) != '' THEN 1 ELSE 0 END AS can_copy,
+             g.name AS group_name, fg.name AS fallback_group_name
+      FROM api_keys k LEFT JOIN groups g ON k.group_id = g.id LEFT JOIN groups fg ON k.fallback_group_id = fg.id WHERE k.id = ?`, [id])
     if (!key) return json({ error: 'API Key not found' }, 404)
     return json({ data: key })
   }

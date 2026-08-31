@@ -52,10 +52,14 @@ export interface ModelMapping {
 export interface ApiKey {
   id: number;
   key_hash: string;
+  /** Encrypted value for administrator-only copy; never returned by list APIs. */
+  key_ciphertext?: string | null;
   name?: string;
   enabled: number;
   balance: number;
   quota_limit: number;
+  group_id?: number | null;
+  fallback_group_id?: number | null;
   created_at: string;
 }
 
@@ -71,6 +75,10 @@ export interface UsageRecord {
   completion_tokens: number;
   total_tokens: number;
   cost: number;
+  base_cost?: number;
+  rate_multiplier?: number;
+  cost_estimated?: number | boolean;
+  cache_status?: string | null;
   status: number;
   error_message?: string;
   latency_ms?: number;

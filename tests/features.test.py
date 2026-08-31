@@ -20,7 +20,7 @@ from upstream_stub import serve  # noqa: E402
 BASE = sys.argv[1] if len(sys.argv) > 1 else 'http://127.0.0.1:8788'
 API = f'{BASE}/api/v1'
 ADMIN = ('admin', 'StrongPass123')
-PORT_FAST, PORT_SLOW = 9201, 9202
+PORT_FAST, PORT_SLOW, PORT_FALLBACK = 9201, 9202, 9203
 
 passed = 0
 failures = []
@@ -71,7 +71,7 @@ def seen(port):
 
 
 # ------------------------------------------------------------------ fixtures
-for port in (PORT_FAST, PORT_SLOW):
+for port in (PORT_FAST, PORT_SLOW, PORT_FALLBACK):
     serve(port)
 time.sleep(0.4)
 
@@ -156,6 +156,65 @@ check('refusal explains the group has no accounts',
 
 status, payload = call('/keys', 'POST', {'name': 'feat-bad-group', 'group_id': 999999}, token=token)
 check('key with unknown group rejected', status == 400, (status, payload))
+
+# ------------------------------------------- primary group, then fallback group
+# A key may name a second group used only after the primary one has nothing
+# healthy left. The fallback must never win while the primary can still serve,
+# otherwise a cheaper account in the fallback pool would quietly steal traffic.
+_, fallback_account = call('/accounts', 'POST', {
+    'name': 'feat-fallback', 'provider': 'openai', 'api_key': 'sk-fallback',
+    'base_url': f'http://127.0.0.1:{PORT_FALLBACK}',
+    'group_id': other_id, 'priority': 0, 'rate_multiplier': 0.1,
+}, token=token)
+fallback_account_id = fallback_account.get('data', {}).get('id')
+check('fallback-group account created', bool(fallback_account_id), fallback_account.get('data'))
+
+status, payload = call('/keys', 'POST', {
+    'name': 'feat-fallback-key', 'group_id': primary_id, 'fallback_group_id': other_id,
+}, token=token)
+fallback_key = payload.get('data', {}).get('key')
+check('key accepts a fallback group',
+      status == 201 and payload.get('data', {}).get('fallback_group_id') == other_id,
+      (status, payload.get('data')))
+
+status, payload = call('/keys', 'POST', {
+    'name': 'feat-same-group', 'group_id': primary_id, 'fallback_group_id': primary_id,
+}, token=token)
+check('fallback group cannot equal the primary group', status == 400, (status, payload))
+
+# The fallback account is the cheapest of the three, so if tiering were ignored
+# it would be picked first. The primary group must still answer.
+for port in (PORT_FAST, PORT_SLOW, PORT_FALLBACK):
+    control(port, reset=True, status=200, stream=False)
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=fallback_key, base=BASE)
+check('primary group answers while it is healthy',
+      status == 200 and payload.get('id') == f'chatcmpl-{PORT_FAST}', (status, payload.get('id')))
+check('fallback upstream stayed untouched', len(seen(PORT_FALLBACK)) == 0, seen(PORT_FALLBACK))
+
+# Disable both primary accounts: the tier is now empty, so the fallback group is
+# the only place left to route. A config write also drops the routing snapshot,
+# so this must take effect on the very next request.
+call(f'/accounts/{cheap_id}', 'PUT', {'enabled': 0}, token=token)
+call(f'/accounts/{pricey_id}', 'PUT', {'enabled': 0}, token=token)
+for port in (PORT_FAST, PORT_SLOW, PORT_FALLBACK):
+    control(port, reset=True, status=200, stream=False)
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=fallback_key, base=BASE)
+check('empty primary group falls back to the fallback group',
+      status == 200 and payload.get('id') == f'chatcmpl-{PORT_FALLBACK}', (status, payload.get('id')))
+
+# A key with no fallback group must fail rather than borrow another group.
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=client_key, base=BASE)
+check('key without a fallback group is still refused', status == 503, (status, payload))
+
+call(f'/accounts/{cheap_id}', 'PUT', {'enabled': 1}, token=token)
+call(f'/accounts/{pricey_id}', 'PUT', {'enabled': 1}, token=token)
+call(f'/accounts/{fallback_account_id}', 'PUT', {'enabled': 0}, token=token)
 
 # ------------------------------------------------------ TTFT + stream records
 control(PORT_FAST, reset=True, status=200, stream=True)

@@ -272,10 +272,12 @@ export class Database {
   // API Key operations
   async listApiKeys() {
     return this.query<any>(`
-      SELECT k.id, k.name, k.enabled, k.balance, k.quota_limit, k.group_id, k.created_at,
-             g.name AS group_name
+      SELECT k.id, k.name, k.enabled, k.balance, k.quota_limit, k.group_id, k.fallback_group_id, k.created_at,
+             CASE WHEN k.key_ciphertext IS NOT NULL AND TRIM(k.key_ciphertext) != '' THEN 1 ELSE 0 END AS can_copy,
+             g.name AS group_name, fg.name AS fallback_group_name
       FROM api_keys k
       LEFT JOIN groups g ON k.group_id = g.id
+      LEFT JOIN groups fg ON k.fallback_group_id = fg.id
       ORDER BY k.id DESC
     `);
   }
@@ -284,10 +286,16 @@ export class Database {
     return this.queryOne<any>('SELECT * FROM api_keys WHERE key_hash = ?', [keyHash]);
   }
 
-  async createApiKey(keyHash: string, name?: string, quotaLimit = 0, groupId: number | null = null) {
+  async createApiKey(keyHash: string, keyCiphertext: string | null, name?: string, quotaLimit = 0, groupId: number | null = null, fallbackGroupId: number | null = null) {
     return this.insert(
-      'INSERT INTO api_keys (key_hash, name, quota_limit, group_id) VALUES (?, ?, ?, ?)',
-      [keyHash, name || '', quotaLimit, groupId]
+      'INSERT INTO api_keys (key_hash, key_ciphertext, name, quota_limit, group_id, fallback_group_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [keyHash, keyCiphertext, name || '', quotaLimit, groupId, fallbackGroupId]
+    );
+  }
+
+  async getApiKeyCiphertext(id: number) {
+    return this.queryOne<{ id: number; key_ciphertext: string | null }>(
+      'SELECT id, key_ciphertext FROM api_keys WHERE id = ?', [id]
     );
   }
 
@@ -300,6 +308,7 @@ export class Database {
     if (updates.balance !== undefined) { fields.push('balance = ?'); values.push(updates.balance); }
     if (updates.quota_limit !== undefined) { fields.push('quota_limit = ?'); values.push(updates.quota_limit); }
     if (updates.group_id !== undefined) { fields.push('group_id = ?'); values.push(updates.group_id); }
+    if (updates.fallback_group_id !== undefined) { fields.push('fallback_group_id = ?'); values.push(updates.fallback_group_id); }
     
     if (fields.length === 0) return { changes: 0 };
     values.push(id);
@@ -321,8 +330,8 @@ export class Database {
   async createUsageRecord(record: Partial<UsageRecord>) {
     return this.insert(
       `INSERT INTO usage_records
-       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, status, error_message, latency_ms, ttft_ms, group_id, account_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (api_key_id, model, provider, prompt_tokens, completion_tokens, total_tokens, cost, base_cost, rate_multiplier, cost_estimated, cache_status, status, error_message, latency_ms, ttft_ms, group_id, account_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.api_key_id ?? 0,
         record.model,
@@ -331,6 +340,10 @@ export class Database {
         record.completion_tokens ?? 0,
         record.total_tokens ?? 0,
         record.cost ?? 0,
+        record.base_cost ?? record.cost ?? 0,
+        record.rate_multiplier ?? 1,
+        record.cost_estimated ?? 0,
+        record.cache_status ?? null,
         record.status ?? 200,
         record.error_message || '',
         record.latency_ms ?? 0,
@@ -410,9 +423,14 @@ export class Database {
           COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
           COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
           COALESCE(SUM(cost), 0) AS total_cost,
-          COALESCE(AVG(NULLIF(latency_ms, 0)), 0) AS avg_latency
+          COALESCE(SUM(base_cost), 0) AS base_cost,
+          COALESCE(AVG(NULLIF(ttft_ms, 0)), 0) AS avg_ttft,
+          COALESCE(AVG(NULLIF(latency_ms, 0)), 0) AS avg_latency,
+          COALESCE(SUM(CASE WHEN cache_status = 'hit' THEN 1 ELSE 0 END), 0) AS cache_hits,
+          COALESCE(SUM(CASE WHEN cache_status IS NOT NULL THEN 1 ELSE 0 END), 0) AS cache_samples
         FROM usage_records
-      `),
+        WHERE created_at >= ?
+      `, [since]),
       this.queryOne<any>(`
         SELECT
           COUNT(*) AS today_requests,
@@ -447,13 +465,15 @@ export class Database {
         GROUP BY bucket ORDER BY bucket ASC
       `, [since]),
       this.query<any>(`
-        SELECT model, COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens, COALESCE(SUM(cost), 0) AS cost
-        FROM usage_records GROUP BY model ORDER BY requests DESC LIMIT 12
-      `),
+        SELECT model, COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens,
+               COALESCE(SUM(base_cost), 0) AS base_cost, COALESCE(SUM(cost), 0) AS cost
+        FROM usage_records WHERE created_at >= ? GROUP BY model ORDER BY requests DESC LIMIT 12
+      `, [since]),
       this.query<any>(`
-        SELECT provider, COUNT(*) AS requests, COALESCE(SUM(cost), 0) AS cost
-        FROM usage_records GROUP BY provider ORDER BY requests DESC
-      `)
+        SELECT provider, COUNT(*) AS requests, COALESCE(SUM(base_cost), 0) AS base_cost,
+               COALESCE(SUM(cost), 0) AS cost
+        FROM usage_records WHERE created_at >= ? GROUP BY provider ORDER BY requests DESC
+      `, [since])
     ]);
 
     return { totals: totals || {}, today: today || {}, resources: resources || {}, trend, byModel, byProvider };

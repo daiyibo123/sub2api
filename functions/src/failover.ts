@@ -126,7 +126,8 @@ export class FailoverManager {
   async selectAccount(
     accounts: Account[],
     groups: Map<number, Group>,
-    preferredGroupId?: number
+    preferredGroupId?: number,
+    fallbackGroupIds: number[] = []
   ): Promise<SelectAccountResult | null> {
     if (accounts.length === 0) return null;
 
@@ -136,42 +137,64 @@ export class FailoverManager {
     });
     if (usableAccounts.length === 0) return null;
 
-    // A model mapping may target a group. Prefer that group, but keep a
-    // provider-compatible fallback when it has no usable accounts.
-    const preferred = preferredGroupId
+    // A pinned primary group is a hard first tier. A fallback group is only
+    // considered after the primary tier has no candidate left; this prevents a
+    // slower/cheaper account in another group from stealing primary traffic.
+    const primary = preferredGroupId
       ? usableAccounts.filter(acc => acc.group_id === preferredGroupId)
       : [];
-    const candidateAccounts = preferred.length > 0 ? preferred : usableAccounts;
+    const hasFallbackPolicy = Boolean(preferredGroupId && fallbackGroupIds.length);
+    const initialAccounts = primary.length > 0
+      ? primary
+      : hasFallbackPolicy
+        ? usableAccounts.filter(acc => fallbackGroupIds.includes(acc.group_id))
+        : usableAccounts;
+    if (initialAccounts.length === 0) return null;
 
     const statsByAccount = new Map<number, AccountErrorStats>(
-      await Promise.all(candidateAccounts.map(async acc => [
+      await Promise.all(initialAccounts.map(async acc => [
         acc.id,
         await this.getErrorStats(acc.id, groups.get(acc.group_id))
       ] as const))
     );
-    let healthyAccounts = candidateAccounts.filter(acc => !statsByAccount.get(acc.id)!.isUnhealthy);
+    let healthyAccounts = initialAccounts.filter(acc => !statsByAccount.get(acc.id)!.isUnhealthy);
+
+    // With a primary/fallback policy, an unhealthy primary tier must not be
+    // selected merely because it is the least unhealthy. Move to the fallback
+    // tier instead. If the fallback tier is also unhealthy, use its least-bad
+    // account as the final admission fallback rather than failing outright.
+    if (healthyAccounts.length === 0 && hasFallbackPolicy && primary.length > 0) {
+      const fallback = usableAccounts.filter(acc => fallbackGroupIds.includes(acc.group_id));
+      if (fallback.length === 0) return null;
+      const fallbackStats = await Promise.all(fallback.map(async acc => [
+        acc.id,
+        await this.getErrorStats(acc.id, groups.get(acc.group_id))
+      ] as const));
+      for (const [id, stats] of fallbackStats) statsByAccount.set(id, stats);
+      healthyAccounts = fallback.filter(acc => !statsByAccount.get(acc.id)!.isUnhealthy);
+      if (healthyAccounts.length === 0) healthyAccounts = fallback;
+    }
 
     // Every account is circuit-broken: fall back to the least unhealthy rather
-    // than refusing the request outright.
+    // than refusing the request outright. This applies only when there is no
+    // explicit fallback tier, or after the fallback tier has been selected.
     if (healthyAccounts.length === 0) {
-      healthyAccounts = [...candidateAccounts].sort((a, b) => {
+      healthyAccounts = [...initialAccounts].sort((a, b) => {
         const statsA = statsByAccount.get(a.id)!;
         const statsB = statsByAccount.get(b.id)!;
         return statsA.errorRate - statsB.errorRate || statsA.errorCount - statsB.errorCount;
       });
     }
 
-    // Explicit priority stays dominant so operators keep hard control of
-    // ordering. Billing weight only breaks ties between equally-prioritised
-    // accounts, where preferring the cheaper upstream costs nothing.
-    //
-    // This differs from sub2api, which is cost-blind: there the multiplier is
-    // only ever a pass/fail admission gate, never a ranking key.
     healthyAccounts.sort((a, b) => {
       const groupA = groups.get(a.group_id)!;
       const groupB = groups.get(b.group_id)!;
       const statsA = statsByAccount.get(a.id)!;
       const statsB = statsByAccount.get(b.id)!;
+      // Explicit ordering stays dominant so operators keep hard control: group
+      // priority first, then account priority. Billing weight only breaks ties
+      // between equally-prioritised accounts, where preferring the cheaper
+      // upstream costs nothing.
       return (groupA.priority - groupB.priority)
         || (a.priority - b.priority)
         || (accountRateMultiplier(a) - accountRateMultiplier(b))

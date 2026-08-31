@@ -154,7 +154,10 @@ function rowActions(buttons) {
   return `<div class="row-actions">${buttons.join('')}</div>`
 }
 function actionButton(action, id, label, iconName, tone = '') {
-  return `<button class="mini-btn ${tone}" data-action="${action}" data-id="${id}" type="button" title="${esc(label)}">${icon(iconName, 'ico-sm')}<span>${esc(label)}</span></button>`
+  const disabled = tone === 'disabled'
+  const classes = ['mini-btn', disabled ? 'is-disabled' : tone].filter(Boolean).join(' ')
+  const title = disabled ? '旧版本密钥无法恢复，请重新创建' : label
+  return `<button class="${classes}" data-action="${action}" data-id="${id}" data-copyable="${disabled ? '0' : '1'}" type="button" title="${esc(title)}">${icon(iconName, 'ico-sm')}<span>${esc(label)}</span></button>`
 }
 
 function showToast(message, type = 'info') {
@@ -513,6 +516,13 @@ function renderDashboard() {
   const successRequests = num(totals.success_requests)
   const successRate = totalRequests ? (successRequests / totalRequests * 100) : 0
 
+  const totalCost = num(totals.total_cost)
+  const baseCost = num(totals.base_cost)
+  const cacheSamples = num(totals.cache_samples)
+  const cacheHits = num(totals.cache_hits)
+  const cacheRate = cacheSamples ? (cacheHits / cacheSamples * 100) : 0
+  const avgTtft = num(totals.avg_ttft)
+
   $('stats-grid').innerHTML = [
     statCard({
       label: '总请求数', iconName: 'i-activity', tint: 'tint-teal',
@@ -525,19 +535,29 @@ function renderDashboard() {
       caption: totalRequests ? `${fmtInt(totalRequests - successRequests)} 次失败` : '暂无调用记录'
     }),
     statCard({
+      label: '平均首字', iconName: 'i-zap', tint: 'tint-violet',
+      value: avgTtft ? fmtLatency(avgTtft) : '--',
+      caption: '流式首字节时间'
+    }),
+    statCard({
       label: '平均响应', iconName: 'i-clock', tint: 'tint-rose',
       value: num(totals.avg_latency) ? fmtLatency(totals.avg_latency) : '--',
       caption: `${fmtInt(res.active_accounts)} 个账号可调度`
     }),
     statCard({
-      label: '总费用', iconName: 'i-coin', tint: 'tint-amber',
-      value: fmtCost(totals.total_cost),
-      caption: `今日 ${fmtCost(today.today_cost)}`
+      label: '总费用（倍率后）', iconName: 'i-coin', tint: 'tint-amber',
+      value: fmtCost(totalCost),
+      caption: `基础价 ${fmtCost(baseCost)}`
     }),
     statCard({
       label: '总 Token', iconName: 'i-token', tint: 'tint-indigo',
       value: fmtTokens(totals.total_tokens),
       caption: `输入 ${fmtTokens(totals.prompt_tokens)} · 输出 ${fmtTokens(totals.completion_tokens)}`
+    }),
+    statCard({
+      label: '路由缓存命中率', iconName: 'i-layers', tint: 'tint-sky',
+      value: cacheSamples ? `${cacheRate.toFixed(1)}%` : '--',
+      caption: `${fmtInt(cacheHits)} / ${fmtInt(cacheSamples)} 次配置命中`
     }),
     statCard({
       label: '今日 Token', iconName: 'i-zap', tint: 'tint-violet',
@@ -686,7 +706,7 @@ function renderKeys() {
 
   $('keys-list').innerHTML = items.length
     ? table(
-        ['名称', '分组', '状态', '已用额度', '额度上限', '创建时间', '操作'],
+            ['名称', '主分组', '兜底分组', '状态', '已用额度', '额度上限', '创建时间', '操作'],
         items.map(item => {
           const used = num(item.balance)
           const limit = num(item.quota_limit)
@@ -696,6 +716,9 @@ function renderKeys() {
             item.group_id
               ? `<span class="badge badge-group">${esc(item.group_name || `#${item.group_id}`)}</span>`
               : '<span class="cell-dim">全部分组</span>',
+            item.fallback_group_id
+              ? `<span class="badge badge-group fallback">${esc(item.fallback_group_name || `#${item.fallback_group_id}`)}</span>`
+              : '<span class="cell-dim">未设置</span>',
             toggleControl('toggle-key', item.id, isOn(item.enabled)),
             limit > 0
               ? `<span class="cell-main">$${used.toFixed(4)}</span><div class="meter"><span style="width:${ratio}%"></span></div>`
@@ -703,6 +726,7 @@ function renderKeys() {
             limit > 0 ? `$${limit.toFixed(2)}` : '<span class="cell-dim">不限</span>',
             `<span class="cell-dim">${fmtDate(item.created_at)}</span>`,
             rowActions([
+              actionButton('copy-key', item.id, '复制', 'i-copy', item.can_copy ? '' : 'disabled'),
               actionButton('edit-key', item.id, '编辑', 'i-edit'),
               actionButton('delete-key', item.id, '删除', 'i-trash', 'danger')
             ])
@@ -1006,16 +1030,20 @@ function openKeyModal(key = null) {
   const editing = Boolean(key)
   openModal({
     title: editing ? '编辑 API 密钥' : '创建 API 密钥',
-    subtitle: editing ? '密钥本身不可查看，只能修改名称与额度。' : '为客户端生成一个新的访问密钥。',
+    subtitle: editing ? '密钥可在列表中复制；旧版本创建的密钥无法恢复。' : '为客户端生成一个新的访问密钥。',
     submitLabel: editing ? '保存修改' : '生成密钥',
     body: formGrid(
       field('名称', textInput('name', key?.name || '', '例如 production-app', 'text', 'required'), { id: 'f-name', required: true }) +
       field('额度上限（USD）', textInput('quota_limit', key?.quota_limit ?? 0, '0 表示不限额', 'number', 'min="0" step="0.01"'), {
         id: 'f-quota_limit', hint: '按累计费用计算，达到上限后密钥自动拒绝请求。'
       }) +
-      field('绑定分组', selectInput('group_id', groupOptions(key?.group_id, '不限（全部分组）')), {
+      field('主分组', selectInput('group_id', groupOptions(key?.group_id, '不限（全部分组）')), {
         id: 'f-group_id', full: true,
-        hint: '绑定后该密钥只会调度所选分组内的账号；分组内无可用账号时请求直接失败，不会跨分组。'
+        hint: '优先使用主分组内的账号；主分组整体不可用时才进入兜底分组。'
+      }) +
+      field('兜底分组', selectInput('fallback_group_id', groupOptions(key?.fallback_group_id, '不设置兜底分组')), {
+        id: 'f-fallback_group_id', full: true,
+        hint: '只能选择与主分组不同的分组，且请求仍会按当前模型的服务商筛选账号。'
       }) +
       (editing ? field('已用额度（USD）', textInput('balance', num(key.balance).toFixed(4), '', 'number', 'min="0" step="0.0001"'), { id: 'f-balance', hint: '可手动重置，例如续费后清零。' }) : '') +
       field('状态', switchField('enabled', editing ? isOn(key.enabled) : true), { full: !editing })
@@ -1030,7 +1058,8 @@ function openKeyModal(key = null) {
         quota_limit: num(values.quota_limit),
         enabled: values.enabled === 'on' ? 1 : 0,
         // Empty string means "any group"; the API stores NULL for that.
-        group_id: values.group_id ? num(values.group_id) : null
+        group_id: values.group_id ? num(values.group_id) : null,
+        fallback_group_id: values.fallback_group_id ? num(values.fallback_group_id) : null
       }
       if (editing) {
         payload.balance = num(values.balance)
@@ -1165,6 +1194,84 @@ function openAccountModal(account = null) {
   })
 }
 
+/**
+ * Health-check dialog: pick an upstream model, then probe with it.
+ *
+ * A fixed probe model is the reason a live Anthropic key could still report a
+ * connection failure — relays and restricted plans often serve a different set
+ * of models than the hard-coded default. The list is fetched from the account's
+ * own upstream, and the chosen model is what the probe actually sends.
+ */
+function openAccountTestModal(account) {
+  const fallback = account.provider === 'anthropic'
+    ? 'claude-3-5-haiku-20241022'
+    : account.provider === 'xai' ? 'grok-2-latest' : 'gpt-4o-mini'
+
+  const card = openModal({
+    title: '账号测活',
+    subtitle: `${account.name || `#${account.id}`} · ${providerLabel(account.provider)}`,
+    size: 'modal-sm',
+    body: `<div class="test-panel">
+      ${field('上游模型', `<div class="test-model-row">
+        <select class="field-select" id="f-test_model" name="model"><option value="">${esc(`使用默认模型（${fallback}）`)}</option></select>
+        <button class="btn btn-secondary" type="button" data-fetch-models>${icon('i-refresh', 'ico-sm')}<span>获取模型</span></button>
+      </div>`, {
+        id: 'f-test_model', full: true,
+        hint: '点击“获取模型”从该账号的上游拉取可用模型；也可以直接用默认模型测试。'
+      })}
+      <div class="test-result" data-test-result></div>
+    </div>`,
+    footer: `<button class="btn btn-ghost" type="button" data-modal-close>关闭</button>
+             <button class="btn btn-primary" type="button" data-run-test>${icon('i-play', 'ico-sm')}<span>开始测试</span></button>`
+  })
+
+  const select = card.querySelector('#f-test_model')
+  const resultNode = card.querySelector('[data-test-result]')
+  const fetchButton = card.querySelector('[data-fetch-models]')
+  const runButton = card.querySelector('[data-run-test]')
+
+  const setResult = (message, tone) => {
+    resultNode.className = `test-result ${tone ? `is-${tone}` : ''}`
+    resultNode.textContent = message
+  }
+
+  fetchButton.addEventListener('click', async () => {
+    fetchButton.disabled = true
+    setResult('正在获取上游模型…', 'pending')
+    try {
+      const result = await api(`/accounts/${account.id}/models`)
+      const models = result?.data?.models || []
+      if (!models.length) throw new Error('上游没有返回可用模型')
+      select.innerHTML = `<option value="">${esc(`使用默认模型（${fallback}）`)}</option>`
+        + models.map(entry => option(entry.id, entry.name && entry.name !== entry.id ? `${entry.id}（${entry.name}）` : entry.id)).join('')
+      setResult(`已获取 ${models.length} 个模型`, 'ok')
+    } catch (error) {
+      setResult(error.message || '获取上游模型失败', 'err')
+    } finally {
+      fetchButton.disabled = false
+    }
+  })
+
+  runButton.addEventListener('click', async () => {
+    runButton.disabled = true
+    setResult('正在测试…', 'pending')
+    try {
+      const result = await api(`/accounts/${account.id}/test`, {
+        method: 'POST',
+        body: { model: select.value || '' }
+      })
+      const ok = result?.success === true
+      setResult(result?.message || (ok ? '连接测试成功' : '连接测试失败'), ok ? 'ok' : 'err')
+      // The probe stores its verdict on the row, so refresh the table behind the dialog.
+      await loadPage('accounts', true)
+    } catch (error) {
+      setResult(error.message || '连接测试失败', 'err')
+    } finally {
+      runButton.disabled = false
+    }
+  })
+}
+
 function openModelModal(model = null) {
   const editing = Boolean(model)
   openModal({
@@ -1283,6 +1390,22 @@ document.addEventListener('click', async event => {
         await copyText(action.dataset.text || '', action)
         break
 
+      case 'copy-key': {
+        if (action.dataset.copyable !== '1') {
+          throw new Error('该密钥创建于旧版本，无法恢复，请重新创建')
+        }
+        action.disabled = true
+        try {
+          const result = await api(`/keys/${id}/reveal`, { method: 'POST' })
+          const secret = result?.data?.key || ''
+          if (!secret) throw new Error('密钥内容为空，请重新创建')
+          await copyText(secret, action)
+        } finally {
+          action.disabled = false
+        }
+        break
+      }
+
       case 'edit-key': { const record = findRecord('keys', id); if (record) openKeyModal(record); break }
       case 'toggle-key': await toggleEntity('/keys', 'keys', id, action); break
       case 'delete-key': {
@@ -1309,20 +1432,8 @@ document.addEventListener('click', async event => {
         break
       }
       case 'test-account': {
-        const original = action.innerHTML
-        action.disabled = true
-        action.innerHTML = `${icon('i-clock', 'ico-sm')}<span>测试中</span>`
-        try {
-          const result = await api(`/accounts/${id}/test`, { method: 'POST' })
-          const ok = result?.success === true || result?.data?.success === true
-          const message = result?.message || result?.data?.message || (ok ? '连接测试成功' : '连接测试失败')
-          showToast(message, ok ? 'success' : 'error')
-          // The probe stores its verdict on the row, so reload to surface it.
-          await loadPage('accounts', true)
-        } finally {
-          action.disabled = false
-          action.innerHTML = original
-        }
+        const record = findRecord('accounts', id)
+        if (record) openAccountTestModal(record)
         break
       }
 

@@ -7,8 +7,9 @@ import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMappin
 import { streamWithRecording } from '../utils/record';
 import { defer, Deferrable } from '../utils/background';
 import { getModelFromHeader } from '../utils/headers';
-import { extractTokenUsage, calculateCost } from '../billing';
+import { extractTokenUsage, calculateCostBreakdown } from '../billing';
 import { Account, Group, ModelMapping } from '../types';
+import { loadRoutingSnapshot } from '../utils/routing-cache';
 
 export async function handleClaudeRequest(request: Request, env: Env, failover: FailoverManager, ctx?: Deferrable): Promise<Response> {
   const db = createDatabase(env.DB);
@@ -39,19 +40,21 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   const stream = requestBody.stream === true;
   
   // Get Anthropic accounts
-  let accounts = await db.listEnabledAccounts();
+  const routing = await loadRoutingSnapshot(db, failover);
+  let accounts = routing.accounts;
   accounts = accounts.filter(a => a.provider === 'anthropic' && a.enabled);
 
   // A client key may be pinned to one group. That is a hard constraint: serving
   // it from another group would bill and route traffic somewhere the operator
   // deliberately excluded, so an empty result fails instead of falling back.
   const keyGroupId = Number(keyRecord?.group_id) || 0;
+  const fallbackGroupId = Number(keyRecord?.fallback_group_id) || 0;
   if (keyGroupId) {
-    accounts = accounts.filter(account => Number(account.group_id) === keyGroupId);
+    accounts = accounts.filter(account => Number(account.group_id) === keyGroupId || Number(account.group_id) === fallbackGroupId);
     if (accounts.length === 0) {
       return new Response(JSON.stringify({
         error: 'No available accounts',
-        message: '该 API 密钥绑定的分组下没有可用账号'
+        message: '该 API 密钥绑定的主分组和兜底分组下没有可用账号'
       }), { status: 503, headers: { 'Content-Type': 'application/json' } });
     }
   }
@@ -61,26 +64,22 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
   }
   
   // Load supporting data
-  const [groupsRaw, mappingsRaw] = await Promise.all([
-    db.listGroups(),
-    db.listModelMappings()
-  ]);
-  const groups = new Map(groupsRaw.map(g => [g.id, g]));
-  const mappings = mappingsRaw;
+  const groups = new Map(routing.groups.map(g => [g.id, g]));
+  const mappings = routing.mappings;
   
   // Apply model mapping
   const mapping = findModelMapping(model, mappings, 'anthropic');
   let upstreamModel = mapping?.requested_model.endsWith('*')
     ? mapping.upstream_model + model.slice(mapping.requested_model.length - 1)
     : (mapping?.upstream_model || model);
-  const preferredGroupId = mapping?.group_id || undefined;
+  const preferredGroupId = keyGroupId || mapping?.group_id || undefined;
   
   if (upstreamModel && upstreamModel !== model && requestBody.model) {
     requestBody.model = upstreamModel;
   }
   
   // Select account with failover
-  const selection = await failover.selectAccount(accounts, groups, preferredGroupId);
+  const selection = await failover.selectAccount(accounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
   if (!selection) {
     return new Response(JSON.stringify({ error: 'No available accounts' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
   }
@@ -113,7 +112,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
       await proxyResponse.text().catch(() => '');
       failover.recordRequest(account.id, group.id, true);
       defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: proxyResponse.status, error_message: `Upstream returned ${proxyResponse.status}`, latency_ms: Date.now() - startTime }));
-      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx);
+      return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, upstreamModel, stream, `Upstream returned ${proxyResponse.status}`, preferredGroupId, startTime, ctx, fallbackGroupId);
     }
     if (stream && proxyResponse.body) {
       // Streaming records usage from the stream's completion callback so
@@ -137,13 +136,14 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
     
     // Calculate cost
     const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
-    const cost = calculateCost('anthropic', upstreamModel, promptTokens, completionTokens);
+    const breakdown = calculateCostBreakdown('anthropic', upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
+    const cost = breakdown.cost;
     
     // Record usage
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: 'anthropic', prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider: 'anthropic', prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: proxyResponse.status, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
     
     // Record request log
     defer(ctx, db.createRequestLog({
@@ -162,7 +162,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
       status: proxyResponse.status,
       headers: {
         ...proxyResponse.headers,
-        'content-type': 'application/json'
+        'content-type': 'application/json', 'cache-control': 'no-store, no-transform'
       }
     });
     
@@ -172,7 +172,7 @@ export async function handleClaudeRequest(request: Request, env: Env, failover: 
     defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
     
     // Try failover
-    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx);
+    return handleClaudeFailover(JSON.stringify(requestBody), request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
   }
 }
 
@@ -191,7 +191,8 @@ async function handleClaudeFailover(
   errorMessage: string,
   preferredGroupId?: number,
   originStart: number = Date.now(),
-  ctx?: Deferrable
+  ctx?: Deferrable,
+  fallbackGroupId = 0
 ): Promise<Response> {
   const db = createDatabase(env.DB);
   
@@ -199,7 +200,7 @@ async function handleClaudeFailover(
   const maxRetries = Math.min(Math.max(Number(env.MAX_SAME_ACCOUNT_RETRIES) || 3, 1), 5);
   for (let i = 0; i < maxRetries; i++) {
     const nextAccounts = accounts.filter(a => a.enabled && !attempted.has(a.id));
-    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId);
+    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
     
     if (!selection) break;
     
@@ -255,7 +256,7 @@ async function handleClaudeFailover(
       
       return new Response(responseText, {
         status: proxyResponse.status,
-        headers: { ...proxyResponse.headers, 'content-type': 'application/json' }
+        headers: { ...proxyResponse.headers, 'content-type': 'application/json', 'cache-control': 'no-store, no-transform' }
       });
       
     } catch (retryError) {

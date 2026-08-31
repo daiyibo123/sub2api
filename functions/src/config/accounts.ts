@@ -2,7 +2,7 @@
 import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { verifySessionToken, resolveSessionSecret } from '../auth';
-import { probeAccount, probeAccounts } from '../utils/healthcheck';
+import { probeAccount, probeAccounts, listUpstreamModels } from '../utils/healthcheck';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
@@ -67,6 +67,22 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
     }
   }
   
+  // GET /api/v1/accounts/:id/models - ask the upstream which models it serves.
+  // This must be matched before the plain list route, otherwise the trailing
+  // path segment would be ignored and every account would be returned instead.
+  const modelsMatch = /\/accounts\/(\d+)\/models$/.exec(url.pathname);
+  if (method === 'GET' && modelsMatch) {
+    const id = Number(modelsMatch[1]);
+    try {
+      const models = await listUpstreamModels(db, id);
+      return new Response(JSON.stringify({ data: { account_id: id, models } }), { status: 200, headers: JSON_HEADERS });
+    } catch (error) {
+      // A rejected upstream listing is information about that upstream, not a
+      // broken admin API, so the message is surfaced verbatim to the operator.
+      return jsonError(error instanceof Error ? error.message : '获取上游模型失败', 502);
+    }
+  }
+
   // GET /api/v1/accounts - list all accounts
   if (method === 'GET') {
     const accounts = await db.listAccounts();
@@ -230,13 +246,25 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
     const id = parseInt(segments[segments.length - 2] || '0');
     if (!id) return jsonError('Invalid account ID', 400);
 
-    const result = await probeAccount(db, id);
+    // The dialog sends the model the operator picked from the upstream's own
+    // list. A missing body keeps the provider default so the older
+    // one-click path still works.
+    let selectedModel = '';
+    try {
+      const body = await request.json() as { model?: string };
+      selectedModel = String(body?.model || '').trim();
+    } catch {
+      selectedModel = '';
+    }
+
+    const result = await probeAccount(db, id, selectedModel || undefined);
     // A failed probe is a valid answer about the upstream, not a failed API
     // call, so the transport stays 200 and the verdict rides in the body.
     return new Response(JSON.stringify({
       success: result.success,
       status: result.status,
       latency_ms: result.latencyMs,
+      model: result.model || '',
       message: result.message
     }), { status: 200, headers: JSON_HEADERS });
   }

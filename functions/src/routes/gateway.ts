@@ -6,8 +6,9 @@ import { FailoverManager } from '../failover';
 import { proxyRequest, buildUpstreamHeaders, getUpstreamBaseUrl, findModelMapping, resolveUpstreamCredentials , accountRateMultiplier } from '../utils/proxy';
 import { streamWithRecording } from '../utils/record';
 import { defer, Deferrable } from '../utils/background';
-import { extractTokenUsage, calculateCost } from '../billing';
+import { extractTokenUsage, calculateCostBreakdown } from '../billing';
 import { Account, Group, ModelMapping } from '../types';
+import { loadRoutingSnapshot } from '../utils/routing-cache';
 
 export async function handleGatewayRequest(request: Request, env: Env, failover: FailoverManager, ctx?: Deferrable): Promise<Response> {
   const db = createDatabase(env.DB);
@@ -50,15 +51,12 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   }
   
   // Load all enabled accounts first; model mappings may refine the provider.
-  let accounts = await db.listEnabledAccounts();
+  const routing = await loadRoutingSnapshot(db, failover);
+  let accounts = routing.accounts;
   
   // Load supporting data
-  const [groupsRaw, mappingsRaw] = await Promise.all([
-    db.listGroups(),
-    db.listModelMappings()
-  ]);
-  const groups = new Map(groupsRaw.map(g => [g.id, g]));
-  const mappings = mappingsRaw;
+  const groups = new Map(routing.groups.map(g => [g.id, g]));
+  const mappings = routing.mappings;
   
   // Apply model mapping
   const mapping = findModelMapping(model, mappings);
@@ -69,12 +67,13 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   // it from another group would bill and route traffic somewhere the operator
   // deliberately excluded, so an empty result fails instead of falling back.
   const keyGroupId = Number(keyRecord?.group_id) || 0;
+  const fallbackGroupId = Number(keyRecord?.fallback_group_id) || 0;
   if (keyGroupId) {
-    accounts = accounts.filter(account => Number(account.group_id) === keyGroupId);
+    accounts = accounts.filter(account => Number(account.group_id) === keyGroupId || Number(account.group_id) === fallbackGroupId);
     if (accounts.length === 0) {
       return new Response(JSON.stringify({
         error: 'No available accounts',
-        message: '该 API 密钥绑定的分组下没有可用账号'
+        message: '该 API 密钥绑定的主分组和兜底分组下没有可用账号'
       }), { status: 503, headers: { 'Content-Type': 'application/json' } });
     }
   }
@@ -85,10 +84,10 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
   let upstreamModel = providerMapping?.requested_model.endsWith('*')
     ? providerMapping.upstream_model + model.slice(providerMapping.requested_model.length - 1)
     : (providerMapping?.upstream_model || model);
-  const preferredGroupId = providerMapping?.group_id || undefined;
+  const preferredGroupId = keyGroupId || providerMapping?.group_id || undefined;
   
   // Select account with failover
-  const selection = await failover.selectAccount(accounts, groups, preferredGroupId);
+  const selection = await failover.selectAccount(accounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
   if (!selection) {
     return new Response(JSON.stringify({ error: 'No available accounts' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
   }
@@ -155,7 +154,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
       await proxyResponse.text().catch(() => '');
       failover.recordRequest(account.id, group.id, true);
       defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: responseStatus, error_message: `Upstream returned ${responseStatus}`, latency_ms: Date.now() - startTime }));
-      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx);
+      return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, `Upstream returned ${responseStatus}`, preferredGroupId, startTime, ctx, fallbackGroupId);
     }
     
     if (stream && proxyResponse.body) {
@@ -181,16 +180,14 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     }
     
     const { promptTokens, completionTokens, totalTokens } = extractTokenUsage(responseBody, proxyResponse.headers);
-    const cost = calculateCost(provider, upstreamModel, 
-      responseBody?.usage?.prompt_tokens || 0,
-      responseBody?.usage?.completion_tokens || 0
-    );
+    const breakdown = calculateCostBreakdown(provider, upstreamModel, promptTokens, completionTokens, accountRateMultiplier(account));
+    const cost = breakdown.cost;
     
     // Record usage and request log
     if (cost > 0) {
       defer(ctx, db.incrementApiKeyUsage(keyRecord.id, cost));
     }
-    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, status: responseStatus, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
+    defer(ctx, db.createUsageRecord({ api_key_id: keyRecord.id, group_id: group.id, account_id: account.id, model: upstreamModel, provider, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens, cost, base_cost: breakdown.baseCost, rate_multiplier: breakdown.multiplier, cost_estimated: breakdown.estimated ? 1 : 0, cache_status: 'bypass', status: responseStatus, error_message: isError ? responseBody?.error?.message || 'Error' : '', latency_ms: Date.now() - startTime }));
     
     defer(ctx, db.createRequestLog({
       account_id: account.id,
@@ -209,7 +206,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
       status: proxyResponse.status,
       headers: {
         ...proxyResponse.headers,
-        'content-type': 'application/json'
+        'content-type': 'application/json', 'cache-control': 'no-store, no-transform'
       }
     });
     
@@ -223,7 +220,7 @@ export async function handleGatewayRequest(request: Request, env: Env, failover:
     defer(ctx, db.createRequestLog({ account_id: account.id, group_id: group.id, model: upstreamModel, status: 502, error_message: errorMessage, latency_ms: Date.now() - startTime }));
     
     // Try to failover to next account
-    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx);
+    return handleFailover(upstreamBody, request, env, failover, keyRecord, accounts.filter(candidate => candidate.id !== account.id), groups, mappings, provider, upstreamModel, stream, errorMessage, preferredGroupId, startTime, ctx, fallbackGroupId);
   }
 }
 
@@ -243,7 +240,8 @@ async function handleFailover(
   errorMessage: string,
   preferredGroupId?: number,
   originStart: number = Date.now(),
-  ctx?: Deferrable
+  ctx?: Deferrable,
+  fallbackGroupId = 0
 ): Promise<Response> {
   const db = createDatabase(env.DB);
   
@@ -253,7 +251,7 @@ async function handleFailover(
   for (let i = 0; i < maxRetries; i++) {
     // Get next healthy account
     const nextAccounts = accounts.filter(a => a.enabled && !attempted.has(a.id));
-    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId);
+    const selection = await failover.selectAccount(nextAccounts, groups, preferredGroupId, fallbackGroupId ? [fallbackGroupId] : []);
     
     if (!selection) {
       break;
@@ -321,7 +319,7 @@ async function handleFailover(
       
       return new Response(responseText, {
         status: proxyResponse.status,
-        headers: { ...proxyResponse.headers, 'content-type': 'application/json' }
+        headers: { ...proxyResponse.headers, 'content-type': 'application/json', 'cache-control': 'no-store, no-transform' }
       });
       
     } catch (retryError) {

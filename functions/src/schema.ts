@@ -17,7 +17,7 @@
  * exception". The version is recorded in `settings` once the work succeeds, and
  * later requests spend a single cheap read confirming there is nothing to do.
  */
-export const SCHEMA_VERSION = '4';
+export const SCHEMA_VERSION = '8';
 
 export const SCHEMA_STATEMENTS: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -82,10 +82,13 @@ export const SCHEMA_STATEMENTS: string[] = [
   `CREATE TABLE IF NOT EXISTS api_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key_hash TEXT NOT NULL UNIQUE,
+    key_ciphertext TEXT,
     name TEXT,
     enabled INTEGER DEFAULT 1,
     balance REAL DEFAULT 0,
     quota_limit REAL DEFAULT 0,
+    group_id INTEGER,
+    fallback_group_id INTEGER,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS usage_records (
@@ -97,6 +100,10 @@ export const SCHEMA_STATEMENTS: string[] = [
     completion_tokens INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
     cost REAL DEFAULT 0,
+    base_cost REAL DEFAULT 0,
+    rate_multiplier REAL DEFAULT 1,
+    cost_estimated INTEGER DEFAULT 0,
+    cache_status TEXT,
     status INTEGER DEFAULT 200,
     error_message TEXT,
     latency_ms INTEGER,
@@ -167,7 +174,21 @@ export const ADDITIVE_COLUMNS: Array<{ table: string; column: string; definition
   { table: 'usage_records', column: 'group_id', definition: 'INTEGER' },
   { table: 'usage_records', column: 'account_id', definition: 'INTEGER' },
 
+  // The plaintext is never stored. New keys keep a versioned AES-GCM payload so
+  // an authenticated administrator can copy them later; old hash-only rows stay
+  // valid for gateway auth but are not recoverable.
+  { table: 'api_keys', column: 'key_ciphertext', definition: 'TEXT' },
+
   // A client key may be pinned to one group. NULL keeps the previous behaviour
-  // of allowing every group, so existing keys are unaffected.
-  { table: 'api_keys', column: 'group_id', definition: 'INTEGER' }
+  // of allowing every group, while fallback_group_id is an optional same-provider
+  // pool used only after the primary group has no healthy account.
+  { table: 'api_keys', column: 'group_id', definition: 'INTEGER' },
+  { table: 'api_keys', column: 'fallback_group_id', definition: 'INTEGER' },
+
+  // Cost and routing observability. These columns are nullable so existing rows
+  // remain valid and old deployments can migrate without rewriting history.
+  { table: 'usage_records', column: 'rate_multiplier', definition: 'REAL DEFAULT 1' },
+  { table: 'usage_records', column: 'base_cost', definition: 'REAL DEFAULT 0' },
+  { table: 'usage_records', column: 'cost_estimated', definition: 'INTEGER DEFAULT 0' },
+  { table: 'usage_records', column: 'cache_status', definition: 'TEXT' }
 ];
