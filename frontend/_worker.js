@@ -2367,6 +2367,10 @@ function readThresholds(body, partial = false) {
 }
 
 // functions/src/utils/provider.ts
+var PROVIDERS = ["openai", "anthropic", "xai"];
+function isProvider(value) {
+  return typeof value === "string" && PROVIDERS.includes(value);
+}
 function getDefaultBaseUrl(provider) {
   switch (provider) {
     case "anthropic":
@@ -2387,12 +2391,12 @@ function getProviderAuthHeaders(provider, apiKey) {
 function getProbeModel(provider) {
   switch (provider) {
     case "anthropic":
-      return "claude-3-5-haiku-20241022";
+      return "claude-opus-5";
     case "xai":
       return "grok-2-latest";
     case "openai":
     default:
-      return "gpt-4o-mini";
+      return "gpt-5.6-terra";
   }
 }
 
@@ -2466,8 +2470,6 @@ async function listUpstreamModels(db, accountId, refresh = false) {
 function resolveProbeModel(account, selectedModel) {
   const explicit = String(selectedModel || "").trim();
   if (explicit) return explicit;
-  const remembered = String(account?.probe_model || "").trim();
-  if (remembered) return remembered;
   return getProbeModel(account?.provider);
 }
 async function probeAccount(db, accountId, selectedModel) {
@@ -2797,28 +2799,49 @@ async function handleAccountsRequest(request, env) {
     } catch {
       body = {};
     }
-    const rawGroup = body.group_id;
-    const scoped = rawGroup !== void 0 && rawGroup !== null && String(rawGroup).trim() !== "" && String(rawGroup) !== "all";
-    let groupId = 0;
-    let groupName = "";
-    if (scoped) {
-      groupId = Number(rawGroup);
-      if (!Number.isInteger(groupId) || groupId <= 0) return jsonError2("\u5206\u7EC4\u65E0\u6548", 400);
-      const group = await db.getGroup(groupId);
+    const rawGroups = Array.isArray(body.group_ids) ? body.group_ids : body.group_id !== void 0 && body.group_id !== null ? [body.group_id] : [];
+    const requested = rawGroups.map((value) => String(value).trim()).filter((value) => value !== "" && value !== "all");
+    const scoped = requested.length > 0;
+    const groupIds = [];
+    const groupNames = [];
+    for (const value of requested) {
+      const id = Number(value);
+      if (!Number.isInteger(id) || id <= 0) return jsonError2("\u5206\u7EC4\u65E0\u6548", 400);
+      const group = await db.getGroup(id);
       if (!group) return jsonError2("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
-      groupName = String(group.name || "");
+      if (groupIds.includes(id)) continue;
+      groupIds.push(id);
+      groupNames.push(String(group.name || ""));
+    }
+    const overrides = {};
+    for (const [provider, model] of Object.entries(body.models || {})) {
+      if (!isProvider(provider)) return jsonError2(`\u672A\u77E5\u7684\u670D\u52A1\u5546\uFF1A${provider}`, 400);
+      const trimmed = String(model || "").trim();
+      if (trimmed) overrides[provider] = trimmed;
     }
     const accounts = await db.listAccounts();
-    const ids = accounts.filter((account) => Number(account.enabled) === 1).filter((account) => !scoped || Number(account.group_id) === groupId).map((account) => Number(account.id));
-    if (!ids.length) {
-      return jsonError2(scoped ? `\u5206\u7EC4\u300C${groupName}\u300D\u4E0B\u6CA1\u6709\u542F\u7528\u7684\u8D26\u53F7` : "\u6CA1\u6709\u542F\u7528\u7684\u8D26\u53F7\u53EF\u6D4B\u8BD5", 400);
+    const selected = accounts.filter((account) => Number(account.enabled) === 1).filter((account) => !scoped || groupIds.includes(Number(account.group_id)));
+    if (!selected.length) {
+      return jsonError2(
+        scoped ? `\u5206\u7EC4\u300C${groupNames.join("\u3001")}\u300D\u4E0B\u6CA1\u6709\u542F\u7528\u7684\u8D26\u53F7` : "\u6CA1\u6709\u542F\u7528\u7684\u8D26\u53F7\u53EF\u6D4B\u8BD5",
+        400
+      );
     }
-    const results = await probeAccounts(db, ids);
+    const ids = selected.map((account) => Number(account.id));
+    const models = {};
+    for (const account of selected) {
+      const provider = String(account.provider || "");
+      models[Number(account.id)] = overrides[provider] || getProbeModel(provider);
+    }
+    const results = await probeAccounts(db, ids, 4, models);
     const healthy = results.filter((result) => result.success).length;
     return new Response(JSON.stringify({
       data: {
-        group_id: scoped ? groupId : null,
-        group_name: groupName,
+        group_ids: scoped ? groupIds : null,
+        group_names: scoped ? groupNames : null,
+        // Retained for a caller written against the single-group response.
+        group_id: scoped && groupIds.length === 1 ? groupIds[0] : null,
+        group_name: scoped && groupNames.length === 1 ? groupNames[0] : "",
         total: results.length,
         healthy,
         failed: results.length - healthy,
@@ -2826,6 +2849,8 @@ async function handleAccountsRequest(request, env) {
           account_id: result.accountId,
           name: result.name,
           provider: result.provider,
+          group_id: Number(selected.find((a) => Number(a.id) === result.accountId)?.group_id) || null,
+          group_name: String(selected.find((a) => Number(a.id) === result.accountId)?.group_name || ""),
           success: result.success,
           status: result.status,
           latency_ms: result.latencyMs,
@@ -2891,7 +2916,7 @@ async function handleModelsRequest(request, env) {
     const provider = String(body.provider || "").trim();
     const groupId = Number(body.group_id);
     if (!requestedModel || !upstreamModel) return jsonError3("\u8BF7\u586B\u5199\u5BA2\u6237\u7AEF\u6A21\u578B\u540D\u548C\u4E0A\u6E38\u6A21\u578B\u540D", 400);
-    if (!PROVIDERS.includes(provider)) return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+    if (!PROVIDERS2.includes(provider)) return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
     if (!groupId) return jsonError3("\u8BF7\u9009\u62E9\u76EE\u6807\u5206\u7EC4", 400);
     if (!await db.getGroup(groupId)) return jsonError3("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
     if (requestedModel.includes("*") && !requestedModel.endsWith("*")) {
@@ -2938,7 +2963,7 @@ async function handleModelsRequest(request, env) {
     }
     if (body.provider !== void 0) {
       const provider = String(body.provider).trim();
-      if (!PROVIDERS.includes(provider)) return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
+      if (!PROVIDERS2.includes(provider)) return jsonError3("\u670D\u52A1\u5546\u5FC5\u987B\u662F openai\u3001anthropic \u6216 xai", 400);
       updates.provider = provider;
     }
     if (body.group_id !== void 0) {
@@ -2965,7 +2990,7 @@ async function handleModelsRequest(request, env) {
   }
   return jsonError3("Method not allowed", 405);
 }
-var PROVIDERS = ["openai", "anthropic", "xai"];
+var PROVIDERS2 = ["openai", "anthropic", "xai"];
 var JSON_HEADERS3 = { "Content-Type": "application/json" };
 function jsonData2(data, status = 200) {
   return new Response(JSON.stringify({ data }), { status, headers: JSON_HEADERS3 });

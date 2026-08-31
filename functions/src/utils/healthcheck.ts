@@ -134,16 +134,15 @@ export async function listUpstreamModels(
 /**
  * Resolve which model to probe an account with.
  *
- * Precedence is explicit choice, then the model this account was last verified
- * against, then the provider default. The remembered model is what makes a batch
- * probe meaningful: keeping an account alive with a model it cannot serve would
- * report a failure that says nothing about the credential.
+ * An explicit choice from the dialog wins; otherwise the provider's default
+ * applies. The account's last-probed model is deliberately *not* consulted: a
+ * one-off manual test against some unusual model would otherwise silently become
+ * what every later keep-alive run used, so two accounts on the same provider
+ * could be checked against different models for no visible reason.
  */
 export function resolveProbeModel(account: any, selectedModel?: string): string {
   const explicit = String(selectedModel || '').trim();
   if (explicit) return explicit;
-  const remembered = String(account?.probe_model || '').trim();
-  if (remembered) return remembered;
   return getProbeModel(account?.provider);
 }
 

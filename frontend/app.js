@@ -1218,34 +1218,44 @@ function openAccountModal(account = null) {
 }
 
 /**
- * Health-check dialog: pick an upstream model, then probe with it.
+ * Probe defaults per provider.
  *
- * A fixed probe model is the reason a live Anthropic key could still report a
- * connection failure — relays and restricted plans often serve a different set
- * of models than the hard-coded default. The list is fetched from the account's
- * own upstream, and the chosen model is what the probe actually sends.
+ * Mirrors the server's own defaults so the dialog can name the model it is about
+ * to send before any request is made. Kept in sync with
+ * functions/src/utils/provider.ts.
+ */
+const PROBE_DEFAULTS = {
+  openai: 'gpt-5.6-terra',
+  anthropic: 'claude-opus-5',
+  xai: 'grok-2-latest'
+}
+
+function probeDefaultModel(provider) {
+  return PROBE_DEFAULTS[provider] || PROBE_DEFAULTS.openai
+}
+
+/**
+ * Health-check dialog: confirm the model, then probe with it.
  *
- * The list is loaded as soon as the dialog opens and is served from the copy
- * stored on the account, so testing an account twice in a row does not repeat
- * the upstream round trip or make the operator re-pick a model. "重新获取"
- * forces a live fetch for when the upstream's catalogue really did change.
+ * The provider default is preselected and the dialog is usable immediately, so
+ * fetching the upstream catalogue is optional and only needed when the default
+ * is not on this account's plan. The result names the model it used, which is
+ * what makes "key is dead" and "model unavailable" read differently.
  */
 function openAccountTestModal(account) {
-  const fallback = account.provider === 'anthropic'
-    ? 'claude-3-5-haiku-20241022'
-    : account.provider === 'xai' ? 'grok-2-latest' : 'gpt-4o-mini'
+  const fallback = probeDefaultModel(account.provider)
 
   const card = openModal({
     title: '账号测活',
     subtitle: `${account.name || `#${account.id}`} · ${providerLabel(account.provider)}`,
     size: 'modal-sm',
     body: `<div class="test-panel">
-      ${field('上游模型', `<div class="test-model-row">
-        <select class="field-select" id="f-test_model" name="model"><option value="">${esc(`使用默认模型（${fallback}）`)}</option></select>
-        <button class="btn btn-secondary" type="button" data-fetch-models>${icon('i-refresh', 'ico-sm')}<span>重新获取</span></button>
+      ${field('测活模型', `<div class="test-model-row">
+        <select class="field-select" id="f-test_model" name="model"><option value="">${esc(`默认模型（${fallback}）`)}</option></select>
+        <button class="btn btn-secondary" type="button" data-fetch-models>${icon('i-refresh', 'ico-sm')}<span>获取模型</span></button>
       </div>`, {
         id: 'f-test_model', full: true,
-        hint: '模型列表会保存在该账号上，下次打开直接选择；上游新增模型后点“重新获取”。测活使用流式请求。'
+        hint: `默认用 <code>${esc(fallback)}</code> 发送一条流式请求。该模型不在此账号可用范围时，点“获取模型”从上游拉取列表另选一个。`
       })}
       <div class="test-result" data-test-result></div>
     </div>`,
@@ -1263,23 +1273,21 @@ function openAccountTestModal(account) {
     resultNode.textContent = message
   }
 
-  // Pre-select the model this account was last verified with. That is also the
-  // model a batch probe will use, so the dialog shows what keep-alive sends.
-  const fillOptions = (models, preferred) => {
-    select.innerHTML = `<option value="">${esc(`使用默认模型（${fallback}）`)}</option>`
-      + models.map(entry => option(entry.id, entry.name && entry.name !== entry.id ? `${entry.id}（${entry.name}）` : entry.id)).join('')
-    if (preferred && models.some(entry => entry.id === preferred)) select.value = preferred
-  }
-
-  const loadModels = async (refresh) => {
+  fetchButton.addEventListener('click', async () => {
     fetchButton.disabled = true
-    setResult(refresh ? '正在重新获取上游模型…' : '正在读取模型列表…', 'pending')
+    setResult('正在获取上游模型…', 'pending')
     try {
-      const result = await api(`/accounts/${account.id}/models${refresh ? '?refresh=1' : ''}`)
+      // The list is cached on the account, so pressing this again after
+      // reopening the dialog does not repeat the upstream round trip.
+      const result = await api(`/accounts/${account.id}/models`)
       const data = result?.data || {}
       const models = data.models || []
       if (!models.length) throw new Error('上游没有返回可用模型')
-      fillOptions(models, data.probe_model || '')
+      select.innerHTML = `<option value="">${esc(`默认模型（${fallback}）`)}</option>`
+        + models.map(entry => option(entry.id, entry.name && entry.name !== entry.id ? `${entry.id}（${entry.name}）` : entry.id)).join('')
+      // Preselect the default when the upstream serves it, so the dropdown
+      // agrees with what pressing 开始测试 would actually send.
+      if (models.some(entry => entry.id === fallback)) select.value = fallback
       setResult(
         data.cached
           ? `已加载 ${models.length} 个模型（缓存于 ${fmtDate(data.fetched_at) || '较早时间'}）`
@@ -1291,14 +1299,11 @@ function openAccountTestModal(account) {
     } finally {
       fetchButton.disabled = false
     }
-  }
-
-  fetchButton.addEventListener('click', () => loadModels(true))
-  loadModels(false)
+  })
 
   runButton.addEventListener('click', async () => {
     runButton.disabled = true
-    setResult('正在流式测活…', 'pending')
+    setResult(`正在用 ${select.value || fallback} 流式测活…`, 'pending')
     try {
       const result = await api(`/accounts/${account.id}/test`, {
         method: 'POST',
@@ -1319,24 +1324,36 @@ function openAccountTestModal(account) {
 /**
  * Batch health check (批量测活) — the keep-alive path.
  *
- * Scoped to a group rather than firing at every account, because keeping one
- * pool warm should not spend tokens on the rest. Each account is probed with the
- * model it was last verified against, so a relay or a restricted plan is not
- * failed against a provider-wide default it never served.
+ * Groups are checkboxes because an operator usually keeps a few named pools warm
+ * rather than one pool or everything. The model is chosen per provider, so every
+ * account in a run is checked against a model the operator can see, instead of
+ * whatever each account happened to be probed with last.
  */
 function openBatchTestModal() {
+  const groups = state.data.groups || []
+  const accounts = state.data.accounts || []
+  // Only ask for a provider that actually has an enabled account, so an
+  // OpenAI-only deployment is never prompted for a Claude model.
+  const providers = [...new Set(accounts.filter(account => isOn(account.enabled)).map(account => account.provider))]
+    .filter(Boolean)
+
   const card = openModal({
     title: '批量测活',
-    subtitle: '按分组保活：流式请求，使用每个账号上次手动测活的模型。',
+    subtitle: '保活脚本：按分组勾选，对组内渠道发送流式请求。',
     size: 'modal-sm',
     body: `<div class="test-panel">
-      ${field('测活分组', `<select class="field-select" id="f-batch_group" name="group_id">
-        <option value="all">全部启用的账号</option>
-        ${state.data.groups.map(group => option(group.id, group.name)).join('')}
-      </select>`, {
-        id: 'f-batch_group', full: true,
-        hint: '每个账号使用它上次手动测活选择的模型；没有记录时回退到该服务商的默认模型。'
-      })}
+      ${field('测活分组', `<div class="check-list">
+        <label class="check-item"><input type="checkbox" data-group-all checked><span>全部启用的账号</span></label>
+        ${groups.map(group => {
+          const bound = accounts.filter(a => num(a.group_id) === num(group.id) && isOn(a.enabled)).length
+          return `<label class="check-item"><input type="checkbox" data-group-id="${num(group.id)}"${bound ? '' : ' disabled'}>`
+            + `<span>${esc(group.name)}</span>`
+            + `<span class="check-note">${bound ? `${bound} 个账号` : '无启用账号'}</span></label>`
+        }).join('')}
+      </div>`, { full: true, hint: '可勾选多个分组；勾选“全部”时忽略其他选择。' })}
+      ${providers.map(provider => field(`${providerLabel(provider)} 测活模型`,
+        textInput(`model_${provider}`, probeDefaultModel(provider), probeDefaultModel(provider)),
+        { id: `f-model_${provider}`, full: true })).join('')}
       <div class="test-result" data-test-result></div>
       <div class="test-rows" data-test-rows hidden></div>
     </div>`,
@@ -1344,31 +1361,49 @@ function openBatchTestModal() {
              <button class="btn btn-primary" type="button" data-run-test>${icon('i-play', 'ico-sm')}<span>开始测活</span></button>`
   })
 
-  const select = card.querySelector('#f-batch_group')
   const resultNode = card.querySelector('[data-test-result]')
   const rowsNode = card.querySelector('[data-test-rows]')
   const runButton = card.querySelector('[data-run-test]')
+  const allBox = card.querySelector('[data-group-all]')
+  const groupBoxes = [...card.querySelectorAll('[data-group-id]')]
 
   const setResult = (message, tone) => {
     resultNode.className = `test-result ${tone ? `is-${tone}` : ''}`
     resultNode.textContent = message
   }
 
+  // "All" and a specific selection are mutually exclusive so the request that
+  // gets sent always matches what the dialog shows.
+  allBox.addEventListener('change', () => {
+    if (allBox.checked) groupBoxes.forEach(box => { box.checked = false })
+  })
+  groupBoxes.forEach(box => box.addEventListener('change', () => {
+    if (box.checked) allBox.checked = false
+    else if (!groupBoxes.some(entry => entry.checked)) allBox.checked = true
+  }))
+
   runButton.addEventListener('click', async () => {
+    const selectedGroups = groupBoxes.filter(box => box.checked).map(box => num(box.dataset.groupId))
+    const models = {}
+    for (const provider of providers) {
+      const value = card.querySelector(`[name="model_${provider}"]`)?.value?.trim()
+      if (value) models[provider] = value
+    }
+
     runButton.disabled = true
     rowsNode.hidden = true
     setResult('正在流式测活…', 'pending')
     try {
       const result = await api('/accounts/test-all', {
         method: 'POST',
-        body: { group_id: select.value }
+        body: { group_ids: allBox.checked ? [] : selectedGroups, models }
       })
       const summary = result?.data || {}
       const rows = summary.results || []
       const failed = num(summary.failed)
 
-      // Per-account lines matter more than the count here: the point of a
-      // keep-alive run is knowing *which* credential went dark.
+      // Per-account lines matter more than the totals: the point of a keep-alive
+      // run is knowing which credential went dark, and on which model.
       rowsNode.innerHTML = rows.map(row => `<div class="test-row ${row.success ? 'is-ok' : 'is-err'}">
         <span class="test-row-name">${esc(row.name || `#${row.account_id}`)}</span>
         <span class="test-row-msg">${esc(row.message || '')}</span>

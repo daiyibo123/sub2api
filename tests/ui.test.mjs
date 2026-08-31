@@ -37,6 +37,9 @@ const db = {
   ]
 }
 const posted = []
+// Every requested URL, so a test can assert that opening a dialog did *not*
+// trigger an upstream fetch.
+const fetched = []
 
 function statsPayload() {
   return {
@@ -73,6 +76,7 @@ function fakeFetch(url, options = {}) {
   const method = (options.method || 'GET').toUpperCase()
   const path = String(url).replace('/api/v1', '')
   const body = options.body ? JSON.parse(options.body) : null
+  fetched.push(path)
   if (method !== 'GET') posted.push({ path, method, body })
 
   if (path === '/auth/login') return respond({ token: 't0ken', user: { id: 1, username: 'admin', is_admin: true } })
@@ -447,9 +451,10 @@ if (cleanupForm) {
   check('bulk cleanup sends the retention window', Boolean(cleanup), JSON.stringify(posted.slice(-3)))
 }
 
-// ---- probe dialog reuses the cached model list ------------------------------
-// Re-fetching on every open is what the operator complained about: the list is
-// stored on the account, so opening the dialog must show it without a refetch.
+// ---- probe dialog defaults to the provider's model -------------------------
+// The dialog must be usable the moment it opens: the provider default is
+// preselected and named, so fetching the upstream catalogue is only needed when
+// that model is not on this account's plan.
 press(doc.querySelector('.nav-item[data-page="accounts"]'))
 await tick(10)
 press(doc.querySelector('#accounts-list [data-action="test-account"]'))
@@ -457,28 +462,70 @@ await tick(14)
 const probeCard = doc.querySelector('.modal-card')
 const probeSelect = probeCard?.querySelector('#f-test_model')
 check('probe dialog opens', Boolean(probeCard))
-check('probe dialog loads models without pressing a button', (probeSelect?.options.length || 0) > 1,
-  `${probeSelect?.options.length} options`)
-check('probe dialog preselects the remembered model', probeSelect?.value === 'gpt-5.5', probeSelect?.value)
-check('probe dialog reports the list came from cache', /缓存/.test(probeCard?.textContent || ''),
-  probeCard?.querySelector('[data-test-result]')?.textContent || '')
+check('probe dialog names the openai default model',
+  /gpt-5\.6-terra/.test(probeCard?.textContent || ''), probeCard?.textContent?.slice(0, 200))
+// Opening the dialog must not spend an upstream round trip; the operator asked
+// for the default to just work.
+check('probe dialog does not fetch models on open',
+  !fetched.some(url => url.includes('/accounts/1/models')), fetched.slice(-3).join(' | '))
+if (probeSelect) {
+  press(probeCard.querySelector('[data-fetch-models]'))
+  await tick(16)
+  check('fetching models fills the dropdown', probeSelect.options.length > 1,
+    `${probeSelect.options.length} options`)
+  check('the default model is preselected when the upstream serves it',
+    probeSelect.value === 'gpt-5.6-terra', probeSelect.value)
+  check('the fetched list reports it came from cache',
+    /缓存/.test(probeCard.textContent || ''),
+    probeCard.querySelector('[data-test-result]')?.textContent || '')
+}
 fire(doc.querySelector('.modal-backdrop'), 'mousedown')
 await tick(4)
 
-// ---- batch probe is scoped to a group --------------------------------------
+// A Claude account must default to the Claude model, not OpenAI's.
+press(doc.querySelectorAll('#accounts-list [data-action="test-account"]')[1])
+await tick(14)
+const claudeCard = doc.querySelector('.modal-card')
+check('a claude account defaults to the claude model',
+  /claude-opus-5/.test(claudeCard?.textContent || ''), claudeCard?.textContent?.slice(0, 200))
+fire(doc.querySelector('.modal-backdrop'), 'mousedown')
+await tick(4)
+
+// ---- batch probe: several groups at once ------------------------------------
 press(doc.getElementById('btn-test-accounts'))
 await tick(8)
 const batchCard = doc.querySelector('.modal-card')
-const batchSelect = batchCard?.querySelector('#f-batch_group')
+const allBox = batchCard?.querySelector('[data-group-all]')
+const groupBoxes = [...(batchCard?.querySelectorAll('[data-group-id]') || [])]
 check('batch probe dialog opens', Boolean(batchCard))
-check('batch probe lists every group plus "all"', batchSelect?.options.length === db.groups.length + 1,
-  `${batchSelect?.options.length} for ${db.groups.length} groups`)
-if (batchSelect) {
-  batchSelect.value = '2'
+check('batch probe offers a checkbox per group', groupBoxes.length === db.groups.length,
+  `${groupBoxes.length} for ${db.groups.length} groups`)
+check('batch probe defaults to every enabled account', allBox?.checked === true, allBox?.checked)
+// The operator asked to be able to tick several groups, so the request must
+// carry all of them rather than only the last one clicked.
+check('batch probe asks for a model per provider',
+  Boolean(batchCard?.querySelector('[name="model_openai"]'))
+  && Boolean(batchCard?.querySelector('[name="model_anthropic"]')),
+  [...(batchCard?.querySelectorAll('[name^="model_"]') || [])].map(node => node.name).join(','))
+check('batch probe prefills the provider defaults',
+  batchCard?.querySelector('[name="model_openai"]')?.value === 'gpt-5.6-terra'
+  && batchCard?.querySelector('[name="model_anthropic"]')?.value === 'claude-opus-5',
+  `${batchCard?.querySelector('[name="model_openai"]')?.value} / ${batchCard?.querySelector('[name="model_anthropic"]')?.value}`)
+
+if (groupBoxes.length >= 2) {
+  groupBoxes.forEach(box => {
+    box.checked = true
+    box.dispatchEvent(new window.Event('change', { bubbles: true }))
+  })
+  check('ticking a group clears the "all" box', allBox?.checked === false, allBox?.checked)
+
   press(batchCard.querySelector('[data-run-test]'))
-  await tick(16)
-  const batchPost = posted.find(entry => entry.path === '/accounts/test-all' && entry.body?.group_id === '2')
-  check('batch probe sends the chosen group', Boolean(batchPost), JSON.stringify(posted.slice(-3)))
+  await tick(18)
+  const batchPost = posted.find(entry => entry.path === '/accounts/test-all'
+    && Array.isArray(entry.body?.group_ids) && entry.body.group_ids.length === db.groups.length)
+  check('batch probe sends every ticked group', Boolean(batchPost), JSON.stringify(posted.slice(-2)))
+  check('batch probe sends the per-provider models',
+    batchPost?.body?.models?.openai === 'gpt-5.6-terra', JSON.stringify(batchPost?.body?.models))
   check('batch probe lists each account result', /acct-openai/.test(doc.body.textContent))
 }
 

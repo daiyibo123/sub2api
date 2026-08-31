@@ -316,7 +316,7 @@ models = payload.get('data', {}).get('models', [])
 check('upstream models listed', status == 200 and bool(models), (status, payload))
 check('model list reports its freshness',
       'cached' in payload.get('data', {}), payload.get('data'))
-check('model list remembers the probed model',
+check('model list reports the last probed model',
       payload.get('data', {}).get('probe_model') == 'gpt-5.5', payload.get('data'))
 
 # The point of persisting the list: a second open must not re-hit the upstream.
@@ -336,35 +336,101 @@ check('refresh re-fetches from the upstream',
 status, _ = call(f'/accounts/{cheap_id}/models')
 check('model listing requires auth', status == 401, status)
 
-# --------------------------------------- batch probe reuses the probed model
-# Batch probing is the keep-alive path: each account must be exercised with the
-# model it was last verified against, not a provider-wide default that a relay
-# or a restricted plan may not serve.
+# ------------------------------------ batch probe is driven by the provider
+# Batch probing is the keep-alive path. The model comes from the account's
+# provider, not from whatever an operator last probed with: a one-off manual test
+# against an unusual model must not silently become what every later keep-alive
+# run sends, and two accounts on the same provider should never be checked
+# against different models for no visible reason.
 control(PORT_FAST, reset=True, status=200)
-status, payload = call('/accounts/test-all', 'POST', {'group_id': primary_id}, token=token)
+status, payload = call('/accounts/test-all', 'POST', {'group_ids': [primary_id]}, token=token)
 data = payload.get('data', {})
 check('batch probe accepts a group', status == 200, (status, payload))
-check('batch probe scopes itself to that group', data.get('group_id') == primary_id, data)
+check('batch probe reports the groups it covered', data.get('group_ids') == [primary_id], data)
 batch_requests = seen(PORT_FAST)
 check('batch probe streams', bool(batch_requests) and batch_requests[-1].get('stream') is True,
       batch_requests)
-check('batch probe reuses the remembered model',
-      bool(batch_requests) and batch_requests[-1].get('model') == 'gpt-5.5', batch_requests)
+check('batch probe uses the openai provider default',
+      bool(batch_requests) and batch_requests[-1].get('model') == 'gpt-5.6-terra', batch_requests)
 check('batch probe names the model per row',
-      bool(data.get('results')) and data['results'][0].get('model'), data.get('results'))
+      bool(data.get('results')) and data['results'][0].get('model') == 'gpt-5.6-terra',
+      data.get('results'))
+check('batch probe attributes each row to its group',
+      bool(data.get('results')) and data['results'][0].get('group_id') == primary_id,
+      data.get('results'))
 
-# An empty group is a configuration mistake worth reporting, not a silent no-op
-# that looks like every account passed.
-_, empty_group = call('/groups', 'POST', {'name': 'feat-empty', 'priority': 9}, token=token)
+# A manual probe against an unusual model must not change what keep-alive sends.
+control(PORT_FAST, reset=True, status=200)
+call(f'/accounts/{cheap_id}/test', 'POST', {'model': 'gpt-5.5-pro'}, token=token)
+control(PORT_FAST, reset=True, status=200)
+call('/accounts/test-all', 'POST', {'group_ids': [primary_id]}, token=token)
+after_manual = seen(PORT_FAST)
+check('a manual probe does not hijack later keep-alive runs',
+      bool(after_manual) and all(entry.get('model') == 'gpt-5.6-terra' for entry in after_manual),
+      [entry.get('model') for entry in after_manual])
+
+# Per-provider override, so an operator can probe a whole run with one model
+# without editing every account.
+control(PORT_FAST, reset=True, status=200)
 status, payload = call('/accounts/test-all', 'POST',
-                       {'group_id': empty_group.get('data', {}).get('id')}, token=token)
+                       {'group_ids': [primary_id], 'models': {'openai': 'gpt-5.6-luna'}},
+                       token=token)
+overridden = seen(PORT_FAST)
+check('a provider override replaces the default',
+      bool(overridden) and overridden[-1].get('model') == 'gpt-5.6-luna', overridden)
+
+status, payload = call('/accounts/test-all', 'POST',
+                       {'group_ids': [primary_id], 'models': {'nonsense': 'x'}}, token=token)
+check('an unknown provider override is rejected', status == 400, (status, payload))
+
+# Several groups at once: the usual case is keeping a few named pools warm.
+call(f'/accounts/{fallback_account_id}', 'PUT', {'enabled': 1}, token=token)
+control(PORT_FAST, reset=True, status=200)
+control(PORT_FALLBACK, reset=True, status=200)
+status, payload = call('/accounts/test-all', 'POST',
+                       {'group_ids': [primary_id, other_id]}, token=token)
+data = payload.get('data', {})
+covered = {row.get('group_id') for row in data.get('results', [])}
+check('multiple groups can be probed in one run', status == 200, (status, payload))
+check('every selected group is covered', covered == {primary_id, other_id}, covered)
+check('both upstreams were actually probed',
+      len(seen(PORT_FAST)) >= 1 and len(seen(PORT_FALLBACK)) >= 1,
+      (len(seen(PORT_FAST)), len(seen(PORT_FALLBACK))))
+
+# A duplicate id is an operator slip, not a reason to probe an account twice.
+control(PORT_FAST, reset=True, status=200)
+status, payload = call('/accounts/test-all', 'POST',
+                       {'group_ids': [primary_id, primary_id]}, token=token)
+check('a repeated group is only probed once',
+      payload.get('data', {}).get('group_ids') == [primary_id], payload.get('data'))
+
+# One selected group being empty must be reported rather than silently skipped.
+_, empty_group = call('/groups', 'POST', {'name': 'feat-empty', 'priority': 9}, token=token)
+empty_id = empty_group.get('data', {}).get('id')
+status, payload = call('/accounts/test-all', 'POST', {'group_ids': [empty_id]}, token=token)
 check('batch probe rejects a group with no accounts', status == 400, (status, payload))
 
-status, payload = call('/accounts/test-all', 'POST', {'group_id': 999999}, token=token)
+status, payload = call('/accounts/test-all', 'POST', {'group_ids': [999999]}, token=token)
 check('batch probe rejects an unknown group', status == 400, (status, payload))
+
+# No selection at all means every enabled account, which is what the "all"
+# checkbox sends.
+status, payload = call('/accounts/test-all', 'POST', {'group_ids': []}, token=token)
+check('an empty selection probes every enabled account',
+      status == 200 and payload.get('data', {}).get('group_ids') is None,
+      (status, payload.get('data', {}).get('group_ids')))
+
+# The older single-group body must keep working: a saved keep-alive caller
+# should not break because the console gained checkboxes.
+status, payload = call('/accounts/test-all', 'POST', {'group_id': primary_id}, token=token)
+check('the single-group request shape still works',
+      status == 200 and payload.get('data', {}).get('group_id') == primary_id,
+      (status, payload.get('data')))
 
 status, payload = call('/accounts/test-all', 'POST', {'group_id': 'all'}, token=token)
 check('batch probe still supports every account', status == 200, (status, payload))
+
+call(f'/accounts/{fallback_account_id}', 'PUT', {'enabled': 0}, token=token)
 
 # ------------------------------------------------------- usage record cleanup
 # D1 caps database size and usage_records is the only table that grows with

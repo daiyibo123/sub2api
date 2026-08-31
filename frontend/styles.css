@@ -898,6 +898,35 @@ html.dark .test-result.is-pending { border-color: rgba(20, 184, 166, .3); backgr
 .test-row-name { font-weight: 600; color: var(--text-1); }
 .test-row-msg { color: var(--text-2); overflow-wrap: anywhere; }
 
+/* Multi-select group picker used by the batch health check. */
+.check-list {
+  display: grid;
+  gap: 2px;
+  max-height: 210px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-ctl);
+  background: var(--surface-2);
+}
+.check-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text-1);
+  cursor: pointer;
+}
+.check-item:hover { background: var(--surface-1); }
+.check-item input { width: 15px; height: 15px; accent-color: var(--p500); flex: 0 0 auto; }
+/* A group with no enabled accounts cannot be probed, so it reads as inert
+   rather than looking like a selectable option that silently does nothing. */
+.check-item input:disabled { cursor: not-allowed; }
+.check-item input:disabled ~ span { color: var(--text-3); }
+.check-note { margin-left: auto; font-size: 11.5px; color: var(--text-3); }
+
 .secret-box {
   display: flex;
   align-items: center;

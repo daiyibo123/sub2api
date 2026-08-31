@@ -3,6 +3,7 @@ import type { Env } from '../index';
 import { createDatabase } from '../db';
 import { verifySessionToken, resolveSessionSecret } from '../auth';
 import { probeAccount, probeAccounts, listUpstreamModels } from '../utils/healthcheck';
+import { isProvider, getProbeModel } from '../utils/provider';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
@@ -232,50 +233,89 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
     });
   }
   
-  // POST /api/v1/accounts/test-all - keep-alive probe over a group (批量测活)
+  // POST /api/v1/accounts/test-all - keep-alive probe (批量测活)
   //
-  // This is the keep-alive path, not a bulk version of the single test. Each
-  // account is probed with the model it was last verified against
-  // (`accounts.probe_model`), because a provider-wide default is exactly what
-  // fails on a relay or a restricted plan — the failure would then say nothing
-  // about whether the credential is alive.
+  // Scoping is by group, and several groups may be selected at once: an operator
+  // usually wants to keep a few named pools warm, not one pool or everything.
+  //
+  // The model is chosen per provider, not per account. A provider default is
+  // predictable — an operator reading the results knows exactly which model was
+  // exercised — whereas replaying whatever each account happened to be probed
+  // with last makes two accounts in the same group report on different models.
+  // `models` lets the caller override a provider's default for this run.
   if (method === 'POST' && url.pathname.endsWith('/test-all')) {
-    let body: { group_id?: number | string | null } = {};
+    let body: {
+      group_id?: number | string | null;
+      group_ids?: Array<number | string> | null;
+      models?: Record<string, string> | null;
+    } = {};
     try { body = await request.json() as typeof body; } catch { body = {}; }
 
-    const rawGroup = body.group_id;
-    // Blank / "all" means every enabled account; a numeric id narrows to one
-    // group so an operator can keep one pool warm without spending tokens on
-    // the rest.
-    const scoped = rawGroup !== undefined && rawGroup !== null
-      && String(rawGroup).trim() !== '' && String(rawGroup) !== 'all';
+    // `group_ids` is the multi-select form; `group_id` is kept so an existing
+    // single-group caller (or a saved keep-alive cron) does not break.
+    const rawGroups: Array<number | string> = Array.isArray(body.group_ids)
+      ? body.group_ids
+      : body.group_id !== undefined && body.group_id !== null
+        ? [body.group_id]
+        : [];
 
-    let groupId = 0;
-    let groupName = '';
-    if (scoped) {
-      groupId = Number(rawGroup);
-      if (!Number.isInteger(groupId) || groupId <= 0) return jsonError('分组无效', 400);
-      const group = await db.getGroup(groupId);
+    const requested = rawGroups
+      .map(value => String(value).trim())
+      .filter(value => value !== '' && value !== 'all');
+    // An explicit "all" — or nothing at all — means every enabled account.
+    const scoped = requested.length > 0;
+
+    const groupIds: number[] = [];
+    const groupNames: string[] = [];
+    for (const value of requested) {
+      const id = Number(value);
+      if (!Number.isInteger(id) || id <= 0) return jsonError('分组无效', 400);
+      const group = await db.getGroup(id);
       if (!group) return jsonError('所选分组不存在', 400);
-      groupName = String(group.name || '');
+      if (groupIds.includes(id)) continue;
+      groupIds.push(id);
+      groupNames.push(String(group.name || ''));
+    }
+
+    // Per-provider overrides. Validated here so a typo is reported once rather
+    // than surfacing as an identical upstream failure on every account.
+    const overrides: Record<string, string> = {};
+    for (const [provider, model] of Object.entries(body.models || {})) {
+      if (!isProvider(provider)) return jsonError(`未知的服务商：${provider}`, 400);
+      const trimmed = String(model || '').trim();
+      if (trimmed) overrides[provider] = trimmed;
     }
 
     const accounts = await db.listAccounts();
-    const ids = accounts
+    const selected = accounts
       .filter(account => Number(account.enabled) === 1)
-      .filter(account => !scoped || Number(account.group_id) === groupId)
-      .map(account => Number(account.id));
+      .filter(account => !scoped || groupIds.includes(Number(account.group_id)));
 
-    if (!ids.length) {
-      return jsonError(scoped ? `分组「${groupName}」下没有启用的账号` : '没有启用的账号可测试', 400);
+    if (!selected.length) {
+      return jsonError(
+        scoped ? `分组「${groupNames.join('、')}」下没有启用的账号` : '没有启用的账号可测试',
+        400
+      );
     }
 
-    const results = await probeAccounts(db, ids);
+    // Resolve each account's model from its provider before probing, so the
+    // response can report which model every row was tested with.
+    const ids = selected.map(account => Number(account.id));
+    const models: Record<number, string> = {};
+    for (const account of selected) {
+      const provider = String(account.provider || '');
+      models[Number(account.id)] = overrides[provider] || getProbeModel(provider);
+    }
+
+    const results = await probeAccounts(db, ids, 4, models);
     const healthy = results.filter(result => result.success).length;
     return new Response(JSON.stringify({
       data: {
-        group_id: scoped ? groupId : null,
-        group_name: groupName,
+        group_ids: scoped ? groupIds : null,
+        group_names: scoped ? groupNames : null,
+        // Retained for a caller written against the single-group response.
+        group_id: scoped && groupIds.length === 1 ? groupIds[0] : null,
+        group_name: scoped && groupNames.length === 1 ? groupNames[0] : '',
         total: results.length,
         healthy,
         failed: results.length - healthy,
@@ -283,6 +323,8 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
           account_id: result.accountId,
           name: result.name,
           provider: result.provider,
+          group_id: Number(selected.find(a => Number(a.id) === result.accountId)?.group_id) || null,
+          group_name: String(selected.find(a => Number(a.id) === result.accountId)?.group_name || ''),
           success: result.success,
           status: result.status,
           latency_ms: result.latencyMs,
