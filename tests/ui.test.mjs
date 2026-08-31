@@ -32,8 +32,8 @@ const db = {
     { id: 2, name: 'staging', enabled: 1, balance: 0, quota_limit: 5, group_id: 2, group_name: 'claude-pool', created_at: '2026-01-02 00:00:00' }
   ],
   usage: [
-    { id: 1, model: 'gpt-4o', provider: 'openai', total_tokens: 120, prompt_tokens: 100, completion_tokens: 20, cost: 0.002, status: 200, latency_ms: 850, ttft_ms: 320, group_id: 1, group_name: 'default', account_id: 1, account_name: 'acct-openai', key_name: 'prod', created_at: '2026-01-01 00:00:00' },
-    { id: 2, model: 'claude-3-5-sonnet', provider: 'anthropic', total_tokens: 80, prompt_tokens: 60, completion_tokens: 20, cost: 0.004, status: 200, latency_ms: 1200, ttft_ms: 2900, group_id: 2, group_name: 'claude-pool', account_id: 2, account_name: 'acct-claude', key_name: 'staging', created_at: '2026-01-02 00:00:00' }
+    { id: 1, model: 'gpt-4o', provider: 'openai', total_tokens: 120, prompt_tokens: 100, completion_tokens: 20, cost: 0.002, base_cost: 0.002, rate_multiplier: 1, cost_estimated: 0, status: 200, latency_ms: 850, ttft_ms: 320, group_id: 1, group_name: 'default', account_id: 1, account_name: 'acct-openai', key_name: 'prod', created_at: '2026-01-01 00:00:00' },
+    { id: 2, model: 'claude-3-5-sonnet', provider: 'anthropic', total_tokens: 80, prompt_tokens: 60, completion_tokens: 20, cost: 0.002, base_cost: 0.004, rate_multiplier: 0.5, cost_estimated: 1, status: 200, latency_ms: 1200, ttft_ms: 2900, group_id: 2, group_name: 'claude-pool', account_id: 2, account_name: 'acct-claude', key_name: 'staging', created_at: '2026-01-02 00:00:00' }
   ]
 }
 const posted = []
@@ -42,7 +42,11 @@ function statsPayload() {
   return {
     data: {
       hours: 24, bucket: 'hour',
-      totals: { total_requests: 1, success_requests: 1, total_tokens: 120, prompt_tokens: 100, completion_tokens: 20, total_cost: 0.002, avg_latency: 850 },
+      totals: {
+        total_requests: 1, success_requests: 1, total_tokens: 120, prompt_tokens: 100,
+        completion_tokens: 20, total_cost: 0.002, base_cost: 0.004, avg_latency: 850,
+        avg_ttft: 320, cache_hits: 3, cache_samples: 4
+      },
       today: { today_requests: 1, today_tokens: 120, today_cost: 0.002 },
       resources: {
         total_accounts: db.accounts.length, active_accounts: db.accounts.length,
@@ -362,7 +366,36 @@ check('trend chart drew svg', Boolean(doc.querySelector('#chart-tokens svg')))
 check('model chart drew svg', Boolean(doc.querySelector('#chart-models svg')))
 check('stat cards populated', /1/.test(doc.getElementById('stats-grid').textContent))
 
+// ---- reworked dashboard cards ----------------------------------------------
+// Resource counts belong to the resource panel; repeating them as stat cards
+// pushed the grid onto a ragged third row and said the same thing twice.
+const statsText = doc.getElementById('stats-grid').textContent
+check('dashboard shows average first-token', /平均首字/.test(statsText), statsText.slice(0, 120))
+check('dashboard shows the routing cache hit rate', /缓存命中率/.test(statsText))
+check('dashboard cost card names the multiplier', /倍率后/.test(statsText))
+check('stat grid no longer repeats resource counts', !/API 密钥/.test(statsText))
+const resourceText = doc.getElementById('resource-health').textContent
+check('resource panel covers keys', /API 密钥/.test(resourceText), resourceText.slice(0, 120))
+
+// ---- reworked usage columns -------------------------------------------------
+press(doc.querySelector('.nav-item[data-page="usage"]'))
+await tick(10)
+const usageHead = [...doc.querySelectorAll('#usage-list thead th')].map(th => th.textContent)
+check('usage table fits without a token column per direction',
+  usageHead.length === 9 && usageHead.includes('Token'), usageHead.join('|'))
+check('usage row keeps both token directions', /↑|↓/.test(doc.getElementById('usage-list').textContent))
+// The discounted row must show what produced the charged figure, otherwise a
+// multiplier is invisible and the number looks wrong against the model's price.
+check('usage cost cell shows the multiplier', /0\.5x/.test(doc.getElementById('usage-list').textContent),
+  doc.getElementById('usage-list').textContent.slice(0, 200))
+check('usage marks an estimated price', /估算价/.test(doc.getElementById('usage-list').textContent))
+
 check('no uncaught page errors', jsErrors.length === 0, jsErrors.join(' | '))
+
+// The page keeps a live-refresh interval running, which is a timer inside this
+// jsdom window. Node will not exit while it is pending, so the window has to be
+// torn down explicitly rather than relying on the script simply ending.
+window.close()
 
 console.log(`\nPASSED ${pass} / ${pass + failures.length}`)
 if (failures.length) {

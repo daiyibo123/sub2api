@@ -442,19 +442,29 @@ html.dark .nav-item.active .nav-badge { background: rgba(20, 184, 166, .25); col
 
 .sidebar-scrim { display: none; }
 
-/* collapsed rail */
-.sidebar-collapsed .sidebar { width: var(--sidebar-w-collapsed); }
-.sidebar-collapsed .sidebar-head { justify-content: center; padding: 0 8px; }
-.sidebar-collapsed .brand-text { max-width: 0; opacity: 0; }
-.sidebar-collapsed .sidebar-nav { overflow-y: hidden; padding: 14px 8px; }
-.sidebar-collapsed .nav-item { width: 56px; height: 44px; justify-content: center; gap: 0; margin: 2px auto; padding: 10px; }
-.sidebar-collapsed .nav-item > .ico { width: 20px; height: 20px; }
-.sidebar-collapsed .nav-item > span:not(.nav-icon) { display: none; }
-.sidebar-collapsed .nav-section { max-width: 0; overflow: hidden; opacity: 0; margin-bottom: 0; }
-.sidebar-collapsed .nav-rule { display: block; margin-left: 12px; margin-right: 12px; }
-.sidebar-collapsed .user-chip { justify-content: center; padding-left: 0; padding-right: 0; }
-.sidebar-collapsed .user-chip-meta, .sidebar-collapsed .user-chip .icon-btn { display: none; }
-.sidebar-collapsed .app-main { margin-left: var(--sidebar-w-collapsed); }
+/* Collapsed rail, desktop only.
+   Below 1024px the sidebar is an overlay drawer opened by the menu button, and
+   a drawer must always show its labels. Left unscoped, collapsing on desktop
+   and then narrowing the window produced a 72px icon strip with every label
+   hidden — an unusable menu. The collapse control is desktop-only for the same
+   reason, so there is nothing to toggle here on a phone. */
+@media (min-width: 1024px) {
+  .sidebar-collapsed .sidebar { width: var(--sidebar-w-collapsed); }
+  .sidebar-collapsed .sidebar-head { justify-content: center; padding: 0 8px; }
+  .sidebar-collapsed .brand-text { max-width: 0; opacity: 0; }
+  /* The rail still scrolls: a short viewport must not strand the last item. */
+  .sidebar-collapsed .sidebar-nav { padding: 14px 8px; }
+  .sidebar-collapsed .nav-item { width: 56px; height: 44px; justify-content: center; gap: 0; margin: 2px auto; padding: 10px; }
+  .sidebar-collapsed .nav-item > .ico { width: 20px; height: 20px; }
+  /* Hides both the label and the count badge; only the icon survives. */
+  .sidebar-collapsed .nav-item > span { display: none; }
+  .sidebar-collapsed .nav-section { max-width: 0; overflow: hidden; opacity: 0; margin-bottom: 0; }
+  .sidebar-collapsed .nav-rule { display: block; margin-left: 12px; margin-right: 12px; }
+  .sidebar-collapsed .sidebar-foot { padding: 10px 8px; }
+  .sidebar-collapsed .user-chip { justify-content: center; padding-left: 0; padding-right: 0; }
+  .sidebar-collapsed .user-chip-meta, .sidebar-collapsed .user-chip .icon-btn { display: none; }
+  .sidebar-collapsed .app-main { margin-left: var(--sidebar-w-collapsed); }
+}
 
 .app-main { margin-left: var(--sidebar-w); min-width: 0; min-height: 100vh; transition: margin .3s ease; }
 
@@ -935,7 +945,14 @@ html.dark .secret-box code { color: var(--p200); }
   .page-heading h1 { font-size: 21px; }
   .page-heading-actions { width: 100%; }
   .page-heading-actions .btn { flex: 1; }
-  .stats-grid { grid-template-columns: 1fr; }
+  /* Eight cards in one column is a long scroll before anything else on the
+     page is reachable, so the pairs are kept and the card itself shrinks. */
+  .stats-grid { gap: 10px; }
+  .stat-card { gap: 9px; padding: 12px; }
+  .stat-icon { width: 32px; height: 32px; border-radius: 9px; }
+  .stat-icon .ico { width: 17px; height: 17px; }
+  .stat-value { font-size: 17px; }
+  .stat-label, .stat-caption { font-size: 11px; }
   .form-grid { grid-template-columns: 1fr; }
   .search-box { width: 100%; }
   .chart-doughnut { justify-content: center; }

@@ -131,6 +131,28 @@ function multiplierCell(value) {
   return `<span class="badge ${rate < 1 ? 'badge-on' : 'badge-warn'} mono">${label}</span>`
 }
 
+/**
+ * Charged cost, with the multiplier that produced it.
+ *
+ * The headline figure is what the key was actually billed. The base price only
+ * appears when a multiplier changed it, otherwise the two lines would be
+ * identical. Rows priced from the fallback table are marked as estimates so a
+ * default price is never mistaken for the upstream's real rate.
+ */
+function costCell(item) {
+  const cost = num(item.cost)
+  const base = num(item.base_cost, cost)
+  const rate = num(item.rate_multiplier, 1)
+  const estimated = isOn(item.cost_estimated)
+
+  const detail = []
+  if (rate !== 1) detail.push(`${Number(rate.toFixed(4))}x · 基础 ${fmtCost(base)}`)
+  if (estimated) detail.push('估算价')
+
+  return `<span class="cell-main">${fmtCost(cost)}</span>`
+    + (detail.length ? `<span class="cell-sub">${esc(detail.join(' · '))}</span>` : '')
+}
+
 // Liveness from the last probe, with the failure reason available on hover.
 function healthCell(item) {
   const checked = item.last_check_at
@@ -223,6 +245,9 @@ function setLoggedIn(user, token) {
 }
 
 function logout(notify = true) {
+  // The background poll carries the session token, so it has to stop before the
+  // token is cleared; otherwise it keeps firing and 401s against the login page.
+  stopLiveRefresh()
   state.token = ''
   state.user = null
   state.stats = null
@@ -274,6 +299,9 @@ function navigate(page) {
   // resolves even when the data was loaded minutes ago.
   paintCached(page)
   loadPage(page, state.painted.has(page))
+  // Traffic pages keep polling; config pages stop it. Called after the load so
+  // the interval is always measured from a fresh fetch.
+  startLiveRefresh()
 }
 
 /**
@@ -563,21 +591,14 @@ function renderDashboard() {
       label: '今日 Token', iconName: 'i-zap', tint: 'tint-violet',
       value: fmtTokens(today.today_tokens),
       caption: `${fmtInt(today.today_requests)} 次请求`
-    }),
-    statCard({
-      label: '上游账号', iconName: 'i-users', tint: 'tint-sky',
-      value: fmtInt(res.active_accounts),
-      caption: `共 ${fmtInt(res.total_accounts)} 个已配置`
-    }),
-    statCard({
-      label: 'API 密钥', iconName: 'i-key', tint: 'tint-fuchsia',
-      value: fmtInt(res.active_keys),
-      caption: `共 ${fmtInt(res.total_keys)} 个客户端密钥`
     })
   ].join('')
 
+  // Resource counts live only here, not also as stat cards: duplicating them
+  // pushed the stat grid onto a ragged third row and said the same thing twice.
   const resources = [
     ['i-users', '上游账号', res.active_accounts, res.total_accounts, 'accounts', 'tint-sky'],
+    ['i-key', 'API 密钥', res.active_keys, res.total_keys, 'keys', 'tint-fuchsia'],
     ['i-layers', '分组', res.active_groups, res.total_groups, 'groups', 'tint-emerald'],
     ['i-route', '模型映射', res.active_models, res.total_models, 'models', 'tint-amber']
   ]
@@ -745,9 +766,12 @@ function renderUsage() {
   })
   $('usage-count').textContent = filterSummary(items.length, all.length, '条记录')
 
+  // Twelve columns overflowed on a laptop, so the three token counts collapse
+  // into one cell (total on top, the split beneath) and cost carries its own
+  // multiplier detail instead of needing a separate column.
   $('usage-list').innerHTML = items.length
     ? table(
-        ['模型', '服务商', '分组 / 账号', '密钥', '输入', '输出', '合计', '费用', '状态', '首字', '耗时', '时间'],
+        ['模型', '服务商', '分组 / 账号', '密钥', 'Token', '费用', '状态', '首字 / 耗时', '时间'],
         items.map(item => [
           `<span class="cell-main">${esc(item.model || '-')}</span>${item.error_message ? `<span class="cell-sub err" title="${esc(item.error_message)}">${esc(item.error_message)}</span>` : ''}`,
           providerBadge(item.provider),
@@ -757,13 +781,11 @@ function renderUsage() {
           item.key_name
             ? `<span class="cell-dim">${esc(item.key_name)}</span>`
             : '<span class="cell-dim">-</span>',
-          fmtTokens(item.prompt_tokens),
-          fmtTokens(item.completion_tokens),
-          `<span class="cell-main">${fmtTokens(item.total_tokens)}</span>`,
-          fmtCost(item.cost),
+          `<span class="cell-main">${fmtTokens(item.total_tokens)}</span>`
+            + `<span class="cell-sub">↑${fmtTokens(item.prompt_tokens)} ↓${fmtTokens(item.completion_tokens)}</span>`,
+          costCell(item),
           httpBadge(item.status),
-          ttftCell(item.ttft_ms),
-          fmtLatency(item.latency_ms),
+          `${ttftCell(item.ttft_ms)}<span class="cell-sub">${fmtLatency(item.latency_ms)}</span>`,
           `<span class="cell-dim">${fmtDate(item.created_at)}</span>`
         ])
       )
@@ -1659,6 +1681,43 @@ $('setup-form').addEventListener('submit', async event => {
 
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && activeModal) closeModal()
+})
+
+/* --------------------------------------------------------- live refresh */
+
+// Only the two pages that show gateway traffic poll; the config pages change
+// solely because the operator changed them, so refetching them would be pure
+// noise. Every poll is silent, which means a failure keeps the current rows on
+// screen instead of replacing them with an error state.
+const LIVE_PAGES = new Set(['dashboard', 'usage'])
+const LIVE_INTERVAL_MS = 15_000
+let liveTimer = null
+
+function stopLiveRefresh() {
+  if (liveTimer === null) return
+  clearInterval(liveTimer)
+  liveTimer = null
+}
+
+function startLiveRefresh() {
+  stopLiveRefresh()
+  if (!state.token || !LIVE_PAGES.has(state.page)) return
+  liveTimer = setInterval(() => {
+    // A hidden tab would queue up requests it cannot show, and polling behind an
+    // open dialog can renumber the rows the operator is acting on.
+    if (document.hidden || activeModal || !state.token) return
+    if (!LIVE_PAGES.has(state.page)) return stopLiveRefresh()
+    loadPage(state.page, true)
+  }, LIVE_INTERVAL_MS)
+}
+
+// Returning to a backgrounded tab shows data as old as the tab was hidden, so
+// refresh once immediately rather than waiting out a full interval.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return
+  if (!state.token || !LIVE_PAGES.has(state.page)) return
+  loadPage(state.page, true)
+  startLiveRefresh()
 })
 
 /* ----------------------------------------------------------------- boot */
