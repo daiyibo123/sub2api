@@ -73,9 +73,22 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
   const modelsMatch = /\/accounts\/(\d+)\/models$/.exec(url.pathname);
   if (method === 'GET' && modelsMatch) {
     const id = Number(modelsMatch[1]);
+    // The list is cached on the account after a successful fetch, so reopening
+    // the dialog does not re-hit the upstream. `?refresh=1` forces a live fetch
+    // for the case where the upstream's catalogue really did change.
+    const refresh = url.searchParams.get('refresh') === '1';
     try {
-      const models = await listUpstreamModels(db, id);
-      return new Response(JSON.stringify({ data: { account_id: id, models } }), { status: 200, headers: JSON_HEADERS });
+      const result = await listUpstreamModels(db, id, refresh);
+      const account = await db.getAccount(id);
+      return new Response(JSON.stringify({
+        data: {
+          account_id: id,
+          models: result.models,
+          cached: result.cached,
+          fetched_at: result.fetchedAt,
+          probe_model: String(account?.probe_model || '')
+        }
+      }), { status: 200, headers: JSON_HEADERS });
     } catch (error) {
       // A rejected upstream listing is information about that upstream, not a
       // broken admin API, so the message is surfaced verbatim to the operator.
@@ -219,23 +232,64 @@ export async function handleAccountsRequest(request: Request, env: Env): Promise
     });
   }
   
-  // POST /api/v1/accounts/test-all - probe every enabled account (批量测活)
+  // POST /api/v1/accounts/test-all - keep-alive probe over a group (批量测活)
+  //
+  // This is the keep-alive path, not a bulk version of the single test. Each
+  // account is probed with the model it was last verified against
+  // (`accounts.probe_model`), because a provider-wide default is exactly what
+  // fails on a relay or a restricted plan — the failure would then say nothing
+  // about whether the credential is alive.
   if (method === 'POST' && url.pathname.endsWith('/test-all')) {
+    let body: { group_id?: number | string | null } = {};
+    try { body = await request.json() as typeof body; } catch { body = {}; }
+
+    const rawGroup = body.group_id;
+    // Blank / "all" means every enabled account; a numeric id narrows to one
+    // group so an operator can keep one pool warm without spending tokens on
+    // the rest.
+    const scoped = rawGroup !== undefined && rawGroup !== null
+      && String(rawGroup).trim() !== '' && String(rawGroup) !== 'all';
+
+    let groupId = 0;
+    let groupName = '';
+    if (scoped) {
+      groupId = Number(rawGroup);
+      if (!Number.isInteger(groupId) || groupId <= 0) return jsonError('分组无效', 400);
+      const group = await db.getGroup(groupId);
+      if (!group) return jsonError('所选分组不存在', 400);
+      groupName = String(group.name || '');
+    }
+
     const accounts = await db.listAccounts();
     const ids = accounts
       .filter(account => Number(account.enabled) === 1)
+      .filter(account => !scoped || Number(account.group_id) === groupId)
       .map(account => Number(account.id));
 
-    if (!ids.length) return jsonError('没有启用的账号可测试', 400);
+    if (!ids.length) {
+      return jsonError(scoped ? `分组「${groupName}」下没有启用的账号` : '没有启用的账号可测试', 400);
+    }
 
     const results = await probeAccounts(db, ids);
     const healthy = results.filter(result => result.success).length;
     return new Response(JSON.stringify({
       data: {
+        group_id: scoped ? groupId : null,
+        group_name: groupName,
         total: results.length,
         healthy,
         failed: results.length - healthy,
-        results
+        results: results.map(result => ({
+          account_id: result.accountId,
+          name: result.name,
+          provider: result.provider,
+          success: result.success,
+          status: result.status,
+          latency_ms: result.latencyMs,
+          ttft_ms: result.ttftMs ?? null,
+          model: result.model || '',
+          message: result.message
+        }))
       }
     }), { status: 200, headers: JSON_HEADERS });
   }

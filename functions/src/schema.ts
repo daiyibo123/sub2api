@@ -17,7 +17,7 @@
  * exception". The version is recorded in `settings` once the work succeeds, and
  * later requests spend a single cheap read confirming there is nothing to do.
  */
-export const SCHEMA_VERSION = '8';
+export const SCHEMA_VERSION = '9';
 
 export const SCHEMA_STATEMENTS: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -68,6 +68,9 @@ export const SCHEMA_STATEMENTS: string[] = [
     last_error_msg TEXT,
     priority INTEGER DEFAULT 0,
     client_spoofing TEXT DEFAULT '',
+    upstream_models TEXT,
+    upstream_models_at TEXT,
+    probe_model TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS model_mappings (
@@ -167,6 +170,16 @@ export const ADDITIVE_COLUMNS: Array<{ table: string; column: string; definition
   { table: 'accounts', column: 'last_check_ok', definition: 'INTEGER' },
   { table: 'accounts', column: 'last_check_latency_ms', definition: 'INTEGER' },
   { table: 'accounts', column: 'last_check_message', definition: 'TEXT' },
+
+  // The upstream's own model list, cached as JSON after a successful fetch, plus
+  // the model the operator last probed with. Re-fetching on every dialog open
+  // costs an upstream round trip to relearn something that rarely changes, and
+  // it forced the operator to re-pick a model each time. The remembered model is
+  // also what a batch probe uses, so an account is kept alive with the model it
+  // was verified against rather than a provider-wide guess.
+  { table: 'accounts', column: 'upstream_models', definition: 'TEXT' },
+  { table: 'accounts', column: 'upstream_models_at', definition: 'TEXT' },
+  { table: 'accounts', column: 'probe_model', definition: 'TEXT' },
 
   // Attribution for a usage row. Without these the records page can only group
   // by model or provider, so an operator cannot tell which upstream account or

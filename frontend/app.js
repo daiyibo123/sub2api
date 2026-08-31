@@ -771,7 +771,7 @@ function renderUsage() {
   // multiplier detail instead of needing a separate column.
   $('usage-list').innerHTML = items.length
     ? table(
-        ['模型', '服务商', '分组 / 账号', '密钥', 'Token', '费用', '状态', '首字 / 耗时', '时间'],
+        ['模型', '服务商', '分组 / 账号', '密钥', 'Token', '费用', '状态', '首字 / 耗时', '时间', ''],
         items.map(item => [
           `<span class="cell-main">${esc(item.model || '-')}</span>${item.error_message ? `<span class="cell-sub err" title="${esc(item.error_message)}">${esc(item.error_message)}</span>` : ''}`,
           providerBadge(item.provider),
@@ -786,7 +786,8 @@ function renderUsage() {
           costCell(item),
           httpBadge(item.status),
           `${ttftCell(item.ttft_ms)}<span class="cell-sub">${fmtLatency(item.latency_ms)}</span>`,
-          `<span class="cell-dim">${fmtDate(item.created_at)}</span>`
+          `<span class="cell-dim">${fmtDate(item.created_at)}</span>`,
+          rowActions([actionButton('delete-usage', item.id, '删除', 'i-trash', 'danger')])
         ])
       )
     : emptyState('i-activity', all.length ? '没有匹配的记录' : '暂无使用记录', all.length ? '换个关键词再试。' : '网关收到请求后会自动记录用量。')
@@ -1223,6 +1224,11 @@ function openAccountModal(account = null) {
  * connection failure — relays and restricted plans often serve a different set
  * of models than the hard-coded default. The list is fetched from the account's
  * own upstream, and the chosen model is what the probe actually sends.
+ *
+ * The list is loaded as soon as the dialog opens and is served from the copy
+ * stored on the account, so testing an account twice in a row does not repeat
+ * the upstream round trip or make the operator re-pick a model. "重新获取"
+ * forces a live fetch for when the upstream's catalogue really did change.
  */
 function openAccountTestModal(account) {
   const fallback = account.provider === 'anthropic'
@@ -1236,10 +1242,10 @@ function openAccountTestModal(account) {
     body: `<div class="test-panel">
       ${field('上游模型', `<div class="test-model-row">
         <select class="field-select" id="f-test_model" name="model"><option value="">${esc(`使用默认模型（${fallback}）`)}</option></select>
-        <button class="btn btn-secondary" type="button" data-fetch-models>${icon('i-refresh', 'ico-sm')}<span>获取模型</span></button>
+        <button class="btn btn-secondary" type="button" data-fetch-models>${icon('i-refresh', 'ico-sm')}<span>重新获取</span></button>
       </div>`, {
         id: 'f-test_model', full: true,
-        hint: '点击“获取模型”从该账号的上游拉取可用模型；也可以直接用默认模型测试。'
+        hint: '模型列表会保存在该账号上，下次打开直接选择；上游新增模型后点“重新获取”。测活使用流式请求。'
       })}
       <div class="test-result" data-test-result></div>
     </div>`,
@@ -1257,26 +1263,42 @@ function openAccountTestModal(account) {
     resultNode.textContent = message
   }
 
-  fetchButton.addEventListener('click', async () => {
+  // Pre-select the model this account was last verified with. That is also the
+  // model a batch probe will use, so the dialog shows what keep-alive sends.
+  const fillOptions = (models, preferred) => {
+    select.innerHTML = `<option value="">${esc(`使用默认模型（${fallback}）`)}</option>`
+      + models.map(entry => option(entry.id, entry.name && entry.name !== entry.id ? `${entry.id}（${entry.name}）` : entry.id)).join('')
+    if (preferred && models.some(entry => entry.id === preferred)) select.value = preferred
+  }
+
+  const loadModels = async (refresh) => {
     fetchButton.disabled = true
-    setResult('正在获取上游模型…', 'pending')
+    setResult(refresh ? '正在重新获取上游模型…' : '正在读取模型列表…', 'pending')
     try {
-      const result = await api(`/accounts/${account.id}/models`)
-      const models = result?.data?.models || []
+      const result = await api(`/accounts/${account.id}/models${refresh ? '?refresh=1' : ''}`)
+      const data = result?.data || {}
+      const models = data.models || []
       if (!models.length) throw new Error('上游没有返回可用模型')
-      select.innerHTML = `<option value="">${esc(`使用默认模型（${fallback}）`)}</option>`
-        + models.map(entry => option(entry.id, entry.name && entry.name !== entry.id ? `${entry.id}（${entry.name}）` : entry.id)).join('')
-      setResult(`已获取 ${models.length} 个模型`, 'ok')
+      fillOptions(models, data.probe_model || '')
+      setResult(
+        data.cached
+          ? `已加载 ${models.length} 个模型（缓存于 ${fmtDate(data.fetched_at) || '较早时间'}）`
+          : `已获取 ${models.length} 个模型`,
+        'ok'
+      )
     } catch (error) {
       setResult(error.message || '获取上游模型失败', 'err')
     } finally {
       fetchButton.disabled = false
     }
-  })
+  }
+
+  fetchButton.addEventListener('click', () => loadModels(true))
+  loadModels(false)
 
   runButton.addEventListener('click', async () => {
     runButton.disabled = true
-    setResult('正在测试…', 'pending')
+    setResult('正在流式测活…', 'pending')
     try {
       const result = await api(`/accounts/${account.id}/test`, {
         method: 'POST',
@@ -1290,6 +1312,109 @@ function openAccountTestModal(account) {
       setResult(error.message || '连接测试失败', 'err')
     } finally {
       runButton.disabled = false
+    }
+  })
+}
+
+/**
+ * Batch health check (批量测活) — the keep-alive path.
+ *
+ * Scoped to a group rather than firing at every account, because keeping one
+ * pool warm should not spend tokens on the rest. Each account is probed with the
+ * model it was last verified against, so a relay or a restricted plan is not
+ * failed against a provider-wide default it never served.
+ */
+function openBatchTestModal() {
+  const card = openModal({
+    title: '批量测活',
+    subtitle: '按分组保活：流式请求，使用每个账号上次手动测活的模型。',
+    size: 'modal-sm',
+    body: `<div class="test-panel">
+      ${field('测活分组', `<select class="field-select" id="f-batch_group" name="group_id">
+        <option value="all">全部启用的账号</option>
+        ${state.data.groups.map(group => option(group.id, group.name)).join('')}
+      </select>`, {
+        id: 'f-batch_group', full: true,
+        hint: '每个账号使用它上次手动测活选择的模型；没有记录时回退到该服务商的默认模型。'
+      })}
+      <div class="test-result" data-test-result></div>
+      <div class="test-rows" data-test-rows hidden></div>
+    </div>`,
+    footer: `<button class="btn btn-ghost" type="button" data-modal-close>关闭</button>
+             <button class="btn btn-primary" type="button" data-run-test>${icon('i-play', 'ico-sm')}<span>开始测活</span></button>`
+  })
+
+  const select = card.querySelector('#f-batch_group')
+  const resultNode = card.querySelector('[data-test-result]')
+  const rowsNode = card.querySelector('[data-test-rows]')
+  const runButton = card.querySelector('[data-run-test]')
+
+  const setResult = (message, tone) => {
+    resultNode.className = `test-result ${tone ? `is-${tone}` : ''}`
+    resultNode.textContent = message
+  }
+
+  runButton.addEventListener('click', async () => {
+    runButton.disabled = true
+    rowsNode.hidden = true
+    setResult('正在流式测活…', 'pending')
+    try {
+      const result = await api('/accounts/test-all', {
+        method: 'POST',
+        body: { group_id: select.value }
+      })
+      const summary = result?.data || {}
+      const rows = summary.results || []
+      const failed = num(summary.failed)
+
+      // Per-account lines matter more than the count here: the point of a
+      // keep-alive run is knowing *which* credential went dark.
+      rowsNode.innerHTML = rows.map(row => `<div class="test-row ${row.success ? 'is-ok' : 'is-err'}">
+        <span class="test-row-name">${esc(row.name || `#${row.account_id}`)}</span>
+        <span class="test-row-msg">${esc(row.message || '')}</span>
+      </div>`).join('')
+      rowsNode.hidden = rows.length === 0
+
+      setResult(`${num(summary.healthy)} 个正常${failed ? `，${failed} 个异常` : ''}`, failed ? 'err' : 'ok')
+      await loadPage('accounts', true)
+    } catch (error) {
+      setResult(error.message || '批量测活失败', 'err')
+    } finally {
+      runButton.disabled = false
+    }
+  })
+}
+
+/**
+ * Bulk cleanup for usage records.
+ *
+ * usage_records is the only table that grows with traffic instead of with
+ * configuration, and D1 caps how much a database may store, so an operator needs
+ * a way to reclaim it from the console. Request logs are trimmed on the same
+ * cutoff because failover reads them for error rates and a log whose usage row
+ * is gone is no longer useful evidence.
+ */
+function openUsageCleanupModal() {
+  openModal({
+    title: '清理使用记录',
+    subtitle: 'Cloudflare D1 有容量上限，使用记录会随流量持续增长。',
+    submitLabel: '开始清理',
+    size: 'modal-sm',
+    body: `${field('清理范围', `<select class="field-select" id="f-cleanup_days" name="older_than_days">
+        <option value="30">删除 30 天前的记录</option>
+        <option value="14">删除 14 天前的记录</option>
+        <option value="7">删除 7 天前的记录</option>
+        <option value="1">删除 1 天前的记录</option>
+        <option value="0">删除全部记录</option>
+      </select>`, {
+        id: 'f-cleanup_days', full: true,
+        hint: '同时清理相同时间之前的请求日志。已产生的费用和额度不会被回退，删除后无法恢复。'
+      })}`,
+    async onSubmit(form) {
+      const days = num(Object.fromEntries(form.entries()).older_than_days, 30)
+      const result = await api(`/usage?older_than_days=${days}`, { method: 'DELETE' })
+      await loadPage('usage', true)
+      showToast(`已删除 ${num(result?.deleted)} 条记录，剩余 ${num(result?.remaining)} 条`, 'success')
     }
   })
 }
@@ -1466,6 +1591,17 @@ document.addEventListener('click', async event => {
         requestDelete({ path: `/models/${id}`, label: '模型映射', name: record?.requested_model || `#${id}`, page: 'models' })
         break
       }
+
+      case 'delete-usage': {
+        const record = (state.data.usage || []).find(row => num(row.id) === id)
+        requestDelete({
+          path: `/usage/${id}`,
+          label: '使用记录',
+          name: record ? `${record.model || '未知模型'} · ${fmtDate(record.created_at)}` : `#${id}`,
+          page: 'usage'
+        })
+        break
+      }
     }
   } catch (error) {
     showToast(error.message, 'error')
@@ -1536,27 +1672,8 @@ $('btn-refresh-usage').addEventListener('click', event =>
 $('btn-create-key').addEventListener('click', () => openKeyModal())
 $('btn-create-group').addEventListener('click', () => openGroupModal())
 $('btn-create-account').addEventListener('click', () => openAccountModal())
-$('btn-test-accounts').addEventListener('click', async event => {
-  const button = event.currentTarget
-  const original = button.innerHTML
-  button.disabled = true
-  button.innerHTML = `${icon('i-clock', 'ico-sm')}<span>测活中…</span>`
-  try {
-    const result = await api('/accounts/test-all', { method: 'POST' })
-    const summary = result?.data || {}
-    const failed = num(summary.failed)
-    showToast(
-      `测活完成：${num(summary.healthy)} 个正常${failed ? `，${failed} 个异常` : ''}`,
-      failed ? 'warn' : 'success'
-    )
-    await loadPage('accounts', true)
-  } catch (error) {
-    showToast(error.message || '批量测活失败', 'error')
-  } finally {
-    button.disabled = false
-    button.innerHTML = original
-  }
-})
+$('btn-test-accounts').addEventListener('click', () => openBatchTestModal())
+$('btn-clean-usage').addEventListener('click', () => openUsageCleanupModal())
 $('btn-create-model').addEventListener('click', () => openModelModal())
 
 /**

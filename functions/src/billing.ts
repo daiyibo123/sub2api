@@ -1,4 +1,5 @@
 // Token counting and billing utilities
+import { findTokenRate, priceTokens, DEFAULT_RATE } from './pricing';
 
 // Simple token estimation (chars / 4 for English, chars / 2 for CJK)
 export function estimateTokens(text: string): number {
@@ -51,39 +52,41 @@ export interface CostBreakdown {
 }
 
 export function calculateCostBreakdown(provider: string, model: string, promptTokens: number, completionTokens: number, multiplier = 1): CostBreakdown {
-  const pricing: Record<string, Record<string, { prompt: number; completion: number }>> = {
-    openai: {
-      'gpt-4o': { prompt: 2.5, completion: 10 },
-      'gpt-4o-mini': { prompt: 0.15, completion: 0.6 },
-      'gpt-4-turbo': { prompt: 10, completion: 30 },
-      'gpt-3.5-turbo': { prompt: 0.5, completion: 1.5 },
-      'o1': { prompt: 15, completion: 60 },
-      'o1-mini': { prompt: 3, completion: 12 },
-      'o3': { prompt: 10, completion: 40 },
-    },
-    anthropic: {
-      'claude-sonnet-4-20250514': { prompt: 3, completion: 15 },
-      'claude-3-5-sonnet-20241022': { prompt: 3, completion: 15 },
-      'claude-3-5-haiku-20241022': { prompt: 0.8, completion: 4 },
-      'claude-3-opus-20240229': { prompt: 15, completion: 75 },
-    },
-    xai: {
-      'grok-2-latest': { prompt: 2, completion: 10 },
-      'grok-2': { prompt: 2, completion: 10 },
-      'grok-vision-beta': { prompt: 2, completion: 10 },
-    }
-  };
-  const modelPricing = pricing[provider]?.[model];
-  const rates = modelPricing || { prompt: 1, completion: 2 };
-  const raw = (promptTokens / 1000) * rates.prompt + (completionTokens / 1000) * rates.completion;
-  const baseCost = Math.round(raw * 1000000) / 1000000;
-  const safeMultiplier = Number.isFinite(Number(multiplier)) && Number(multiplier) >= 0 ? Number(multiplier) : 1;
+  const published = findTokenRate(provider, model);
+  const rates = published || DEFAULT_RATE;
+
+  // priceTokens divides by 1,000,000 because the table is per-1M. The previous
+  // implementation divided by 1,000 against the same per-1M figures, so every
+  // recorded cost — and every quota decrement — was 1000x too large.
+  const raw = priceTokens(promptTokens, rates.prompt) + priceTokens(completionTokens, rates.completion);
+  const baseCost = round6(raw);
+  const safeMultiplier = readMultiplier(multiplier);
   return {
     baseCost,
-    cost: Math.round(baseCost * safeMultiplier * 1000000) / 1000000,
+    cost: round6(baseCost * safeMultiplier),
     multiplier: safeMultiplier,
-    estimated: !modelPricing
+    estimated: !published
   };
+}
+
+/**
+ * Coerce a billing weight, falling back to 1x for anything unusable.
+ *
+ * `null` has to be rejected before the numeric check rather than by it, because
+ * `Number(null)` is 0 — a legal weight meaning "free". An account whose
+ * rate_multiplier column was never populated would therefore have billed every
+ * request at zero and never consumed its key's quota. 0 is still honoured when
+ * it is written explicitly, since a genuinely free upstream is a real case.
+ */
+function readMultiplier(value: unknown): number {
+  if (value === null || value === undefined || value === '') return 1;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 1;
+}
+
+/** Six decimals: sub-cent accuracy without accumulating float noise. */
+function round6(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
 }
 
 // Calculate cost based on model and provider

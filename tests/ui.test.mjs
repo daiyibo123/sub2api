@@ -78,7 +78,34 @@ function fakeFetch(url, options = {}) {
   if (path === '/auth/login') return respond({ token: 't0ken', user: { id: 1, username: 'admin', is_admin: true } })
   if (path.startsWith('/auth/setup')) return respond({ data: { initialized: true, setup_available: false } })
   if (path.startsWith('/stats')) return respond(statsPayload())
-  if (path.startsWith('/usage')) return respond({ data: db.usage })
+  if (path.startsWith('/usage')) {
+    if (method === 'DELETE') return respond({ success: true, deleted: 2, remaining: 0 })
+    return respond({ data: db.usage })
+  }
+
+  // The probe dialog reads the list cached on the account, so the stub reports
+  // `cached` and the remembered model the same way the worker does.
+  const upstreamModels = path.match(/^\/accounts\/(\d+)\/models/)
+  if (upstreamModels) {
+    return respond({
+      data: {
+        account_id: Number(upstreamModels[1]),
+        models: [{ id: 'gpt-5.6-terra' }, { id: 'gpt-5.5' }],
+        cached: !path.includes('refresh=1'),
+        fetched_at: '2026-01-01 00:00:00',
+        probe_model: 'gpt-5.5'
+      }
+    })
+  }
+  if (path === '/accounts/test-all') {
+    return respond({
+      data: {
+        group_id: body?.group_id === 'all' ? null : Number(body?.group_id),
+        total: 1, healthy: 1, failed: 0,
+        results: [{ account_id: 1, name: 'acct-openai', success: true, status: 200, latency_ms: 400, ttft_ms: 180, model: 'gpt-5.5', message: 'gpt-5.5 · 流式连接成功' }]
+      }
+    })
+  }
 
   const table = path.match(/^\/(keys|groups|accounts|models)/)?.[1]
   if (!table) return respond({ error: `unhandled ${path}` }, 404)
@@ -381,14 +408,79 @@ check('resource panel covers keys', /API 密钥/.test(resourceText), resourceTex
 press(doc.querySelector('.nav-item[data-page="usage"]'))
 await tick(10)
 const usageHead = [...doc.querySelectorAll('#usage-list thead th')].map(th => th.textContent)
+// One combined Token column instead of three per-direction ones; the split still
+// appears inside the cell. The action column carries no label.
 check('usage table fits without a token column per direction',
-  usageHead.length === 9 && usageHead.includes('Token'), usageHead.join('|'))
+  usageHead.includes('Token')
+  && !usageHead.includes('输入')
+  && !usageHead.includes('输出')
+  && usageHead.filter(Boolean).length === 9, usageHead.join('|'))
 check('usage row keeps both token directions', /↑|↓/.test(doc.getElementById('usage-list').textContent))
 // The discounted row must show what produced the charged figure, otherwise a
 // multiplier is invisible and the number looks wrong against the model's price.
 check('usage cost cell shows the multiplier', /0\.5x/.test(doc.getElementById('usage-list').textContent),
   doc.getElementById('usage-list').textContent.slice(0, 200))
 check('usage marks an estimated price', /估算价/.test(doc.getElementById('usage-list').textContent))
+
+// ---- usage records must be removable ---------------------------------------
+// D1 caps database size and usage_records is the only table that grows with
+// traffic, so an operator needs both a single-row delete and a bulk cleanup.
+check('usage row exposes a delete action', Boolean(doc.querySelector('#usage-list [data-action="delete-usage"]')))
+press(doc.querySelector('#usage-list [data-action="delete-usage"]'))
+await tick(6)
+check('deleting a usage row asks for confirmation', /删除/.test(doc.querySelector('.modal-card')?.textContent || ''),
+  doc.querySelector('.modal-card')?.textContent?.slice(0, 80) || 'no dialog')
+press(doc.querySelector('.modal-card [data-confirm]') || doc.querySelector('.modal-foot .btn-danger') || doc.querySelector('.modal-foot .btn-primary'))
+await tick(14)
+const usageDelete = posted.find(entry => entry.method === 'DELETE' && /^\/usage\/\d+$/.test(entry.path))
+check('single usage delete hits the record endpoint', Boolean(usageDelete), JSON.stringify(posted.slice(-3)))
+
+press(doc.getElementById('btn-clean-usage'))
+await tick(8)
+const cleanupForm = doc.querySelector('.modal-form')
+check('usage cleanup dialog opens', Boolean(cleanupForm))
+if (cleanupForm) {
+  cleanupForm.querySelector('[name="older_than_days"]').value = '7'
+  cleanupForm.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }))
+  await tick(16)
+  const cleanup = posted.find(entry => entry.method === 'DELETE' && entry.path.includes('older_than_days=7'))
+  check('bulk cleanup sends the retention window', Boolean(cleanup), JSON.stringify(posted.slice(-3)))
+}
+
+// ---- probe dialog reuses the cached model list ------------------------------
+// Re-fetching on every open is what the operator complained about: the list is
+// stored on the account, so opening the dialog must show it without a refetch.
+press(doc.querySelector('.nav-item[data-page="accounts"]'))
+await tick(10)
+press(doc.querySelector('#accounts-list [data-action="test-account"]'))
+await tick(14)
+const probeCard = doc.querySelector('.modal-card')
+const probeSelect = probeCard?.querySelector('#f-test_model')
+check('probe dialog opens', Boolean(probeCard))
+check('probe dialog loads models without pressing a button', (probeSelect?.options.length || 0) > 1,
+  `${probeSelect?.options.length} options`)
+check('probe dialog preselects the remembered model', probeSelect?.value === 'gpt-5.5', probeSelect?.value)
+check('probe dialog reports the list came from cache', /缓存/.test(probeCard?.textContent || ''),
+  probeCard?.querySelector('[data-test-result]')?.textContent || '')
+fire(doc.querySelector('.modal-backdrop'), 'mousedown')
+await tick(4)
+
+// ---- batch probe is scoped to a group --------------------------------------
+press(doc.getElementById('btn-test-accounts'))
+await tick(8)
+const batchCard = doc.querySelector('.modal-card')
+const batchSelect = batchCard?.querySelector('#f-batch_group')
+check('batch probe dialog opens', Boolean(batchCard))
+check('batch probe lists every group plus "all"', batchSelect?.options.length === db.groups.length + 1,
+  `${batchSelect?.options.length} for ${db.groups.length} groups`)
+if (batchSelect) {
+  batchSelect.value = '2'
+  press(batchCard.querySelector('[data-run-test]'))
+  await tick(16)
+  const batchPost = posted.find(entry => entry.path === '/accounts/test-all' && entry.body?.group_id === '2')
+  check('batch probe sends the chosen group', Boolean(batchPost), JSON.stringify(posted.slice(-3)))
+  check('batch probe lists each account result', /acct-openai/.test(doc.body.textContent))
+}
 
 check('no uncaught page errors', jsErrors.length === 0, jsErrors.join(' | '))
 

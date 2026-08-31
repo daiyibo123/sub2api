@@ -69,10 +69,20 @@ class Handler(BaseHTTPRequestHandler):
             state = STATE.setdefault(port, _blank())
             if self.path.startswith('/__control'):
                 return self._send(200, {'requests': list(state['requests'])})
+            # Recorded like a POST so a test can prove the model list was served
+            # from the cached copy rather than re-fetched on every dialog open.
+            state['requests'].append({
+                'path': self.path,
+                'method': 'GET',
+                'model': None,
+                'stream': False,
+                'authorization': self.headers.get('authorization'),
+                'x_api_key': self.headers.get('x-api-key'),
+            })
             status = state['status']
         # Provider "list models" probe used by the account connection test.
         return self._send(status if status >= 400 else 200,
-                          {'object': 'list', 'data': [{'id': 'stub-model'}]})
+                          {'object': 'list', 'data': [{'id': 'stub-model'}, {'id': 'stub-model-2'}]})
 
     def do_POST(self):
         port = self._port()

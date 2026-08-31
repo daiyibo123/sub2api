@@ -11,6 +11,22 @@ interface ErrorWindow {
   errors: number[];
 }
 
+/**
+ * 4xx codes that describe the *account*, not the request.
+ *
+ * Each of these can succeed on a different credential, so they must move to the
+ * next account rather than being handed back to the caller:
+ *   401 key revoked or invalid
+ *   402 balance exhausted / payment required
+ *   403 plan or region not permitted
+ *   404 this upstream does not serve the requested model
+ *   408 upstream timed out
+ *   409 transient conflict (some relays use this for a busy pool)
+ *   425 sent too early
+ *   429 rate limited or quota exceeded
+ */
+const ACCOUNT_LEVEL_FAILURES = new Set([401, 402, 403, 404, 408, 409, 425, 429]);
+
 export class FailoverManager {
   private errorWindows: Map<number, ErrorWindow> = new Map();
   private windowMs: number;
@@ -225,10 +241,25 @@ export class FailoverManager {
   // Check if error should trigger failover
   shouldFailover(error: any): boolean {
     if (!error) return false;
-    
+
     const status = error.status || error.statusCode || 0;
-    // Retry transient upstream failures, but preserve useful client errors.
-    return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
+
+    // A status is retried when a *different account* could plausibly succeed.
+    //
+    // The earlier rule only retried 408/425/429/5xx, which left the most common
+    // real-world account failures unhandled: an expired key (401), an unpaid
+    // account (402) and a plan without access (403) were all returned straight
+    // to the client while the dead account stayed in rotation. Those are
+    // properties of the credential, not of the request, so another account is
+    // exactly what should serve it.
+    if (status === 0 || status >= 500) return true;
+    if (ACCOUNT_LEVEL_FAILURES.has(status)) return true;
+
+    // Everything else in 4xx describes the request itself — a malformed body,
+    // an oversized payload, a rejected parameter. Replaying it against another
+    // account produces the identical error while burning that account's quota
+    // and the caller's latency budget, so it is surfaced immediately.
+    return false;
   }
 
   // Cleanup old windows periodically

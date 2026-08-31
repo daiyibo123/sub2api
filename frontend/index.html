@@ -324,6 +324,9 @@
               <button id="btn-refresh-usage" class="btn btn-quiet refresh-btn" type="button" title="重新拉取调用记录">
                 <svg class="ico ico-sm" aria-hidden="true"><use href="#i-refresh"/></svg><span>刷新</span>
               </button>
+              <button id="btn-clean-usage" class="btn btn-secondary" type="button" title="按时间清理历史记录">
+                <svg class="ico ico-sm" aria-hidden="true"><use href="#i-trash"/></svg>清理记录
+              </button>
             </div>
           </div>
           <div class="toolbar">
@@ -486,7 +489,8 @@
                   <li>同优先级下，计费倍率低的账号优先，倍率相同再看错误率。</li>
                   <li>按统计窗口内的错误率和错误次数熔断异常账号。</li>
                   <li>同等条件下按最近使用时间分散请求。</li>
-                  <li>上游返回 408 / 425 / 429 / 5xx 或网络超时时自动切换账号重试。</li>
+                  <li>上游返回 401 / 402 / 403 / 404 / 408 / 409 / 425 / 429 或任意 5xx、网络超时时自动切换账号重试。</li>
+                  <li>请求本身有问题（400 参数错误、413 请求过大等）不会切换账号，换号只会得到同样的错误。</li>
                 </ol>
               </div>
             </article>

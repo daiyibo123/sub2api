@@ -177,6 +177,41 @@ status, payload = call('/v1/chat/completions', 'POST',
 check('rate limit triggers failover', status == 200 and payload.get('id') == f'chatcmpl-{PORT_B}',
       (status, payload.get('id')))
 
+# Account-level 4xx must switch accounts too. An expired key (401), an unpaid
+# balance (402), a plan without access (403) and an upstream that does not serve
+# the model (404) all describe the *credential*, not the request, so another
+# account can serve them. Returning them to the caller left the dead account in
+# rotation and made the gateway look broken.
+#
+# The assertion is that the caller never sees the upstream's status: whichever
+# account is picked first, the answer must come from a working one. Checking the
+# reply's origin rather than which port was touched keeps this stable even once
+# the error window has circuit-broken the failing account.
+for code in (401, 402, 403, 404, 409, 500, 502, 503, 529):
+    reset_upstreams()
+    control(PORT_A, status=code)
+    status, payload = call('/v1/chat/completions', 'POST',
+                           {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                           token=client_key, base=BASE)
+    check(f'HTTP {code} switches accounts instead of reaching the client',
+          status == 200 and payload.get('id') != f'chatcmpl-{PORT_A}',
+          (status, payload.get('id')))
+
+# The other half of the rule: a 4xx that describes the request must NOT be
+# replayed. Retrying it produces the identical error on every account while
+# burning each one's quota, so every upstream is set to the same status and the
+# test asserts a single attempt was made in total.
+for code in (400, 413, 422):
+    reset_upstreams()
+    for port in (PORT_A, PORT_B, PORT_C):
+        control(port, status=code)
+    status, _ = call('/v1/chat/completions', 'POST',
+                     {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                     token=client_key, base=BASE)
+    attempts = sum(len(requests_seen(port)) for port in (PORT_A, PORT_B, PORT_C))
+    check(f'HTTP {code} is returned to the client', status == code, status)
+    check(f'HTTP {code} is not replayed on another account', attempts == 1, attempts)
+
 # Both primary accounts down -> must fall through to the backup group.
 reset_upstreams()
 control(PORT_A, status=500)

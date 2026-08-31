@@ -868,6 +868,36 @@ html.dark .test-result.is-pending { border-color: rgba(20, 184, 166, .3); backgr
   .test-model-row { flex-direction: column; align-items: stretch; }
 }
 
+/*
+ * Per-account results of a batch probe.
+ *
+ * A keep-alive run needs to say *which* credential went dark, so the rows are
+ * scrollable rather than truncated: a large group would otherwise push the
+ * dialog past the viewport and hide the failures underneath.
+ */
+.test-rows {
+  display: grid;
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.test-row {
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-2);
+  border-left-width: 3px;
+  border-radius: var(--radius-ctl);
+  background: var(--surface-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.test-row.is-ok { border-left-color: var(--emerald); }
+.test-row.is-err { border-left-color: var(--red); }
+.test-row-name { font-weight: 600; color: var(--text-1); }
+.test-row-msg { color: var(--text-2); overflow-wrap: anywhere; }
+
 .secret-box {
   display: flex;
   align-items: center;

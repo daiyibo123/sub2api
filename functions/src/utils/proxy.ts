@@ -262,9 +262,17 @@ export function measureStreamTiming(
  *
  * A reseller upstream may bill at a fraction (or a premium) of list price, so
  * cost is the raw token price scaled by this factor.
+ *
+ * A null column has to be rejected before the numeric check, not by it, because
+ * `Number(null)` is 0 — a legal weight meaning "free". A database row created
+ * before rate_multiplier existed would otherwise bill at zero and, because this
+ * value also breaks ties in account selection, sort as the cheapest upstream and
+ * win every request. An explicit 0 is still honoured: a free upstream is real.
  */
 export function accountRateMultiplier(account: any): number {
-  const value = Number(account?.rate_multiplier);
+  const raw = account?.rate_multiplier;
+  if (raw === null || raw === undefined || raw === '') return 1;
+  const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : 1;
 }
 

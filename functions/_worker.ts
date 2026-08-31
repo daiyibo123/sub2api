@@ -113,9 +113,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return handleApiKeys(request, env)
   }
 
-  // Usage
-  if (path === '/api/v1/usage' && request.method === 'GET') {
-    return handleUsage(request, env)
+  // Usage. DELETE is on the same prefix because usage_records is the only table
+  // that grows with traffic rather than with configuration, and D1 caps database
+  // size — an operator needs a way to reclaim it without shell access.
+  if (path === '/api/v1/usage' || path.startsWith('/api/v1/usage/')) {
+    if (request.method === 'GET' && path === '/api/v1/usage') return handleUsage(request, env)
+    if (request.method === 'DELETE') return handleUsageDelete(request, env, path)
+    return json({ error: 'Method not allowed' }, 405)
   }
 
   // Config endpoints. A write changes which accounts the gateway may pick, so
@@ -475,6 +479,44 @@ async function handleUsage(request: Request, env: Env): Promise<Response> {
 
   const records = await db.listUsageRecords(limit, offset)
   return json({ data: records })
+}
+
+/**
+ * Delete usage rows: one by id, or everything older than `days`.
+ *
+ * Admin-only and destructive, so the two shapes are kept explicit rather than
+ * letting a missing parameter mean "wipe the table". `days=0` does clear
+ * everything, but only when the caller says so.
+ */
+async function handleUsageDelete(request: Request, env: Env, path: string): Promise<Response> {
+  const session = await checkAuth(request, env)
+  if (!session) return json({ error: 'Unauthorized' }, 401)
+  if (session.isAdmin !== true) return json({ error: '需要管理员权限' }, 403)
+
+  const db = createDatabase(env.DB)
+  const itemMatch = /^\/api\/v1\/usage\/(\d+)$/.exec(path)
+  if (itemMatch) {
+    const result = await db.deleteUsageRecord(Number(itemMatch[1]))
+    if (!result.changes) return json({ error: '记录不存在' }, 404)
+    return json({ success: true, deleted: result.changes })
+  }
+
+  if (path !== '/api/v1/usage') return json({ error: 'Invalid usage path' }, 404)
+
+  const url = new URL(request.url)
+  const rawDays = url.searchParams.get('older_than_days')
+  if (rawDays === null) {
+    return json({ error: '请提供 older_than_days（0 表示清空全部）' }, 400)
+  }
+  const days = Number(rawDays)
+  if (!Number.isFinite(days) || days < 0 || days > 3650) {
+    return json({ error: 'older_than_days 必须是 0 到 3650 之间的数字' }, 400)
+  }
+
+  const before = await db.countUsageRecords()
+  await db.deleteUsageRecordsOlderThan(days)
+  const after = await db.countUsageRecords()
+  return json({ success: true, deleted: Math.max(0, before - after), remaining: after })
 }
 
 async function checkAuth(request: Request, env: Env): Promise<any> {

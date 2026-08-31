@@ -214,6 +214,31 @@ export class Database {
     );
   }
 
+  /**
+   * Cache the upstream's model list on the account.
+   *
+   * Stored as a JSON array of `{ id, name? }` rows. The list changes rarely, so
+   * re-fetching it every time the probe dialog opens costs a round trip to
+   * relearn the same answer and forces the operator to re-pick a model.
+   */
+  async saveUpstreamModels(id: number, models: Array<{ id: string; name?: string }>) {
+    return this.update(
+      `UPDATE accounts SET upstream_models = ?, upstream_models_at = datetime('now') WHERE id = ?`,
+      [JSON.stringify(models.slice(0, 200)), id]
+    );
+  }
+
+  /**
+   * Remember which model an operator probed with.
+   *
+   * A batch probe reuses this so an account is kept alive against the model it
+   * was actually verified with, rather than a provider-wide default the plan may
+   * not serve.
+   */
+  async saveProbeModel(id: number, model: string) {
+    return this.update('UPDATE accounts SET probe_model = ? WHERE id = ?', [model.slice(0, 200), id]);
+  }
+
   /** Resolve a single account row including its credential. */
   async getAccountWithKey(id: number) {
     return this.queryOne<any>(`
@@ -371,6 +396,35 @@ export class Database {
        ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
       [limit, offset]
     );
+  }
+
+  async countUsageRecords(): Promise<number> {
+    const row = await this.queryOne<{ total: number }>('SELECT COUNT(*) AS total FROM usage_records');
+    return Number(row?.total || 0);
+  }
+
+  async deleteUsageRecord(id: number) {
+    return this.update('DELETE FROM usage_records WHERE id = ?', [id]);
+  }
+
+  /**
+   * Drop usage rows older than `days`, or every row when `days` is 0.
+   *
+   * D1 bills on rows stored and caps database size, and usage_records is the
+   * only table that grows with traffic rather than with configuration, so an
+   * operator needs a way to reclaim it. Request logs are trimmed on the same
+   * cutoff because failover reads them for error rates and a log with no
+   * matching usage row is no longer useful evidence.
+   */
+  async deleteUsageRecordsOlderThan(days: number) {
+    if (days <= 0) {
+      await this.update('DELETE FROM usage_records', []);
+      await this.update('DELETE FROM request_logs', []);
+      return;
+    }
+    const cutoff = sqliteTimestamp(Date.now() - days * 24 * 60 * 60 * 1000);
+    await this.update('DELETE FROM usage_records WHERE created_at < ?', [cutoff]);
+    await this.update('DELETE FROM request_logs WHERE created_at < ?', [cutoff]);
   }
 
   // Request logs for error tracking

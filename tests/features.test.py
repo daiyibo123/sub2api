@@ -298,6 +298,183 @@ check('probe of unknown account is reported', payload.get('success') is False, p
 status, _ = call('/accounts/test-all', 'POST')
 check('batch probe requires auth', status == 401, status)
 
+# --------------------------------------------- probe uses a streaming request
+# The gateway serves streaming traffic, and an upstream can accept a buffered
+# request while failing to stream (a relay that never flushes, a plan without
+# streaming rights). A non-streaming probe would call that account healthy.
+control(PORT_FAST, reset=True, status=200)
+call(f'/accounts/{cheap_id}/test', 'POST', {'model': 'gpt-5.5'}, token=token)
+probe_requests = seen(PORT_FAST)
+check('probe sends a streaming request',
+      bool(probe_requests) and probe_requests[-1].get('stream') is True, probe_requests)
+check('probe sends the selected model',
+      bool(probe_requests) and probe_requests[-1].get('model') == 'gpt-5.5', probe_requests)
+
+# ------------------------------------------------- cached upstream model list
+status, payload = call(f'/accounts/{cheap_id}/models', token=token)
+models = payload.get('data', {}).get('models', [])
+check('upstream models listed', status == 200 and bool(models), (status, payload))
+check('model list reports its freshness',
+      'cached' in payload.get('data', {}), payload.get('data'))
+check('model list remembers the probed model',
+      payload.get('data', {}).get('probe_model') == 'gpt-5.5', payload.get('data'))
+
+# The point of persisting the list: a second open must not re-hit the upstream.
+control(PORT_FAST, reset=True, status=200)
+status, payload = call(f'/accounts/{cheap_id}/models', token=token)
+check('second listing is served from cache',
+      payload.get('data', {}).get('cached') is True, payload.get('data'))
+check('cached listing skips the upstream round trip', len(seen(PORT_FAST)) == 0, seen(PORT_FAST))
+
+# An explicit refresh must still reach the upstream, or a genuinely changed
+# catalogue could never be relearned.
+status, payload = call(f'/accounts/{cheap_id}/models?refresh=1', token=token)
+check('refresh re-fetches from the upstream',
+      payload.get('data', {}).get('cached') is False and len(seen(PORT_FAST)) >= 1,
+      (payload.get('data'), seen(PORT_FAST)))
+
+status, _ = call(f'/accounts/{cheap_id}/models')
+check('model listing requires auth', status == 401, status)
+
+# --------------------------------------- batch probe reuses the probed model
+# Batch probing is the keep-alive path: each account must be exercised with the
+# model it was last verified against, not a provider-wide default that a relay
+# or a restricted plan may not serve.
+control(PORT_FAST, reset=True, status=200)
+status, payload = call('/accounts/test-all', 'POST', {'group_id': primary_id}, token=token)
+data = payload.get('data', {})
+check('batch probe accepts a group', status == 200, (status, payload))
+check('batch probe scopes itself to that group', data.get('group_id') == primary_id, data)
+batch_requests = seen(PORT_FAST)
+check('batch probe streams', bool(batch_requests) and batch_requests[-1].get('stream') is True,
+      batch_requests)
+check('batch probe reuses the remembered model',
+      bool(batch_requests) and batch_requests[-1].get('model') == 'gpt-5.5', batch_requests)
+check('batch probe names the model per row',
+      bool(data.get('results')) and data['results'][0].get('model'), data.get('results'))
+
+# An empty group is a configuration mistake worth reporting, not a silent no-op
+# that looks like every account passed.
+_, empty_group = call('/groups', 'POST', {'name': 'feat-empty', 'priority': 9}, token=token)
+status, payload = call('/accounts/test-all', 'POST',
+                       {'group_id': empty_group.get('data', {}).get('id')}, token=token)
+check('batch probe rejects a group with no accounts', status == 400, (status, payload))
+
+status, payload = call('/accounts/test-all', 'POST', {'group_id': 999999}, token=token)
+check('batch probe rejects an unknown group', status == 400, (status, payload))
+
+status, payload = call('/accounts/test-all', 'POST', {'group_id': 'all'}, token=token)
+check('batch probe still supports every account', status == 200, (status, payload))
+
+# ------------------------------------------------------- usage record cleanup
+# D1 caps database size and usage_records is the only table that grows with
+# traffic, so an operator needs to reclaim it without shell access.
+_, usage_before = call('/usage?limit=50', token=token)
+rows = usage_before.get('data', [])
+check('usage rows exist before cleanup', bool(rows), len(rows))
+
+first_id = rows[0].get('id') if rows else 0
+status, payload = call(f'/usage/{first_id}', 'DELETE', token=token)
+check('single usage record deleted', status == 200 and payload.get('success') is True,
+      (status, payload))
+
+_, usage_after = call('/usage?limit=50', token=token)
+check('deleted row is gone',
+      all(row.get('id') != first_id for row in usage_after.get('data', [])),
+      [row.get('id') for row in usage_after.get('data', [])])
+
+status, payload = call(f'/usage/{first_id}', 'DELETE', token=token)
+check('deleting a missing record is reported', status == 404, (status, payload))
+
+# A bulk delete without a window would be an unguarded "drop everything".
+status, payload = call('/usage', 'DELETE', token=token)
+check('bulk cleanup requires a retention window', status == 400, (status, payload))
+
+status, payload = call('/usage?older_than_days=abc', 'DELETE', token=token)
+check('bulk cleanup validates the window', status == 400, (status, payload))
+
+# A 3650-day window keeps everything, which proves the endpoint honours the
+# cutoff instead of always truncating the table.
+status, payload = call('/usage?older_than_days=3650', 'DELETE', token=token)
+_, kept = call('/usage?limit=50', token=token)
+check('a wide window keeps recent rows', status == 200 and bool(kept.get('data')),
+      (status, payload, len(kept.get('data', []))))
+
+status, payload = call('/usage?older_than_days=0', 'DELETE', token=token)
+_, emptied = call('/usage?limit=50', token=token)
+check('zero days clears every row',
+      status == 200 and not emptied.get('data'), (status, payload, emptied.get('data')))
+
+status, _ = call('/usage?older_than_days=0', 'DELETE')
+check('usage cleanup requires auth', status == 401, status)
+
+# ------------------------------------------------- error-rate circuit breaking
+# Failing over on a single request is not the same as circuit breaking. Once an
+# account has crossed its group's error threshold it must be taken out of
+# rotation *before* the next request is attempted, otherwise every caller keeps
+# paying the latency of a known-dead upstream first.
+_, breaker = call('/groups', 'POST', {
+    'name': 'feat-breaker', 'priority': 0,
+    'error_threshold': 0.5, 'error_count_threshold': 2, 'window_seconds': 300,
+}, token=token)
+breaker_id = breaker.get('data', {}).get('id')
+check('breaker group stores its thresholds',
+      breaker.get('data', {}).get('error_count_threshold') == 2, breaker.get('data'))
+
+_, broken = call('/accounts', 'POST', {
+    'name': 'feat-broken', 'provider': 'openai', 'api_key': 'sk-broken',
+    'base_url': f'http://127.0.0.1:{PORT_SLOW}',
+    'group_id': breaker_id, 'priority': 0,
+}, token=token)
+broken_id = broken.get('data', {}).get('id')
+
+_, spare = call('/accounts', 'POST', {
+    'name': 'feat-spare', 'provider': 'openai', 'api_key': 'sk-spare',
+    'base_url': f'http://127.0.0.1:{PORT_FALLBACK}',
+    'group_id': breaker_id, 'priority': 5,
+}, token=token)
+check('breaker fixtures created', bool(broken_id) and bool(spare.get('data', {}).get('id')),
+      (broken_id, spare.get('data')))
+
+_, breaker_key_payload = call('/keys', 'POST',
+                              {'name': 'feat-breaker-key', 'group_id': breaker_id}, token=token)
+breaker_key = breaker_key_payload.get('data', {}).get('key')
+
+# The preferred account fails; the spare answers. Each attempt writes a request
+# log, which is what the breaker reads.
+call(f'/accounts/{fallback_account_id}', 'PUT', {'enabled': 1}, token=token)
+control(PORT_SLOW, reset=True, status=500, stream=False)
+control(PORT_FALLBACK, reset=True, status=200, stream=False)
+
+for _ in range(3):
+    status, payload = call('/v1/chat/completions', 'POST',
+                           {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                           token=breaker_key, base=BASE)
+check('failover still answers while the preferred account is down',
+      status == 200 and payload.get('id') == f'chatcmpl-{PORT_FALLBACK}',
+      (status, payload.get('id')))
+# Exactly one attempt is the correct number, not a floor. error_threshold is 0.5
+# and one failure out of one request is a 100% error rate, so the breaker opens
+# after the very first failure and error_count_threshold never becomes the
+# binding condition. Asserting on ">= 2 attempts" would demand that the gateway
+# keep paying for a known-dead upstream.
+check('the broken upstream was attempted exactly once', len(seen(PORT_SLOW)) == 1, len(seen(PORT_SLOW)))
+
+# Let the deferred request_logs writes land, then heal the broken upstream. A
+# request must still skip it: the error window has not expired, so the breaker
+# is what decides, not the upstream's current mood.
+time.sleep(1.5)
+control(PORT_SLOW, reset=True, status=200, stream=False)
+control(PORT_FALLBACK, reset=True, status=200, stream=False)
+status, payload = call('/v1/chat/completions', 'POST',
+                       {'model': 'gpt-4o', 'messages': [{'role': 'user', 'content': 'hi'}]},
+                       token=breaker_key, base=BASE)
+check('a tripped breaker diverts to the healthy account',
+      status == 200 and payload.get('id') == f'chatcmpl-{PORT_FALLBACK}',
+      (status, payload.get('id')))
+check('the circuit-broken account is not attempted at all',
+      len(seen(PORT_SLOW)) == 0, seen(PORT_SLOW))
+
 # ------------------------------------------------------------------- teardown
 print()
 print(f'PASSED {passed} / {passed + len(failures)}')

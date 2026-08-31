@@ -53,6 +53,9 @@ CREATE TABLE IF NOT EXISTS accounts (
   last_error_msg TEXT,
   priority INTEGER DEFAULT 0,
   client_spoofing TEXT DEFAULT '',
+  upstream_models TEXT,
+  upstream_models_at TEXT,
+  probe_model TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 

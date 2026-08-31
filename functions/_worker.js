@@ -1,5 +1,5 @@
 // functions/src/schema.ts
-var SCHEMA_VERSION = "8";
+var SCHEMA_VERSION = "9";
 var SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,6 +49,9 @@ var SCHEMA_STATEMENTS = [
     last_error_msg TEXT,
     priority INTEGER DEFAULT 0,
     client_spoofing TEXT DEFAULT '',
+    upstream_models TEXT,
+    upstream_models_at TEXT,
+    probe_model TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS model_mappings (
@@ -136,6 +139,15 @@ var ADDITIVE_COLUMNS = [
   { table: "accounts", column: "last_check_ok", definition: "INTEGER" },
   { table: "accounts", column: "last_check_latency_ms", definition: "INTEGER" },
   { table: "accounts", column: "last_check_message", definition: "TEXT" },
+  // The upstream's own model list, cached as JSON after a successful fetch, plus
+  // the model the operator last probed with. Re-fetching on every dialog open
+  // costs an upstream round trip to relearn something that rarely changes, and
+  // it forced the operator to re-pick a model each time. The remembered model is
+  // also what a batch probe uses, so an account is kept alive with the model it
+  // was verified against rather than a provider-wide guess.
+  { table: "accounts", column: "upstream_models", definition: "TEXT" },
+  { table: "accounts", column: "upstream_models_at", definition: "TEXT" },
+  { table: "accounts", column: "probe_model", definition: "TEXT" },
   // Attribution for a usage row. Without these the records page can only group
   // by model or provider, so an operator cannot tell which upstream account or
   // scheduling group served a request.
@@ -383,6 +395,29 @@ var Database = class {
       [ok ? 1 : 0, Math.max(0, Math.round(latencyMs)), (message || "").slice(0, 300), id]
     );
   }
+  /**
+   * Cache the upstream's model list on the account.
+   *
+   * Stored as a JSON array of `{ id, name? }` rows. The list changes rarely, so
+   * re-fetching it every time the probe dialog opens costs a round trip to
+   * relearn the same answer and forces the operator to re-pick a model.
+   */
+  async saveUpstreamModels(id, models) {
+    return this.update(
+      `UPDATE accounts SET upstream_models = ?, upstream_models_at = datetime('now') WHERE id = ?`,
+      [JSON.stringify(models.slice(0, 200)), id]
+    );
+  }
+  /**
+   * Remember which model an operator probed with.
+   *
+   * A batch probe reuses this so an account is kept alive against the model it
+   * was actually verified with, rather than a provider-wide default the plan may
+   * not serve.
+   */
+  async saveProbeModel(id, model) {
+    return this.update("UPDATE accounts SET probe_model = ? WHERE id = ?", [model.slice(0, 200), id]);
+  }
   /** Resolve a single account row including its credential. */
   async getAccountWithKey(id) {
     return this.queryOne(`
@@ -558,6 +593,32 @@ var Database = class {
        ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
       [limit, offset]
     );
+  }
+  async countUsageRecords() {
+    const row = await this.queryOne("SELECT COUNT(*) AS total FROM usage_records");
+    return Number(row?.total || 0);
+  }
+  async deleteUsageRecord(id) {
+    return this.update("DELETE FROM usage_records WHERE id = ?", [id]);
+  }
+  /**
+   * Drop usage rows older than `days`, or every row when `days` is 0.
+   *
+   * D1 bills on rows stored and caps database size, and usage_records is the
+   * only table that grows with traffic rather than with configuration, so an
+   * operator needs a way to reclaim it. Request logs are trimmed on the same
+   * cutoff because failover reads them for error rates and a log with no
+   * matching usage row is no longer useful evidence.
+   */
+  async deleteUsageRecordsOlderThan(days) {
+    if (days <= 0) {
+      await this.update("DELETE FROM usage_records", []);
+      await this.update("DELETE FROM request_logs", []);
+      return;
+    }
+    const cutoff = sqliteTimestamp(Date.now() - days * 24 * 60 * 60 * 1e3);
+    await this.update("DELETE FROM usage_records WHERE created_at < ?", [cutoff]);
+    await this.update("DELETE FROM request_logs WHERE created_at < ?", [cutoff]);
   }
   // Request logs for error tracking
   async createRequestLog(log) {
@@ -1111,7 +1172,9 @@ function measureStreamTiming(body, startedAt, onDone) {
   }));
 }
 function accountRateMultiplier(account) {
-  const value = Number(account?.rate_multiplier);
+  const raw = account?.rate_multiplier;
+  if (raw === null || raw === void 0 || raw === "") return 1;
+  const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : 1;
 }
 function getUpstreamBaseUrl(baseUrl, provider) {
@@ -1139,6 +1202,7 @@ function findModelMapping(requestedModel, mappings, provider) {
 }
 
 // functions/src/failover.ts
+var ACCOUNT_LEVEL_FAILURES = /* @__PURE__ */ new Set([401, 402, 403, 404, 408, 409, 425, 429]);
 var FailoverManager = class {
   errorWindows = /* @__PURE__ */ new Map();
   windowMs;
@@ -1294,7 +1358,9 @@ var FailoverManager = class {
   shouldFailover(error) {
     if (!error) return false;
     const status = error.status || error.statusCode || 0;
-    return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
+    if (status === 0 || status >= 500) return true;
+    if (ACCOUNT_LEVEL_FAILURES.has(status)) return true;
+    return false;
   }
   // Cleanup old windows periodically
   cleanup() {
@@ -1307,6 +1373,45 @@ var FailoverManager = class {
     }
   }
 };
+
+// functions/src/pricing.ts
+var TOKENS_PER_UNIT = 1e6;
+var OPENAI_RATES = [
+  ["gpt-5.6-cyber", { prompt: 12.5, completion: 75 }],
+  ["gpt-5.6-sol", { prompt: 4, completion: 20 }],
+  ["gpt-5.6-terra", { prompt: 2, completion: 12 }],
+  ["gpt-5.6-luna", { prompt: 0.2, completion: 1.2 }],
+  ["gpt-5.5-cyber", { prompt: 12.5, completion: 75 }],
+  ["gpt-5.5-pro", { prompt: 30, completion: 180 }],
+  ["gpt-5.5", { prompt: 5, completion: 30 }]
+];
+var ANTHROPIC_RATES = [
+  ["claude-opus-5", { prompt: 5, completion: 25 }],
+  ["claude-opus-4-8", { prompt: 5, completion: 25 }],
+  ["claude-opus-4.8", { prompt: 5, completion: 25 }]
+];
+var RATES_BY_PROVIDER = {
+  openai: OPENAI_RATES,
+  anthropic: ANTHROPIC_RATES,
+  xai: []
+};
+var DEFAULT_RATE = { prompt: 1, completion: 3 };
+function findTokenRate(provider, model) {
+  const id = String(model || "").trim().toLowerCase();
+  if (!id) return null;
+  const table = RATES_BY_PROVIDER[provider] ?? [];
+  let best = null;
+  for (const [prefix, rate] of table) {
+    if (id.startsWith(prefix) && (!best || prefix.length > best.length)) {
+      best = { length: prefix.length, rate };
+    }
+  }
+  return best?.rate ?? null;
+}
+function priceTokens(tokens, ratePerMillion) {
+  const count = Number.isFinite(tokens) && tokens > 0 ? tokens : 0;
+  return count / TOKENS_PER_UNIT * ratePerMillion;
+}
 
 // functions/src/billing.ts
 function estimateTokens(text) {
@@ -1341,39 +1446,25 @@ function extractTokenUsage(body, headers) {
   return { promptTokens, completionTokens, totalTokens };
 }
 function calculateCostBreakdown(provider, model, promptTokens, completionTokens, multiplier = 1) {
-  const pricing = {
-    openai: {
-      "gpt-4o": { prompt: 2.5, completion: 10 },
-      "gpt-4o-mini": { prompt: 0.15, completion: 0.6 },
-      "gpt-4-turbo": { prompt: 10, completion: 30 },
-      "gpt-3.5-turbo": { prompt: 0.5, completion: 1.5 },
-      "o1": { prompt: 15, completion: 60 },
-      "o1-mini": { prompt: 3, completion: 12 },
-      "o3": { prompt: 10, completion: 40 }
-    },
-    anthropic: {
-      "claude-sonnet-4-20250514": { prompt: 3, completion: 15 },
-      "claude-3-5-sonnet-20241022": { prompt: 3, completion: 15 },
-      "claude-3-5-haiku-20241022": { prompt: 0.8, completion: 4 },
-      "claude-3-opus-20240229": { prompt: 15, completion: 75 }
-    },
-    xai: {
-      "grok-2-latest": { prompt: 2, completion: 10 },
-      "grok-2": { prompt: 2, completion: 10 },
-      "grok-vision-beta": { prompt: 2, completion: 10 }
-    }
-  };
-  const modelPricing = pricing[provider]?.[model];
-  const rates = modelPricing || { prompt: 1, completion: 2 };
-  const raw = promptTokens / 1e3 * rates.prompt + completionTokens / 1e3 * rates.completion;
-  const baseCost = Math.round(raw * 1e6) / 1e6;
-  const safeMultiplier = Number.isFinite(Number(multiplier)) && Number(multiplier) >= 0 ? Number(multiplier) : 1;
+  const published = findTokenRate(provider, model);
+  const rates = published || DEFAULT_RATE;
+  const raw = priceTokens(promptTokens, rates.prompt) + priceTokens(completionTokens, rates.completion);
+  const baseCost = round6(raw);
+  const safeMultiplier = readMultiplier(multiplier);
   return {
     baseCost,
-    cost: Math.round(baseCost * safeMultiplier * 1e6) / 1e6,
+    cost: round6(baseCost * safeMultiplier),
     multiplier: safeMultiplier,
-    estimated: !modelPricing
+    estimated: !published
   };
+}
+function readMultiplier(value) {
+  if (value === null || value === void 0 || value === "") return 1;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 1;
+}
+function round6(value) {
+  return Math.round(value * 1e6) / 1e6;
 }
 
 // functions/src/utils/record.ts
@@ -2307,9 +2398,35 @@ function getProbeModel(provider) {
 
 // functions/src/utils/healthcheck.ts
 var PROBE_TIMEOUT_MS = 15e3;
-async function listUpstreamModels(db, accountId) {
+var MODEL_CACHE_TTL_MS = 24 * 60 * 60 * 1e3;
+var PROBE_PROMPT = "1+1=?";
+var PROBE_MAX_TOKENS = 16;
+function readCachedModels(account) {
+  const raw = String(account?.upstream_models || "").trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    const models = parsed.map((row) => ({ id: String(row?.id || "").trim(), name: row?.name ? String(row.name) : void 0 })).filter((row) => row.id);
+    if (!models.length) return null;
+    return { models, fetchedAt: String(account?.upstream_models_at || "") };
+  } catch {
+    return null;
+  }
+}
+function isStale(fetchedAt) {
+  if (!fetchedAt) return true;
+  const parsed = Date.parse(`${fetchedAt.replace(" ", "T")}Z`);
+  if (!Number.isFinite(parsed)) return true;
+  return Date.now() - parsed > MODEL_CACHE_TTL_MS;
+}
+async function listUpstreamModels(db, accountId, refresh = false) {
   const account = await db.getAccount(accountId);
   if (!account) throw new Error("\u8D26\u53F7\u4E0D\u5B58\u5728");
+  const cached = readCachedModels(account);
+  if (cached && !refresh && !isStale(cached.fetchedAt)) {
+    return { models: cached.models, cached: true, fetchedAt: cached.fetchedAt };
+  }
   const apiKey = String(account.api_key || "").trim();
   if (!apiKey) throw new Error("\u8D26\u53F7\u6CA1\u6709\u914D\u7F6E\u5BC6\u94A5");
   const baseUrl = (String(account.base_url || "").trim() || getDefaultBaseUrl(account.provider)).replace(/\/+$/, "");
@@ -2322,7 +2439,10 @@ async function listUpstreamModels(db, accountId) {
       signal: controller.signal
     });
     const raw = await response.text().catch(() => "");
-    if (!response.ok) throw new Error(`\u83B7\u53D6\u6A21\u578B\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`);
+    if (!response.ok) {
+      if (cached) return { models: cached.models, cached: true, fetchedAt: cached.fetchedAt };
+      throw new Error(`\u83B7\u53D6\u6A21\u578B\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`);
+    }
     let payload = null;
     try {
       payload = raw ? JSON.parse(raw) : null;
@@ -2330,12 +2450,25 @@ async function listUpstreamModels(db, accountId) {
       payload = null;
     }
     const rows = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : [];
-    const models = rows.map((row) => ({ id: String(row.id || row.name || "").trim(), name: row.name ? String(row.name) : void 0 })).filter((row) => row.id);
-    if (!models.length) throw new Error("\u4E0A\u6E38\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u6A21\u578B");
-    return models.slice(0, 200);
+    const models = rows.map((row) => ({ id: String(row.id || row.name || "").trim(), name: row.name ? String(row.name) : void 0 })).filter((row) => row.id).slice(0, 200);
+    if (!models.length) {
+      if (cached) return { models: cached.models, cached: true, fetchedAt: cached.fetchedAt };
+      throw new Error("\u4E0A\u6E38\u6CA1\u6709\u8FD4\u56DE\u53EF\u7528\u6A21\u578B");
+    }
+    await db.saveUpstreamModels(accountId, models).catch(() => {
+    });
+    const stored = await db.getAccount(accountId);
+    return { models, cached: false, fetchedAt: String(stored?.upstream_models_at || "") };
   } finally {
     clearTimeout(timer);
   }
+}
+function resolveProbeModel(account, selectedModel) {
+  const explicit = String(selectedModel || "").trim();
+  if (explicit) return explicit;
+  const remembered = String(account?.probe_model || "").trim();
+  if (remembered) return remembered;
+  return getProbeModel(account?.provider);
 }
 async function probeAccount(db, accountId, selectedModel) {
   const account = await db.getAccount(accountId);
@@ -2363,51 +2496,111 @@ async function probeAccount(db, accountId, selectedModel) {
   }
   const baseUrl = (String(account.base_url || "").trim() || getDefaultBaseUrl(account.provider)).replace(/\/+$/, "");
   const isAnthropic = account.provider === "anthropic";
-  const model = String(selectedModel || "").trim();
+  const probeModel = resolveProbeModel(account, selectedModel);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   const startedAt = Date.now();
-  const usesCompletion = isAnthropic || Boolean(model);
-  const probeModel = model || getProbeModel(account.provider);
-  const endpoint = usesCompletion ? isAnthropic ? `${baseUrl}/v1/messages` : `${baseUrl}/v1/chat/completions` : `${baseUrl}/v1/models`;
-  const payload = isAnthropic ? { model: probeModel, max_tokens: 1, messages: [{ role: "user", content: "ping" }] } : { model: probeModel, max_tokens: 1, messages: [{ role: "user", content: "ping" }], stream: false };
+  const endpoint = isAnthropic ? `${baseUrl}/v1/messages` : `${baseUrl}/v1/chat/completions`;
+  const payload = {
+    model: probeModel,
+    max_tokens: PROBE_MAX_TOKENS,
+    stream: true,
+    messages: [{ role: "user", content: PROBE_PROMPT }]
+  };
   try {
     const response = await fetch(endpoint, {
-      method: usesCompletion ? "POST" : "GET",
-      headers: { ...getProviderAuthHeaders(account.provider, apiKey), "content-type": "application/json" },
-      body: usesCompletion ? JSON.stringify(payload) : void 0,
+      method: "POST",
+      headers: {
+        ...getProviderAuthHeaders(account.provider, apiKey),
+        "content-type": "application/json",
+        accept: "text/event-stream"
+      },
+      body: JSON.stringify(payload),
       signal: controller.signal
     });
-    const latencyMs = Date.now() - startedAt;
-    let detail = "";
     if (!response.ok) {
       const raw = await response.text().catch(() => "");
+      let detail = "";
       try {
         detail = JSON.parse(raw)?.error?.message || "";
       } catch {
         detail = raw.slice(0, 160);
       }
+      const result2 = {
+        ...base,
+        model: probeModel,
+        success: false,
+        status: response.status,
+        latencyMs: Date.now() - startedAt,
+        message: `${probeModel} \xB7 \u8FDE\u63A5\u5931\u8D25\uFF08HTTP ${response.status}\uFF09${detail ? `\uFF1A${detail}` : ""}`
+      };
+      await persist(db, result2);
+      return result2;
     }
-    const scope = usesCompletion ? `${probeModel} \xB7 ` : "";
+    const stream = await readProbeStream(response, startedAt);
+    const latencyMs = Date.now() - startedAt;
+    if (!stream.received) {
+      const result2 = {
+        ...base,
+        model: probeModel,
+        success: false,
+        status: response.status,
+        latencyMs,
+        message: `${probeModel} \xB7 \u4E0A\u6E38\u8FD4\u56DE 200 \u4F46\u6CA1\u6709\u63A8\u9001\u4EFB\u4F55\u6D41\u5F0F\u5185\u5BB9`
+      };
+      await persist(db, result2);
+      return result2;
+    }
+    const ttft = stream.ttftMs ?? latencyMs;
     const result = {
       ...base,
-      model: usesCompletion ? probeModel : "",
-      success: response.ok,
+      model: probeModel,
+      success: true,
       status: response.status,
       latencyMs,
-      message: response.ok ? `${scope}\u8FDE\u63A5\u6210\u529F\uFF08${latencyMs} ms\uFF09` : `${scope}\u8FDE\u63A5\u5931\u8D25\uFF08HTTP ${response.status}\uFF09${detail ? `\uFF1A${detail}` : ""}`
+      ttftMs: ttft,
+      message: `${probeModel} \xB7 \u6D41\u5F0F\u8FDE\u63A5\u6210\u529F\uFF08\u9996\u5B57 ${ttft} ms\uFF0C\u5171 ${latencyMs} ms\uFF09`
     };
     await persist(db, result);
+    await db.saveProbeModel(accountId, probeModel).catch(() => {
+    });
     return result;
   } catch (error) {
     const latencyMs = Date.now() - startedAt;
-    const message = error instanceof Error && error.name === "AbortError" ? `\u8FDE\u63A5\u8D85\u65F6\uFF08${PROBE_TIMEOUT_MS / 1e3} \u79D2\uFF09` : error instanceof Error ? error.message : "\u672A\u77E5\u9519\u8BEF";
-    const result = { ...base, success: false, status: 0, latencyMs, message };
+    const message = error instanceof Error && error.name === "AbortError" ? `${probeModel} \xB7 \u8FDE\u63A5\u8D85\u65F6\uFF08${PROBE_TIMEOUT_MS / 1e3} \u79D2\uFF09` : `${probeModel} \xB7 ${error instanceof Error ? error.message : "\u672A\u77E5\u9519\u8BEF"}`;
+    const result = { ...base, model: probeModel, success: false, status: 0, latencyMs, message };
     await persist(db, result);
     return result;
   } finally {
     clearTimeout(timer);
   }
+}
+async function readProbeStream(response, startedAt) {
+  if (!response.body) return { received: false, ttftMs: null };
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      for (const line of buffered.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith(":")) continue;
+        if (!trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        if (!data || data === "[DONE]") continue;
+        return { received: true, ttftMs: Date.now() - startedAt };
+      }
+      if (buffered.length > 64e3) break;
+    }
+  } catch {
+  } finally {
+    await reader.cancel().catch(() => {
+    });
+  }
+  return { received: false, ttftMs: null };
 }
 async function probeAccounts(db, accountIds, concurrency = 4, selectedModels) {
   const results = [];
@@ -2470,9 +2663,19 @@ async function handleAccountsRequest(request, env) {
   const modelsMatch = /\/accounts\/(\d+)\/models$/.exec(url.pathname);
   if (method === "GET" && modelsMatch) {
     const id = Number(modelsMatch[1]);
+    const refresh = url.searchParams.get("refresh") === "1";
     try {
-      const models = await listUpstreamModels(db, id);
-      return new Response(JSON.stringify({ data: { account_id: id, models } }), { status: 200, headers: JSON_HEADERS2 });
+      const result = await listUpstreamModels(db, id, refresh);
+      const account = await db.getAccount(id);
+      return new Response(JSON.stringify({
+        data: {
+          account_id: id,
+          models: result.models,
+          cached: result.cached,
+          fetched_at: result.fetchedAt,
+          probe_model: String(account?.probe_model || "")
+        }
+      }), { status: 200, headers: JSON_HEADERS2 });
     } catch (error) {
       return jsonError2(error instanceof Error ? error.message : "\u83B7\u53D6\u4E0A\u6E38\u6A21\u578B\u5931\u8D25", 502);
     }
@@ -2588,17 +2791,48 @@ async function handleAccountsRequest(request, env) {
     });
   }
   if (method === "POST" && url.pathname.endsWith("/test-all")) {
+    let body = {};
+    try {
+      body = await request.json();
+    } catch {
+      body = {};
+    }
+    const rawGroup = body.group_id;
+    const scoped = rawGroup !== void 0 && rawGroup !== null && String(rawGroup).trim() !== "" && String(rawGroup) !== "all";
+    let groupId = 0;
+    let groupName = "";
+    if (scoped) {
+      groupId = Number(rawGroup);
+      if (!Number.isInteger(groupId) || groupId <= 0) return jsonError2("\u5206\u7EC4\u65E0\u6548", 400);
+      const group = await db.getGroup(groupId);
+      if (!group) return jsonError2("\u6240\u9009\u5206\u7EC4\u4E0D\u5B58\u5728", 400);
+      groupName = String(group.name || "");
+    }
     const accounts = await db.listAccounts();
-    const ids = accounts.filter((account) => Number(account.enabled) === 1).map((account) => Number(account.id));
-    if (!ids.length) return jsonError2("\u6CA1\u6709\u542F\u7528\u7684\u8D26\u53F7\u53EF\u6D4B\u8BD5", 400);
+    const ids = accounts.filter((account) => Number(account.enabled) === 1).filter((account) => !scoped || Number(account.group_id) === groupId).map((account) => Number(account.id));
+    if (!ids.length) {
+      return jsonError2(scoped ? `\u5206\u7EC4\u300C${groupName}\u300D\u4E0B\u6CA1\u6709\u542F\u7528\u7684\u8D26\u53F7` : "\u6CA1\u6709\u542F\u7528\u7684\u8D26\u53F7\u53EF\u6D4B\u8BD5", 400);
+    }
     const results = await probeAccounts(db, ids);
     const healthy = results.filter((result) => result.success).length;
     return new Response(JSON.stringify({
       data: {
+        group_id: scoped ? groupId : null,
+        group_name: groupName,
         total: results.length,
         healthy,
         failed: results.length - healthy,
-        results
+        results: results.map((result) => ({
+          account_id: result.accountId,
+          name: result.name,
+          provider: result.provider,
+          success: result.success,
+          status: result.status,
+          latency_ms: result.latencyMs,
+          ttft_ms: result.ttftMs ?? null,
+          model: result.model || "",
+          message: result.message
+        }))
       }
     }), { status: 200, headers: JSON_HEADERS2 });
   }
@@ -2857,8 +3091,10 @@ async function route(request, env, ctx) {
   if (path.startsWith("/api/v1/keys")) {
     return handleApiKeys(request, env);
   }
-  if (path === "/api/v1/usage" && request.method === "GET") {
-    return handleUsage(request, env);
+  if (path === "/api/v1/usage" || path.startsWith("/api/v1/usage/")) {
+    if (request.method === "GET" && path === "/api/v1/usage") return handleUsage(request, env);
+    if (request.method === "DELETE") return handleUsageDelete(request, env, path);
+    return json({ error: "Method not allowed" }, 405);
   }
   if (path.startsWith("/api/v1/groups")) {
     if (request.method !== "GET") invalidateRouting();
@@ -3159,6 +3395,32 @@ async function handleUsage(request, env) {
   const offset = Math.max(parseInt(url.searchParams.get("offset") || "0", 10) || 0, 0);
   const records = await db.listUsageRecords(limit, offset);
   return json({ data: records });
+}
+async function handleUsageDelete(request, env, path) {
+  const session = await checkAuth(request, env);
+  if (!session) return json({ error: "Unauthorized" }, 401);
+  if (session.isAdmin !== true) return json({ error: "\u9700\u8981\u7BA1\u7406\u5458\u6743\u9650" }, 403);
+  const db = createDatabase(env.DB);
+  const itemMatch = /^\/api\/v1\/usage\/(\d+)$/.exec(path);
+  if (itemMatch) {
+    const result = await db.deleteUsageRecord(Number(itemMatch[1]));
+    if (!result.changes) return json({ error: "\u8BB0\u5F55\u4E0D\u5B58\u5728" }, 404);
+    return json({ success: true, deleted: result.changes });
+  }
+  if (path !== "/api/v1/usage") return json({ error: "Invalid usage path" }, 404);
+  const url = new URL(request.url);
+  const rawDays = url.searchParams.get("older_than_days");
+  if (rawDays === null) {
+    return json({ error: "\u8BF7\u63D0\u4F9B older_than_days\uFF080 \u8868\u793A\u6E05\u7A7A\u5168\u90E8\uFF09" }, 400);
+  }
+  const days = Number(rawDays);
+  if (!Number.isFinite(days) || days < 0 || days > 3650) {
+    return json({ error: "older_than_days \u5FC5\u987B\u662F 0 \u5230 3650 \u4E4B\u95F4\u7684\u6570\u5B57" }, 400);
+  }
+  const before = await db.countUsageRecords();
+  await db.deleteUsageRecordsOlderThan(days);
+  const after = await db.countUsageRecords();
+  return json({ success: true, deleted: Math.max(0, before - after), remaining: after });
 }
 async function checkAuth(request, env) {
   const authHeader = request.headers.get("authorization");
